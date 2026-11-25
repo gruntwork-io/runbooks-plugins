@@ -12,7 +12,7 @@ use serde_json::Map;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::aws::{Aws, AwsCredentials, SsoAccount};
+use crate::aws::{Aws, AwsCredentials, SsoAccount, read_profiles};
 use crate::detect::{
     AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, Environment,
     parse_sources,
@@ -20,9 +20,10 @@ use crate::detect::{
 use crate::error::{self, invalid_params};
 use crate::identity::{ACCOUNT, AccountId, Pins, Principal, ROLE};
 use crate::methods::{
-    self, ACCESS_KEY_ID, DEFAULT_REGION, Fields, SECRET_ACCESS_KEY, SESSION_TOKEN, SSO_REGION,
-    SignInMethod,
+    self, ACCESS_KEY_ID, DEFAULT_REGION, Fields, PROFILE, SECRET_ACCESS_KEY, SESSION_TOKEN,
+    SSO_REGION, SignInMethod,
 };
+use crate::profile;
 use crate::region::Region;
 use crate::secret::Secret;
 use crate::sso::{self, SsoLogin};
@@ -84,6 +85,16 @@ struct Ready {
     /// For a role IAM Identity Center gave: the login, to list other
     /// targets and to get fresh keys.
     sso: Option<SsoRole>,
+    /// For a profile's keys: the sign-in, to get fresh ones.
+    profile: Option<ProfileSignIn>,
+}
+
+/// A sign-in with a profile, as it was asked for.
+#[derive(Clone, Debug)]
+struct ProfileSignIn {
+    name: String,
+    default_region: Option<Region>,
+    pins: Pins,
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +209,7 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
             principal,
             method,
             sso: None,
+            profile: None,
         })
     }
 
@@ -219,6 +231,52 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
         let method = SignInMethod::Credentials.name().to_owned();
         self.check(credentials, region.clone(), &region, method, pins)
             .await
+    }
+
+    /// Reads the profile files where the environment says they are, gets the
+    /// profile's keys, assuming each role in its chain in the partition of
+    /// the run's region, and checks them. The run's region is the profile's,
+    /// else the default region.
+    async fn sign_in_with_profile(&self, sign_in: ProfileSignIn) -> Result<Ready, PluginError> {
+        let profiles = read_profiles(profile::file_env(&self.env))
+            .await
+            .map_err(|e| invalid_params(&format!("{e}: fix the line it names")))?;
+        let plan = profile::plan(&profiles, &sign_in.name, &self.env, self.clock.now())
+            .map_err(|error| invalid_params(&error))?;
+        let region = match plan.region.as_deref() {
+            Some(region) => Region::parse(region).map_err(|e| {
+                invalid_params(&format!(
+                    "profile {:?}'s region is invalid: {e}",
+                    sign_in.name
+                ))
+            })?,
+            None => sign_in
+                .default_region
+                .clone()
+                .unwrap_or_else(Region::default_region),
+        };
+        let home = region.partition_home();
+        let mut credentials = plan.base;
+        for role in &plan.roles {
+            credentials = self
+                .aws
+                .assume_role(&credentials, role, &home)
+                .await
+                .map_err(|e| {
+                    error::aws(&e, &format!("assuming role {} in {home}", role.role_arn))
+                })?;
+        }
+        let mut ready = self
+            .check(
+                credentials,
+                region.clone(),
+                &region,
+                profile::METHOD.to_owned(),
+                &sign_in.pins,
+            )
+            .await?;
+        ready.profile = Some(sign_in);
+        Ok(ready)
     }
 
     /// The device authorization, then as far as the choice goes without the
@@ -313,36 +371,43 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
         Ok(ready)
     }
 
-    /// The role's keys, fresh ones first when these are about to expire. Keys
-    /// that still work are kept if AWS cannot give fresh ones.
+    /// The keys, fresh ones first when these are about to expire: a role's
+    /// from IAM Identity Center, a profile's by signing in with it again.
+    /// Keys that still work are kept if fresh ones cannot be got.
     async fn refreshed(&self, generation: u64, ready: Ready) -> Result<Ready, PluginError> {
-        let (Some(sso), Some(expires_at)) = (&ready.sso, ready.credentials.expires_at) else {
+        let Some(expires_at) = ready.credentials.expires_at else {
             return Ok(ready);
         };
         let now = self.clock.now();
         if expires_at - now > REFRESH_MARGIN {
             return Ok(ready);
         }
-        let answer = self
-            .aws
-            .role_credentials(
-                &sso.login.token,
-                &sso.account,
-                &sso.role,
-                &sso.login.sso_region,
-            )
-            .await;
-        match answer {
-            Ok(credentials) => {
-                let fresh = Ready {
+        let fresh = if let Some(sso) = &ready.sso {
+            self.aws
+                .role_credentials(
+                    &sso.login.token,
+                    &sso.account,
+                    &sso.role,
+                    &sso.login.sso_region,
+                )
+                .await
+                .map(|credentials| Ready {
                     credentials,
-                    ..ready
-                };
+                    ..ready.clone()
+                })
+                .map_err(|e| sso::sso_error(&e, "getting fresh keys for the role"))
+        } else if let Some(sign_in) = &ready.profile {
+            self.sign_in_with_profile(sign_in.clone()).await
+        } else {
+            return Ok(ready);
+        };
+        match fresh {
+            Ok(fresh) => {
                 self.set_if(generation, Session::Ready(Box::new(fresh.clone())));
                 Ok(fresh)
             }
             Err(_) if expires_at > now => Ok(ready),
-            Err(e) => Err(sso::sso_error(&e, "getting fresh keys for the role")),
+            Err(e) => Err(e),
         }
     }
 }
@@ -448,6 +513,16 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
         let (session, identity) = match method {
             SignInMethod::Credentials => ready(self.sign_in_with_keys(fields, &pins).await?),
             SignInMethod::Sso => self.sign_in_with_sso(fields, pins, &prompts).await?,
+            SignInMethod::Profile => {
+                let sign_in = ProfileSignIn {
+                    name: fields.required(PROFILE).to_owned(),
+                    default_region: fields
+                        .region(DEFAULT_REGION)
+                        .map_err(|error| invalid_params(&error))?,
+                    pins,
+                };
+                ready(self.sign_in_with_profile(sign_in).await?)
+            }
         };
         self.set(session);
         Ok(SignInResult(identity))

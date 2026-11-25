@@ -11,8 +11,8 @@ use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
 use time::OffsetDateTime;
 
 use super::{
-    Aws, AwsCredentials, AwsError, AwsErrorKind, CallerIdentity, DeviceAuthorization, Service,
-    SsoAccount, SsoToken, TokenPoll,
+    AssumeRole, Aws, AwsCredentials, AwsError, AwsErrorKind, CallerIdentity, DeviceAuthorization,
+    Service, SsoAccount, SsoToken, TokenPoll,
 };
 use crate::identity::AccountId;
 use crate::region::Region;
@@ -128,6 +128,48 @@ impl Aws for SdkAws {
             account,
             arn: arn.to_owned(),
             alias,
+        })
+    }
+
+    async fn assume_role(
+        &self,
+        credentials: &AwsCredentials,
+        request: &AssumeRole,
+        region: &Region,
+    ) -> Result<AwsCredentials, AwsError> {
+        let sts = aws_sdk_sts::Client::from_conf(
+            aws_sdk_sts::Config::builder()
+                .behavior_version(BehaviorVersion::latest())
+                .region(sdk_region(region))
+                .credentials_provider(sdk_credentials(credentials))
+                .timeout_config(timeouts())
+                .build(),
+        );
+        let duration = request
+            .duration
+            .map(|duration| i32::try_from(duration.as_secs()).unwrap_or(i32::MAX));
+        let answer = sts
+            .assume_role()
+            .role_arn(&request.role_arn)
+            .role_session_name(&request.session_name)
+            .set_external_id(request.external_id.clone())
+            .set_duration_seconds(duration)
+            .send()
+            .await
+            .map_err(|error| classify(Service::Sts, &error))?;
+        let keys = answer.credentials().ok_or_else(|| {
+            AwsError::new(
+                Service::Sts,
+                AwsErrorKind::Unexpected,
+                "AssumeRole answered without Credentials",
+            )
+        })?;
+        let expiration = keys.expiration();
+        Ok(AwsCredentials {
+            access_key_id: keys.access_key_id().to_owned(),
+            secret_access_key: Secret::new(keys.secret_access_key()),
+            session_token: Some(Secret::new(keys.session_token())),
+            expires_at: OffsetDateTime::from_unix_timestamp(expiration.secs()).ok(),
         })
     }
 

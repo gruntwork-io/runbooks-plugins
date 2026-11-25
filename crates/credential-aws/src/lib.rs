@@ -6,7 +6,10 @@
 //!   the source has one, or the same names from an earlier block's outputs.
 //! - **Sign-in methods**: `credentials`, an access key with its secret and an
 //!   optional session token; `sso`, IAM Identity Center's device
-//!   authorization, approved in the browser, then an account and a role.
+//!   authorization, approved in the browser, then an account and a role;
+//!   `profile`, a profile from the shared AWS files with static keys or a
+//!   role to assume, found where `AWS_CONFIG_FILE`,
+//!   `AWS_SHARED_CREDENTIALS_FILE` and `HOME` in the plugin's environment say.
 //! - Every credential is checked with STS `GetCallerIdentity`, in the home
 //!   region of its region's partition, before it is used.
 //! - **Pins** are keyed by level: `account` (`ssoAccountId`) and `role`
@@ -23,13 +26,14 @@ mod error;
 mod identity;
 mod methods;
 mod plugin;
+mod profile;
 mod region;
 mod secret;
 mod sso;
 
 pub use aws::{
-    Aws, AwsCredentials, AwsError, AwsErrorKind, CallerIdentity, DeviceAuthorization, SdkAws,
-    Service, SsoAccount, SsoToken, TokenPoll,
+    AssumeRole, Aws, AwsCredentials, AwsError, AwsErrorKind, CallerIdentity, DeviceAuthorization,
+    SdkAws, Service, SsoAccount, SsoToken, TokenPoll,
 };
 pub use detect::Environment;
 pub use identity::{AccountId, InvalidAccountId};

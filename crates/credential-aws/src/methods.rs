@@ -31,12 +31,15 @@ pub(crate) const DEFAULT_REGION: &str = "defaultRegion";
 /// `ssoRegion` fill them in.
 pub(crate) const SSO_START_URL: &str = "ssoStartUrl";
 pub(crate) const SSO_REGION: &str = "ssoRegion";
+/// A profile in the shared AWS config and credentials files.
+pub const PROFILE: &str = "profile";
 
 /// The sign-in methods: the block's tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SignInMethod {
     Credentials,
     Sso,
+    Profile,
 }
 
 /// One input of a sign-in method.
@@ -55,7 +58,7 @@ const DEFAULT_REGION_FIELD: FieldSpec = FieldSpec {
 };
 
 impl SignInMethod {
-    pub(crate) const ALL: [Self; 2] = [Self::Credentials, Self::Sso];
+    pub(crate) const ALL: [Self; 3] = [Self::Credentials, Self::Sso, Self::Profile];
 
     pub(crate) fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|method| method.name() == name)
@@ -65,6 +68,7 @@ impl SignInMethod {
         match self {
             Self::Credentials => "credentials",
             Self::Sso => "sso",
+            Self::Profile => "profile",
         }
     }
 
@@ -72,6 +76,7 @@ impl SignInMethod {
         match self {
             Self::Credentials => "Static Credentials",
             Self::Sso => "AWS SSO",
+            Self::Profile => "Local Profile",
         }
     }
 
@@ -109,6 +114,15 @@ impl SignInMethod {
                     name: SSO_REGION,
                     label: "SSO Region",
                     required: false,
+                    secret: false,
+                },
+                DEFAULT_REGION_FIELD,
+            ],
+            Self::Profile => &[
+                FieldSpec {
+                    name: PROFILE,
+                    label: "Profile",
+                    required: true,
                     secret: false,
                 },
                 DEFAULT_REGION_FIELD,

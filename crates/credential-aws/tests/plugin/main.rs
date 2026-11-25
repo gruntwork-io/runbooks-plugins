@@ -2,6 +2,7 @@
 //! pipes, a fake AWS, and every line the plugin writes checked against the
 //! protocol schema.
 
+mod profile;
 mod sso;
 
 use std::collections::{HashMap, VecDeque};
@@ -14,8 +15,9 @@ use std::time::Duration;
 
 use jsonschema::{Draft, Registry, Validator};
 use runbooks_credential_aws::{
-    AccountId, Aws, AwsCredentials, AwsError, AwsErrorKind, AwsPlugin, CallerIdentity, Clock,
-    DeviceAuthorization, Environment, Region, Secret, Service, SsoAccount, SsoToken, TokenPoll,
+    AccountId, AssumeRole, Aws, AwsCredentials, AwsError, AwsErrorKind, AwsPlugin, CallerIdentity,
+    Clock, DeviceAuthorization, Environment, Region, Secret, Service, SsoAccount, SsoToken,
+    TokenPoll,
 };
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_protocol::credential::DetectParams;
@@ -86,6 +88,8 @@ fn at(value: &Value, pointer: &str) -> Value {
 struct FakeAws {
     callers: HashMap<String, Result<CallerIdentity, AwsError>>,
     calls: Arc<Mutex<Vec<Call>>>,
+    /// AssumeRole's answers by role ARN, in order; the last repeats.
+    assumed: Arc<Mutex<HashMap<String, VecDeque<KeysAnswer>>>>,
     sso: FakeSso,
 }
 
@@ -103,7 +107,7 @@ struct FakeSso {
     keys: Arc<Mutex<HashMap<String, VecDeque<KeysAnswer>>>>,
     /// Holds the next `GetRoleCredentials` until it is sent.
     gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
-    /// Every SSO and SSO-OIDC call, as "<call> <detail> in <region>".
+    /// Every call but GetCallerIdentity, as "<call> <detail> in <region>".
     log: Arc<Mutex<Vec<String>>>,
     started: Arc<Mutex<Option<Instant>>>,
 }
@@ -148,6 +152,12 @@ impl FakeAws {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// AssumeRole for `role_arn` answers these, in order.
+    fn assumes(self, role_arn: &str, keys: Vec<KeysAnswer>) -> Self {
+        lock(&self.assumed).insert(role_arn.to_owned(), keys.into());
+        self
     }
 
     /// `CreateToken` answers these, in order, then Pending.
@@ -221,6 +231,15 @@ fn approved() -> TokenPoll {
     })
 }
 
+/// The next of a queue of answers: the last one repeats.
+fn next_answer(queue: Option<&mut VecDeque<KeysAnswer>>) -> Option<KeysAnswer> {
+    match queue {
+        Some(queue) if queue.len() > 1 => queue.pop_front(),
+        Some(queue) => queue.front().cloned(),
+        None => None,
+    }
+}
+
 fn sso_failure(kind: AwsErrorKind, detail: &str) -> AwsError {
     AwsError::new(Service::Sso, kind, detail)
 }
@@ -250,6 +269,32 @@ impl Aws for FakeAws {
                     ))
                 }),
         )
+    }
+
+    async fn assume_role(
+        &self,
+        credentials: &AwsCredentials,
+        request: &AssumeRole,
+        region: &Region,
+    ) -> Result<AwsCredentials, AwsError> {
+        let mut entry = format!(
+            "assume {} as {} with {} in {region}",
+            request.role_arn, request.session_name, credentials.access_key_id
+        );
+        if let Some(external_id) = &request.external_id {
+            entry.push_str(&format!(" external {external_id}"));
+        }
+        if let Some(duration) = request.duration {
+            entry.push_str(&format!(" for {}s", duration.as_secs()));
+        }
+        self.record(entry);
+        next_answer(lock(&self.assumed).get_mut(&request.role_arn)).unwrap_or_else(|| {
+            Err(AwsError::new(
+                Service::Sts,
+                AwsErrorKind::Refused,
+                "AccessDenied: not authorized to perform sts:AssumeRole",
+            ))
+        })
     }
 
     fn start_device_authorization(
@@ -317,20 +362,14 @@ impl Aws for FakeAws {
         if let Some(gate) = gate {
             let _opened = gate.await;
         }
-        let answer = {
-            let mut keys = lock(&self.sso.keys);
-            match keys.get_mut(&format!("{account}/{role}")) {
-                Some(queue) if queue.len() > 1 => queue.pop_front(),
-                Some(queue) => queue.front().cloned(),
-                None => None,
-            }
-        };
-        answer.unwrap_or_else(|| {
-            Err(sso_failure(
-                AwsErrorKind::Refused,
-                "ForbiddenException: No access",
-            ))
-        })
+        next_answer(lock(&self.sso.keys).get_mut(&format!("{account}/{role}"))).unwrap_or_else(
+            || {
+                Err(sso_failure(
+                    AwsErrorKind::Refused,
+                    "ForbiddenException: No access",
+                ))
+            },
+        )
     }
 }
 
