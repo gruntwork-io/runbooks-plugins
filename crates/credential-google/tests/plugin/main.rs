@@ -2,6 +2,7 @@
 //! Google, and checks every line it writes against the protocol schema.
 
 mod detect;
+mod gcloud;
 mod secrets;
 mod sign_in;
 mod support;

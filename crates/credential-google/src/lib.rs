@@ -12,6 +12,7 @@ mod api;
 mod credential;
 mod crypto;
 mod files;
+mod gcloud;
 mod plugin;
 mod secret;
 mod session;

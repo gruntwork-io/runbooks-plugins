@@ -17,6 +17,7 @@ use crate::api::{GoogleApi, Network, NetworkError};
 use crate::credential::{Credential, MAX_DOCUMENT_BYTES, Origin, api_error, parse_document};
 use crate::crypto::Crypto;
 use crate::files::{self, CREDENTIALS_FILE, ReadError};
+use crate::gcloud::{ADC_LOGIN, Configuration, ConfigurationName, Root};
 use crate::session::{self, Candidate, Constraints, PROJECT, Prover, Session, invalid_params};
 use crate::sources::{self, FoundVars, Prefix, VarCredential};
 
@@ -27,6 +28,10 @@ const PAGE_SIZE: usize = 1000;
 const MAX_CA_BUNDLE_BYTES: usize = 1024 * 1024;
 
 const SERVICE_ACCOUNT: &str = "service_account";
+const GCLOUD: &str = "gcloud";
+const ADC: &str = "adc";
+const CONFIGURATION_NAME_RULE: &str =
+    "a gcloud configuration name: lower case letters, digits and hyphens, starting with a letter";
 
 /// What `main` found in the process: its environment, read once, and the
 /// clock. The plugin reads no other global state.
@@ -156,6 +161,143 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
         };
         self.sign_in_with(candidate, constraints).await
     }
+
+    /// gcloud's configuration, the active one unless the field names one, with
+    /// the Application Default Credentials every configuration shares.
+    async fn sign_in_gcloud(
+        &self,
+        fields: HashMap<String, String>,
+        constraints: &Constraints,
+    ) -> Result<Session, PluginError> {
+        let mut fields = MethodFields::new(GCLOUD, fields, &["configuration"])?;
+        let requested = fields.take("configuration");
+        let root = Root::resolve(&self.host.env).ok_or_else(|| {
+            PluginError::new(
+                ErrorKind::NotSignedIn,
+                "There is no gcloud configuration directory: CLOUDSDK_CONFIG is set to nothing, or no home directory is set. Run: gcloud init",
+            )
+        })?;
+        let name = match &requested {
+            Some(name) => ConfigurationName::parse(name.clone()).map_err(|_name| {
+                invalid_params(format!(
+                    "The configuration field must be {CONFIGURATION_NAME_RULE}."
+                ))
+            })?,
+            None => active_configuration_name(&root, &self.host.env).await?,
+        };
+        let Some(configuration) = read_configuration(&root, &name).await? else {
+            let names = root.configuration_names().await;
+            let listed = if names.is_empty() {
+                format!(
+                    "there are none in {}. Run: gcloud init",
+                    root.path().display()
+                )
+            } else {
+                format!("its configurations are {}", names.join(", "))
+            };
+            return Err(match requested {
+                Some(_) => invalid_params(format!(
+                    "gcloud has no configuration {}; {listed}",
+                    name.as_str()
+                )),
+                None => PluginError::new(
+                    ErrorKind::NotSignedIn,
+                    format!(
+                        "gcloud's active configuration {} doesn't exist; {listed}",
+                        name.as_str()
+                    ),
+                ),
+            });
+        };
+        let document = root.adc().await?.ok_or_else(|| {
+            PluginError::new(
+                ErrorKind::NotSignedIn,
+                format!(
+                    "There are no Application Default Credentials in {}. Run: {ADC_LOGIN}",
+                    root.path().display()
+                ),
+            )
+        })?;
+        self.sign_in_with(gcloud_candidate(document, configuration), constraints)
+            .await
+    }
+
+    /// The credential a detection source names, or `None` if it has none.
+    async fn find(&self, lookup: Lookup) -> Result<Option<Candidate>, PluginError> {
+        match lookup {
+            Lookup::Vars { vars, prefix, name } => match sources::find(&vars, &prefix) {
+                None => Ok(None),
+                Some(found) => candidate_from_vars(found, name).await.map(Some),
+            },
+            Lookup::Adc => {
+                let Some(root) = Root::resolve(&self.host.env) else {
+                    return Ok(None);
+                };
+                Ok(root.adc().await?.map(|document| Candidate {
+                    credential: Credential::Document(document),
+                    method: ADC.to_owned(),
+                    project: None,
+                    region: None,
+                    zone: None,
+                    configuration: None,
+                }))
+            }
+            // A configuration without Application Default Credentials has
+            // nothing to sign in with, however complete it looks.
+            Lookup::Gcloud => {
+                let Some(root) = Root::resolve(&self.host.env) else {
+                    return Ok(None);
+                };
+                let name = active_configuration_name(&root, &self.host.env).await?;
+                let Some(configuration) = read_configuration(&root, &name).await? else {
+                    return Ok(None);
+                };
+                Ok(root
+                    .adc()
+                    .await?
+                    .map(|document| gcloud_candidate(document, configuration)))
+            }
+        }
+    }
+}
+
+async fn active_configuration_name(
+    root: &Root,
+    env: &HashMap<String, String>,
+) -> Result<ConfigurationName, PluginError> {
+    ConfigurationName::parse(root.active_name(env).await).map_err(|_name| {
+        invalid_params(format!(
+            "gcloud's active configuration, from CLOUDSDK_ACTIVE_CONFIG_NAME or {}, must be {CONFIGURATION_NAME_RULE}.",
+            root.path().join("active_config").display()
+        ))
+    })
+}
+
+async fn read_configuration(
+    root: &Root,
+    name: &ConfigurationName,
+) -> Result<Option<Configuration>, PluginError> {
+    root.configuration(name).await.map_err(|error| {
+        invalid_params(format!(
+            "gcloud's configuration {} in {}: the file {error}",
+            name.as_str(),
+            root.path().display()
+        ))
+    })
+}
+
+fn gcloud_candidate(
+    document: crate::credential::Document,
+    configuration: Configuration,
+) -> Candidate {
+    Candidate {
+        credential: Credential::Document(document),
+        method: GCLOUD.to_owned(),
+        project: configuration.project,
+        region: configuration.region,
+        zone: configuration.zone,
+        configuration: Some(configuration.name),
+    }
 }
 
 /// The candidate in variables an `env` or `values` source found.
@@ -252,15 +394,22 @@ fn methods() -> Vec<Method> {
         required: false,
         secret,
     };
-    vec![Method {
-        fields: vec![
-            field("key", "Service account key (JSON)", true),
-            field("keyFile", "Key file", false),
-            field("project", "Project ID", false),
-        ],
-        label: "Service Account Key".to_owned(),
-        name: SERVICE_ACCOUNT.to_owned(),
-    }]
+    vec![
+        Method {
+            fields: vec![
+                field("key", "Service account key (JSON)", true),
+                field("keyFile", "Key file", false),
+                field("project", "Project ID", false),
+            ],
+            label: "Service Account Key".to_owned(),
+            name: SERVICE_ACCOUNT.to_owned(),
+        },
+        Method {
+            fields: vec![field("configuration", "gcloud configuration", false)],
+            label: "gcloud Config".to_owned(),
+            name: GCLOUD.to_owned(),
+        },
+    ]
 }
 
 /// A detection source, checked before any is read.
@@ -270,6 +419,10 @@ enum Lookup {
         prefix: Prefix,
         name: &'static str,
     },
+    /// gcloud's Application Default Credentials file.
+    Adc,
+    /// gcloud's active configuration, with the Application Default Credentials.
+    Gcloud,
 }
 
 impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
@@ -329,7 +482,7 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
             names: session::names(),
             protocol_version: PROTOCOL_VERSION.to_owned(),
             requirements: vec![RequirementKind::Scopes],
-            sources: Vec::new(),
+            sources: vec![ADC.to_owned(), GCLOUD.to_owned()],
         })
     }
 
@@ -354,9 +507,13 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                     prefix: Prefix::default(),
                     name: "values",
                 }),
-                Source::Named { name } => problems.push(format!(
-                    "this plugin has no detection source named {name:?}"
-                )),
+                Source::Named { name } => match name.as_str() {
+                    ADC => lookups.push(Lookup::Adc),
+                    GCLOUD => lookups.push(Lookup::Gcloud),
+                    _ => problems.push(format!(
+                        "this plugin has no detection source named {name:?}; its named sources are {ADC} and {GCLOUD}"
+                    )),
+                },
             }
         }
         if !problems.is_empty() {
@@ -367,16 +524,15 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
         // did; one that lacks a required scope stops the search.
         let mut failures: Vec<PluginError> = Vec::new();
         for lookup in lookups {
-            let Lookup::Vars { vars, prefix, name } = lookup;
-            let Some(found) = sources::find(&vars, &prefix) else {
-                continue;
-            };
-            let proved = match candidate_from_vars(found, name).await {
-                Ok(candidate) => self.sign_in_with(candidate, &constraints).await,
+            let proved = match self.find(lookup).await {
+                Ok(None) => continue,
+                Ok(Some(candidate)) => self.sign_in_with(candidate, &constraints).await,
                 Err(error) => Err(error),
             };
             match proved {
-                Ok(session) => return Ok(DetectResult::found(session.identity(), name)),
+                Ok(session) => {
+                    return Ok(DetectResult::found(session.identity(), session.method));
+                }
                 Err(error) if error.kind() == ErrorKind::RequirementNotMet => return Err(error),
                 Err(error) => failures.push(error),
             }
@@ -407,9 +563,10 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                 self.sign_in_service_account(params.fields, &constraints)
                     .await?
             }
+            GCLOUD => self.sign_in_gcloud(params.fields, &constraints).await?,
             other => {
                 return Err(invalid_params(format!(
-                    "this plugin has no sign-in method {other:?}; its methods are {SERVICE_ACCOUNT}"
+                    "this plugin has no sign-in method {other:?}; its methods are {SERVICE_ACCOUNT} and {GCLOUD}"
                 )));
             }
         };

@@ -414,3 +414,28 @@ pub fn sign_in(method: &str, fields: Value) -> Value {
 pub fn detect(sources: Value) -> Value {
     json!({"sources": sources, "pins": {}, "requirements": []})
 }
+
+/// A gcloud configuration directory at `dir/gcloud`: configurations `dev`
+/// (active, with a project, region and zone) and `default`, and `adc` as
+/// its Application Default Credentials file if given.
+pub fn gcloud_root(dir: &Path, adc: Option<&str>) -> TestResult<String> {
+    let root = dir.join("gcloud");
+    let configurations = root.join("configurations");
+    fs::create_dir_all(&configurations)?;
+    fs::write(
+        configurations.join("config_dev"),
+        "[core]\naccount = someone@example.com\nproject = sandbox-1234\n\n[compute]\nregion = europe-west1\nzone = europe-west1-b\n",
+    )?;
+    fs::write(
+        configurations.join("config_default"),
+        "[core]\nproject = quota-5678\n",
+    )?;
+    fs::write(root.join("active_config"), "dev\n")?;
+    if let Some(adc) = adc {
+        fs::write(root.join("application_default_credentials.json"), adc)?;
+    }
+    Ok(root
+        .to_str()
+        .ok_or("the temporary directory isn't UTF-8")?
+        .to_owned())
+}

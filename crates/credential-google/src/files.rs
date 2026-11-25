@@ -44,6 +44,26 @@ pub(crate) async fn read_text(path: &Path, max: usize) -> Result<String, ReadErr
     String::from_utf8(bytes).map_err(|_not_utf8| ReadError::NotText)
 }
 
+/// Up to `max` names of the entries in `dir`, skipping names that aren't
+/// UTF-8. A directory that can't be read has none.
+pub(crate) async fn list_dir(dir: &Path, max: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(mut entries) = fs::read_dir(dir).await else {
+        return names;
+    };
+    while names.len() < max {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                if let Ok(name) = entry.file_name().into_string() {
+                    names.push(name);
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    names
+}
+
 /// Creates `dir`, readable by its owner only on Unix, if it is missing.
 pub(crate) async fn create_private_dir(dir: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
