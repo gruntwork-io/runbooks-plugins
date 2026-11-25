@@ -16,6 +16,7 @@ pub mod host;
 pub mod ids;
 mod params;
 mod plugin;
+pub mod process_tree;
 mod roles;
 pub mod service_principal;
 mod session;
@@ -23,16 +24,27 @@ mod state_dir;
 
 use std::ffi::OsString;
 use std::fmt;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 pub use plugin::{AzurePlugin, Connect, Network};
+use process_tree::Killer;
 use runbooks_plugin_transport::PluginError;
+
+/// Writes `message` to standard error, the protocol's log.
+fn log(message: fmt::Arguments<'_>) {
+    match writeln!(io::stderr().lock(), "runbooks-credential-azure: {message}") {
+        // A log line standard error cannot take has nowhere else to go.
+        Ok(()) | Err(_) => {}
+    }
+}
 
 /// The `az` `main` found on `PATH`, if any, run with the host's environment.
 #[derive(Clone)]
 pub struct InstalledAz {
     program: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
+    killer: Killer,
 }
 
 /// The environment's names only: its values may hold the person's secrets.
@@ -44,15 +56,25 @@ impl fmt::Debug for InstalledAz {
                 "env",
                 &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             )
+            .field("killer", &self.killer)
             .finish()
     }
 }
 
 impl InstalledAz {
-    /// `program`, if `main` found one, run with `env`.
+    /// `program`, if `main` found one, run with `env`, and ended with
+    /// what it started by `killer`.
     #[must_use]
-    pub const fn new(program: Option<PathBuf>, env: Vec<(OsString, OsString)>) -> Self {
-        Self { program, env }
+    pub const fn new(
+        program: Option<PathBuf>,
+        env: Vec<(OsString, OsString)>,
+        killer: Killer,
+    ) -> Self {
+        Self {
+            program,
+            env,
+            killer,
+        }
     }
 }
 
@@ -70,7 +92,11 @@ impl Connect for InstalledAz {
             env.push(("HTTPS_PROXY".into(), proxy.into()));
             env.push(("HTTP_PROXY".into(), proxy.into()));
         }
-        Ok(az::AzCli::new(self.program.clone(), env))
+        Ok(az::AzCli::new(
+            self.program.clone(),
+            env,
+            self.killer.clone(),
+        ))
     }
 }
 
@@ -80,6 +106,7 @@ mod tests {
 
     use super::InstalledAz;
     use crate::az::AzCli;
+    use crate::process_tree::Killer;
 
     /// Both name the environment's variables and never show their values.
     #[test]
@@ -87,13 +114,18 @@ mod tests {
         let program = Some(PathBuf::from("/usr/bin/az"));
         let env = vec![("ARM_CLIENT_SECRET".into(), "hunter2".into())];
         let shown = [
-            format!("{:?}", InstalledAz::new(program.clone(), env.clone())),
-            format!("{:?}", AzCli::new(program, env)),
+            format!(
+                "{:?}",
+                InstalledAz::new(program.clone(), env.clone(), Killer::ProcessGroup)
+            ),
+            format!("{:?}", AzCli::new(program, env, Killer::ProcessGroup)),
         ];
         for (shown, name) in shown.iter().zip(["InstalledAz", "AzCli"]) {
             assert_eq!(
                 *shown,
-                format!(r#"{name} {{ program: Some("/usr/bin/az"), env: ["ARM_CLIENT_SECRET"] }}"#)
+                format!(
+                    r#"{name} {{ program: Some("/usr/bin/az"), env: ["ARM_CLIENT_SECRET"], killer: ProcessGroup }}"#
+                )
             );
         }
     }

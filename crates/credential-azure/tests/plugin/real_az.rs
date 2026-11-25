@@ -4,12 +4,14 @@
 
 use std::env;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::iter;
 use std::path::Path;
 use std::process::Stdio;
 
 use runbooks_credential_azure::host::Host;
+use runbooks_credential_azure::process_tree::Killer;
 use runbooks_credential_azure::{AzurePlugin, InstalledAz};
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use serde_json::{Value, json};
@@ -18,14 +20,19 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::time::timeout;
 
 use crate::fake_az::{CLIENT, CONTOSO, PROD};
-use crate::scripted_az::{DEVICE_LINE, ScriptedAz, token};
+use crate::hanging_az::{self, HangingAz};
+use crate::scripted_az::{self, DEVICE_LINE, ScriptedAz, token};
 use crate::support::{
     App, TestResult, WAIT, assert_valid, at, detect_params, env_value, error_kind, error_message,
     sign_in_dirs, sign_in_params,
 };
 
 fn installed(scripted: &ScriptedAz) -> InstalledAz {
-    InstalledAz::new(Some(scripted.program()), scripted.env())
+    InstalledAz::new(
+        Some(scripted.program()),
+        scripted.env(),
+        scripted_az::killer(),
+    )
 }
 
 async fn start(az: InstalledAz, state: &Path) -> Result<App, Box<dyn Error>> {
@@ -34,16 +41,16 @@ async fn start(az: InstalledAz, state: &Path) -> Result<App, Box<dyn Error>> {
     Ok(app)
 }
 
-/// Starts the binary as the app does, with the script first on `PATH`.
-fn spawn_binary(scripted: &ScriptedAz) -> Result<Child, Box<dyn Error>> {
-    let program = scripted.program();
+/// Starts the binary as the app does, with `env` and the script `program`
+/// first on `PATH`.
+fn spawn_binary(program: &Path, env: Vec<(OsString, OsString)>) -> Result<Child, Box<dyn Error>> {
     let dir = program.parent().ok_or("the script has no directory")?;
     let path = env::var_os("PATH").unwrap_or_default();
     let path = env::join_paths(iter::once(dir.to_owned()).chain(env::split_paths(&path)))?;
     Ok(
         Command::new(env!("CARGO_BIN_EXE_runbooks-credential-azure"))
             .env_clear()
-            .envs(scripted.env())
+            .envs(env)
             .env("PATH", path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -101,7 +108,7 @@ async fn the_binary_logs_a_tenant_list_az_refuses_and_signs_in_without_it() -> T
         "rest.err",
         "ERROR: Insufficient privileges to complete the operation.\n",
     )?;
-    let mut plugin = spawn_binary(&scripted)?;
+    let mut plugin = spawn_binary(&scripted.program(), scripted.env())?;
     let mut output =
         BufReader::new(plugin.stdout.take().ok_or("the plugin has no output")?).lines();
     let state_dir = state
@@ -149,13 +156,57 @@ async fn the_binary_logs_a_tenant_list_az_refuses_and_signs_in_without_it() -> T
     Ok(())
 }
 
+/// The app cancels a sign-in by closing the plugin's input, and the plugin
+/// exits.
+#[tokio::test]
+async fn closing_the_input_during_a_sign_in_ends_az_and_what_it_started() -> TestResult {
+    let (hanging, state) = (HangingAz::new()?, tempfile::tempdir()?);
+    let mut plugin = spawn_binary(&hanging.program(), hanging.env())?;
+    let mut output =
+        BufReader::new(plugin.stdout.take().ok_or("the plugin has no output")?).lines();
+    let state_dir = state
+        .path()
+        .to_str()
+        .ok_or("the state directory is not UTF-8")?;
+    let configured = ask(
+        &mut plugin,
+        &mut output,
+        (
+            1,
+            "configure",
+            json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": state_dir}),
+        ),
+    )
+    .await?;
+    assert_eq!(at(&configured, "/error"), Value::Null, "{configured}");
+    let request = json!({"jsonrpc": "2.0", "id": 2, "method": "signIn", "params": sign_in_params("cli", &json!({}), &json!({}))});
+    plugin
+        .stdin
+        .as_mut()
+        .ok_or("the plugin's input is closed")?
+        .write_all(format!("{request}\n").as_bytes())
+        .await?;
+    let pids = hanging.started().await?;
+
+    drop(plugin.stdin.take());
+    let ended = timeout(WAIT, plugin.wait()).await??;
+    assert!(ended.success(), "{ended:?}");
+    let running = HangingAz::still_running(&pids).await;
+    assert!(
+        running.is_empty(),
+        "{running:?} of {pids:?} outlived the plugin by {:?}",
+        hanging_az::GONE
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn with_no_az_on_path_a_sign_in_is_tool_missing() -> TestResult {
     let state = tempfile::tempdir()?;
     let missing = state.path().join("not-there").join("az");
     for az in [
-        InstalledAz::new(None, Vec::new()),
-        InstalledAz::new(Some(missing), Vec::new()),
+        InstalledAz::new(None, Vec::new(), Killer::ChildOnly),
+        InstalledAz::new(Some(missing), Vec::new(), Killer::ChildOnly),
     ] {
         let mut app = start(az, state.path()).await?;
         let response = app
@@ -191,7 +242,11 @@ async fn unavailable(az: InstalledAz, state: &Path) -> Result<Vec<Value>, Box<dy
 #[tokio::test]
 async fn with_no_az_on_path_configure_lists_every_method_as_unavailable() -> TestResult {
     let (scripted, state) = (ScriptedAz::new()?, tempfile::tempdir()?);
-    let without = unavailable(InstalledAz::new(None, Vec::new()), state.path()).await?;
+    let without = unavailable(
+        InstalledAz::new(None, Vec::new(), Killer::ChildOnly),
+        state.path(),
+    )
+    .await?;
     assert_eq!(without.len(), 3);
     for why in &without {
         assert_eq!(at(why, "/kind"), "toolMissing", "{why}");

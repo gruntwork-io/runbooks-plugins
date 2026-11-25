@@ -13,7 +13,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::future::{self, Future};
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -32,6 +31,7 @@ use crate::claims::Principal;
 use crate::describe::{self, CLI_SOURCE, SUBSCRIPTION_LEVEL, TENANT_LEVEL};
 use crate::host::Host;
 use crate::ids::{SubscriptionId, TenantId, TenantRef};
+use crate::log;
 use crate::params::{self, Constraints};
 use crate::roles::{self, MissingRole, RoleRequirement};
 use crate::service_principal::{self, Credential, Found, ServicePrincipal};
@@ -541,14 +541,6 @@ fn not_signed_in() -> PluginError {
         ErrorKind::NotSignedIn,
         "This block isn't signed in to Azure. Sign in first.",
     )
-}
-
-/// Writes `message` to standard error, the protocol's log.
-fn log(message: fmt::Arguments<'_>) {
-    match writeln!(io::stderr().lock(), "runbooks-credential-azure: {message}") {
-        // A log line standard error cannot take has nowhere else to go.
-        Ok(()) | Err(_) => {}
-    }
 }
 
 impl<C: Connect> CredentialPlugin for AzurePlugin<C> {

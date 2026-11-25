@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 
 use crate::claims::{Principal, principal_of_token};
 use crate::ids::{ObjectId, SubscriptionId, TenantId, TenantRef};
+use crate::process_tree::{Killer, ProcessTree};
 use crate::service_principal::{Credential, Secret, ServicePrincipal};
 
 /// Where the error for a missing `az` sends the person to install it.
@@ -171,6 +172,7 @@ pub struct AzCli {
     /// `None` when `main` found no `az` on `PATH`.
     program: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
+    killer: Killer,
 }
 
 /// The environment's names only: its values may hold the person's secrets.
@@ -182,16 +184,26 @@ impl fmt::Debug for AzCli {
                 "env",
                 &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             )
+            .field("killer", &self.killer)
             .finish()
     }
 }
 
 impl AzCli {
     /// Runs `program` with exactly `env`, plus the sign-in's config
-    /// directory and settings that keep `az` quiet.
+    /// directory and settings that keep `az` quiet. `killer` ends a call's
+    /// `az`, and what it started, when the call is dropped.
     #[must_use]
-    pub const fn new(program: Option<PathBuf>, env: Vec<(OsString, OsString)>) -> Self {
-        Self { program, env }
+    pub const fn new(
+        program: Option<PathBuf>,
+        env: Vec<(OsString, OsString)>,
+        killer: Killer,
+    ) -> Self {
+        Self {
+            program,
+            env,
+            killer,
+        }
     }
 
     async fn run(
@@ -220,12 +232,11 @@ impl AzCli {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         if let Some(extensions) = &dir.extensions {
             child.env("AZURE_EXTENSION_DIR", extensions);
         }
-        let mut child = child.spawn().map_err(|error| {
+        let mut tree = ProcessTree::spawn(&mut child, self.killer.clone()).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 az_missing()
             } else {
@@ -235,6 +246,7 @@ impl AzCli {
                 )
             }
         })?;
+        let child = tree.child();
         let (stdin, stdout, stderr) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let write = async {
@@ -245,30 +257,31 @@ impl AzCli {
             }
         };
         let finished = tokio::time::timeout(timeout, async {
-            tokio::join!(
+            let ((), stdout, stderr) = tokio::join!(
                 write,
                 read_capped(stdout),
-                read_stderr(stderr, &mut on_stderr_line),
-                child.wait()
-            )
+                read_stderr(stderr, &mut on_stderr_line)
+            );
+            // Reaped once its output has closed: until then, a process az
+            // left holding that output is still in the group a stop ends.
+            (stdout, stderr, tree.child().wait().await)
         })
-        .await
-        .map_err(|_elapsed| {
-            PluginError::new(
+        .await;
+        let Ok((stdout, stderr, status)) = finished else {
+            return Err(PluginError::new(
                 ErrorKind::TimedOut,
                 format!(
                     "{command} did not finish within {} seconds",
                     timeout.as_secs()
                 ),
-            )
-        })?;
+            ));
+        };
         let read_failed = |error: std::io::Error| {
             PluginError::new(
                 ErrorKind::Internal,
                 format!("reading the output of {command}: {error}"),
             )
         };
-        let ((), stdout, stderr, status) = finished;
         let (stdout, stderr, status) = (
             stdout.map_err(read_failed)?,
             stderr.map_err(read_failed)?,

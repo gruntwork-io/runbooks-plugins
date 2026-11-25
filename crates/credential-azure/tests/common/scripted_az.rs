@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use runbooks_credential_azure::host::Host;
+use runbooks_credential_azure::process_tree::Killer;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -29,6 +30,11 @@ pub(crate) fn token() -> String {
         URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#),
         URL_SAFE_NO_PAD.encode(claims.to_string())
     )
+}
+
+/// How `main` ends `az` and what it started, on this OS.
+pub(crate) fn killer() -> Killer {
+    Host::new(std::env::vars_os(), cfg!(windows)).tree_killer()
 }
 
 pub(crate) const DEVICE_LINE: &str = "To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code SCRIPTED1 to authenticate.";

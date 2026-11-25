@@ -10,7 +10,7 @@ use runbooks_plugin_transport::serve_stdio;
 
 fn main() -> ExitCode {
     let host = Host::new(std::env::vars_os(), cfg!(windows));
-    let az = InstalledAz::new(host.find_program("az"), host.az_env());
+    let az = InstalledAz::new(host.find_program("az"), host.az_env(), host.tree_killer());
     let plugin = AzurePlugin::new(host, az);
 
     let runtime = match tokio::runtime::Builder::new_current_thread()

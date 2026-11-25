@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use runbooks_credential_azure::az::{Az, AzCli, AzDir, DeviceCode, Interactive};
 use runbooks_credential_azure::ids::{ClientId, ObjectId, SubscriptionId, TenantId, TenantRef};
+use runbooks_credential_azure::process_tree::Killer;
 use runbooks_credential_azure::service_principal::{Credential, Secret, ServicePrincipal};
 use runbooks_plugin_protocol::credential::ErrorKind;
 use serde_json::json;
@@ -67,8 +68,8 @@ async fn without_az_every_call_is_tool_missing() -> TestResult {
     let (tenant, subscription, object_id) = ids()?;
     let missing = temp.path().join("not-there").join("az");
     for az in [
-        AzCli::new(None, Vec::new()),
-        AzCli::new(Some(missing), Vec::new()),
+        AzCli::new(None, Vec::new(), Killer::ChildOnly),
+        AzCli::new(Some(missing), Vec::new(), Killer::ChildOnly),
     ] {
         let (sender, _receiver) = oneshot::channel();
         let tenant = TenantRef::Id(tenant.clone());
@@ -122,7 +123,11 @@ async fn each_call_runs_az_quietly_in_the_sign_ins_config_dir() -> TestResult {
     )?;
     let (config, extensions) = (tempfile::tempdir()?, tempfile::tempdir()?);
     let dir = az_dir(config.path(), Some(extensions.path()));
-    let az = AzCli::new(Some(scripted.program()), scripted.env());
+    let az = AzCli::new(
+        Some(scripted.program()),
+        scripted.env(),
+        scripted_az::killer(),
+    );
     let (tenant, subscription, object_id) = ids()?;
 
     let accounts = bounded(Box::pin(az.accounts(&dir))).await??;
@@ -182,7 +187,11 @@ async fn a_device_code_is_sent_as_soon_as_az_prints_it() -> TestResult {
     let scripted = ScriptedAz::new()?;
     scripted.respond("login.err", &format!("WARNING: starting\n{DEVICE_LINE}\n"))?;
     let config = tempfile::tempdir()?;
-    let az = AzCli::new(Some(scripted.program()), scripted.env());
+    let az = AzCli::new(
+        Some(scripted.program()),
+        scripted.env(),
+        scripted_az::killer(),
+    );
     let (sender, receiver) = oneshot::channel();
     let tenant = TenantRef::parse("contoso.onmicrosoft.com").ok_or("tenant")?;
     bounded(Box::pin(az.login(
@@ -232,7 +241,11 @@ async fn a_failure_is_answered_with_its_error_line_and_kind() -> TestResult {
     )?;
     let config = tempfile::tempdir()?;
     let dir = az_dir(config.path(), None);
-    let az = AzCli::new(Some(scripted.program()), scripted.env());
+    let az = AzCli::new(
+        Some(scripted.program()),
+        scripted.env(),
+        scripted_az::killer(),
+    );
 
     let (sender, _receiver) = oneshot::channel();
     let login = bounded(Box::pin(az.login(&dir, Interactive::Browser, None, sender)))
@@ -265,7 +278,11 @@ async fn output_that_is_not_what_az_documents_is_never_quoted() -> TestResult {
         "{\"accessToken\": 7, \"x\": \"SECRET-SIGNATURE\"",
     )?;
     let config = tempfile::tempdir()?;
-    let az = AzCli::new(Some(scripted.program()), scripted.env());
+    let az = AzCli::new(
+        Some(scripted.program()),
+        scripted.env(),
+        scripted_az::killer(),
+    );
     let error = bounded(Box::pin(az.principal(&az_dir(config.path(), None), None)))
         .await?
         .err()
@@ -288,7 +305,11 @@ async fn a_token_az_cant_get_for_a_tenant_says_to_sign_in_with_it() -> TestResul
     )?;
     let config = tempfile::tempdir()?;
     let dir = az_dir(config.path(), None);
-    let az = AzCli::new(Some(scripted.program()), scripted.env());
+    let az = AzCli::new(
+        Some(scripted.program()),
+        scripted.env(),
+        scripted_az::killer(),
+    );
     let (tenant, _, _) = ids()?;
 
     let error = bounded(Box::pin(az.principal(&dir, Some(&TenantRef::Id(tenant)))))
@@ -322,7 +343,11 @@ async fn a_service_principal_secret_goes_on_stdin_and_never_into_a_message() -> 
     let scripted = ScriptedAz::new()?;
     let config = tempfile::tempdir()?;
     let dir = az_dir(config.path(), None);
-    let az = AzCli::new(Some(scripted.program()), scripted.env());
+    let az = AzCli::new(
+        Some(scripted.program()),
+        scripted.env(),
+        scripted_az::killer(),
+    );
     let principal = service_principal(Credential::Secret(Secret::new(SECRET.to_owned())))?;
 
     az.login_service_principal(&dir, &principal).await?;
@@ -360,7 +385,11 @@ async fn a_service_principal_certificate_is_passed_by_path() -> TestResult {
     let scripted = ScriptedAz::new()?;
     let config = tempfile::tempdir()?;
     let pem = config.path().join("client-certificate.pem");
-    let az = AzCli::new(Some(scripted.program()), scripted.env());
+    let az = AzCli::new(
+        Some(scripted.program()),
+        scripted.env(),
+        scripted_az::killer(),
+    );
     let principal = service_principal(Credential::Certificate(pem.clone()))?;
     az.login_service_principal(&az_dir(config.path(), None), &principal)
         .await?;

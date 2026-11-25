@@ -5,6 +5,8 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::process_tree::Killer;
+
 /// Variables that point `az` at a config directory. The plugin sets its own
 /// for every `az` it runs.
 const AZ_DIR_VARS: [&str; 2] = ["AZURE_CONFIG_DIR", "AZURE_EXTENSION_DIR"];
@@ -109,6 +111,19 @@ impl Host {
             .is_ok_and(|meta| meta.is_file() && (self.windows || executable(&meta)))
     }
 
+    /// How to end `az` and what it started. On Windows that is
+    /// `taskkill.exe` in `%SystemRoot%\System32`, never one from `PATH`.
+    #[must_use]
+    pub fn tree_killer(&self) -> Killer {
+        if self.windows {
+            self.var("SystemRoot").map_or(Killer::ChildOnly, |root| {
+                Killer::Taskkill(Path::new(root).join("System32").join("taskkill.exe"))
+            })
+        } else {
+            Killer::ProcessGroup
+        }
+    }
+
     /// Where the environment says the person's own `az` login is.
     pub fn local_login(&self) -> LocalLogin {
         let home = if self.windows { "USERPROFILE" } else { "HOME" };
@@ -149,6 +164,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::Host;
+    use crate::process_tree::Killer;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -274,6 +290,23 @@ mod tests {
         .az_env();
         let names: Vec<_> = env.iter().map(|(key, _)| key.clone()).collect();
         assert_eq!(names, [OsString::from("PATH")]);
+    }
+
+    #[test]
+    fn taskkill_comes_from_system_root_and_unix_signals_the_group() {
+        let root = OsString::from("C:\\Windows");
+        let taskkill = Path::new("C:\\Windows")
+            .join("System32")
+            .join("taskkill.exe");
+        assert_eq!(
+            host(&[("SYSTEMROOT", &root)], true).tree_killer(),
+            Killer::Taskkill(taskkill)
+        );
+        assert_eq!(host(&[], true).tree_killer(), Killer::ChildOnly);
+        assert_eq!(
+            host(&[("SystemRoot", &root)], false).tree_killer(),
+            Killer::ProcessGroup
+        );
     }
 
     #[test]

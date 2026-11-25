@@ -4,6 +4,8 @@
 //! real adapter, with a script standing in for `az`.
 
 mod fake_az;
+#[path = "../common/hanging_az.rs"]
+mod hanging_az;
 mod protocol;
 mod real_az;
 #[path = "../common/scripted_az.rs"]
