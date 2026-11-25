@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MPL-2.0"
+repository = "https://github.com/gruntwork-io/runbooks-plugins"
+publish = false
+
+[workspace.dependencies]
+runbooks-plugin-protocol = { path = "crates/protocol" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+time = { version = "0.3.55", features = ["serde", "formatting", "parsing"] }
+typify = "0.10.1"
+jsonschema = { version = "0.61.2", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+allow_attributes = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+todo = "deny"
+unwrap_used = "deny"
