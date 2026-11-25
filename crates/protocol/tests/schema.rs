@@ -203,3 +203,23 @@ fn a_detection_source_of_an_unknown_kind_is_refused() -> TestResult {
     let params = json!({"sources":[{"kind":"keychain"}],"pins":{},"requirements":[]});
     assert_refused::<credential::DetectParams>("credential.schema.json#/$defs/detectParams", params)
 }
+
+#[test]
+fn an_error_response_round_trips_with_an_integer_code() -> TestResult {
+    let response = json!({"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"the role is not in account 123456789012","data":{"kind":"pinMismatch"}}});
+    round_trip::<base::ErrorResponse>("base.schema.json#/$defs/errorResponse", &response)
+}
+
+#[test]
+fn an_error_response_to_an_unreadable_request_has_a_null_id() -> TestResult {
+    let response = json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"the line is not JSON","data":{"kind":"invalidParams"}}});
+    round_trip::<base::ErrorResponse>("base.schema.json#/$defs/errorResponse", &response)
+}
+
+#[test]
+fn error_data_keeps_a_kinds_own_fields() -> TestResult {
+    let data = json!({"kind":"requirementNotMet","unmet":[{"kind":"scopes","scopes":["https://www.googleapis.com/auth/cloud-platform"]}]});
+    assert_valid("credential.schema.json#/$defs/requirementNotMetData", &data)?;
+    let response = json!({"jsonrpc":"2.0","id":"7","error":{"code":-32000,"message":"a scope is missing","data":data}});
+    round_trip::<base::ErrorResponse>("base.schema.json#/$defs/errorResponse", &response)
+}
