@@ -5,8 +5,7 @@
 //!
 //! [`GooglePlugin`] implements the transport's
 //! [`CredentialPlugin`](runbooks_plugin_transport::CredentialPlugin). Its
-//! network is a [`GoogleApi`] and its cryptography a [`Crypto`], so tests run
-//! it with fakes.
+//! network is a [`GoogleApi`], so tests run it against a fake Google.
 
 mod api;
 mod credential;
@@ -23,6 +22,5 @@ pub use api::{
     ApiError, GoogleApi, HttpApi, MAX_RESPONSE_BYTES, Network, NetworkError, OAuthError, Project,
     ProjectPage, TIMEOUT, TOKEN_URL, Token, TokenInfo, TokenRequest,
 };
-pub use crypto::{Crypto, CryptoError, FlowSecrets, JwtClaims, RustlsCrypto};
 pub use plugin::{Connect, GooglePlugin, Host, MAX_PROJECTS};
 pub use secret::Secret;

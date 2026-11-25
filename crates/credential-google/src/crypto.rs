@@ -22,60 +22,34 @@ const JWT_HEADER: &str = r#"{"alg":"RS256","typ":"JWT"}"#;
 /// The claims of a service account's JWT assertion, which Google's token
 /// endpoint exchanges for an access token.
 #[derive(Clone, Debug)]
-pub struct JwtClaims {
+pub(crate) struct JwtClaims {
     /// The service account's email.
-    pub issuer: String,
+    pub(crate) issuer: String,
     /// The scopes asked for, separated by spaces.
-    pub scope: String,
+    pub(crate) scope: String,
     /// The token endpoint.
-    pub audience: String,
+    pub(crate) audience: String,
     /// Seconds since the Unix epoch.
-    pub issued_at: i64,
+    pub(crate) issued_at: i64,
     /// Seconds since the Unix epoch.
-    pub expires_at: i64,
-}
-
-/// The signing the plugin does.
-pub trait Crypto: Send + Sync + 'static {
-    /// The compact JWS of `claims`: `header.claims.signature`, each part
-    /// base64url without padding, signed RS256 with `private_key`, a PKCS #8
-    /// RSA key in PEM as Google issues it.
-    ///
-    /// # Errors
-    ///
-    /// [`CryptoError::InvalidKey`] if `private_key` is not such a key.
-    fn sign_jwt(&self, claims: &JwtClaims, private_key: &Secret) -> Result<Secret, CryptoError>;
-
-    /// Fresh secrets for one browser sign-in: a random `state` and PKCE code
-    /// verifier (RFC 7636: 43 to 128 unreserved characters, from at least
-    /// 32 random bytes), and the verifier's S256 challenge, the base64url
-    /// SHA-256 of it without padding.
-    ///
-    /// # Errors
-    ///
-    /// [`CryptoError::Failed`] if the random source fails.
-    fn flow_secrets(&self) -> Result<FlowSecrets, CryptoError>;
-
-    /// Whether `left` and `right` are equal, taking time that depends on
-    /// their lengths only, not on where they differ.
-    fn same(&self, left: &[u8], right: &[u8]) -> bool;
+    pub(crate) expires_at: i64,
 }
 
 /// The secrets of one browser sign-in.
 #[derive(Clone, Debug)]
-pub struct FlowSecrets {
+pub(crate) struct FlowSecrets {
     /// Sent to Google in the sign-in URL and checked on the way back, so it
     /// is shown to the person; it guards only this one sign-in.
-    pub state: String,
+    pub(crate) state: String,
     /// The PKCE code verifier, sent only in the token exchange.
-    pub verifier: Secret,
+    pub(crate) verifier: Secret,
     /// The verifier's S256 challenge, sent in the sign-in URL.
-    pub challenge: String,
+    pub(crate) challenge: String,
 }
 
-/// Why a [`Crypto`] call failed.
+/// Why signing or making a sign-in's secrets failed.
 #[derive(Debug, thiserror::Error)]
-pub enum CryptoError {
+pub(crate) enum CryptoError {
     /// The system's cryptography failed at the named step.
     #[error("the system's cryptography could not {0}")]
     Failed(&'static str),
@@ -84,55 +58,66 @@ pub enum CryptoError {
     InvalidKey,
 }
 
-/// [`Crypto`] over rustls' aws-lc-rs provider.
-#[derive(Clone, Copy, Debug)]
-pub struct RustlsCrypto;
+/// The compact JWS of `claims`: `header.claims.signature`, each part
+/// base64url without padding, signed RS256 with `private_key`, a PKCS #8
+/// RSA key in PEM as Google issues it.
+///
+/// # Errors
+///
+/// [`CryptoError::InvalidKey`] if `private_key` is not such a key.
+pub(crate) fn sign_jwt(claims: &JwtClaims, private_key: &Secret) -> Result<Secret, CryptoError> {
+    // The parse error is dropped: it can quote a line of the key.
+    let key = PrivatePkcs8KeyDer::from_pem_slice(private_key.expose().as_bytes())
+        .map_err(|_quotes_the_key| CryptoError::InvalidKey)?;
+    let signer = aws_lc_rs::default_provider()
+        .key_provider
+        .load_private_key(key.into())
+        .map_err(|_not_a_key| CryptoError::InvalidKey)?
+        .choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
+        .ok_or(CryptoError::InvalidKey)?;
+    let claims = json!({
+        "iss": claims.issuer,
+        "scope": claims.scope,
+        "aud": claims.audience,
+        "iat": claims.issued_at,
+        "exp": claims.expires_at,
+    });
+    let signing_input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(JWT_HEADER),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    let signature = signer
+        .sign(signing_input.as_bytes())
+        .map_err(|_sign_failed| CryptoError::Failed("sign the token request"))?;
+    Ok(Secret::new(format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature)
+    )))
+}
 
-impl Crypto for RustlsCrypto {
-    fn sign_jwt(&self, claims: &JwtClaims, private_key: &Secret) -> Result<Secret, CryptoError> {
-        // The parse error is dropped: it can quote a line of the key.
-        let key = PrivatePkcs8KeyDer::from_pem_slice(private_key.expose().as_bytes())
-            .map_err(|_quotes_the_key| CryptoError::InvalidKey)?;
-        let signer = aws_lc_rs::default_provider()
-            .key_provider
-            .load_private_key(key.into())
-            .map_err(|_not_a_key| CryptoError::InvalidKey)?
-            .choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
-            .ok_or(CryptoError::InvalidKey)?;
-        let claims = json!({
-            "iss": claims.issuer,
-            "scope": claims.scope,
-            "aud": claims.audience,
-            "iat": claims.issued_at,
-            "exp": claims.expires_at,
-        });
-        let signing_input = format!(
-            "{}.{}",
-            URL_SAFE_NO_PAD.encode(JWT_HEADER),
-            URL_SAFE_NO_PAD.encode(claims.to_string())
-        );
-        let signature = signer
-            .sign(signing_input.as_bytes())
-            .map_err(|_sign_failed| CryptoError::Failed("sign the token request"))?;
-        Ok(Secret::new(format!(
-            "{signing_input}.{}",
-            URL_SAFE_NO_PAD.encode(signature)
-        )))
-    }
+/// Fresh secrets for one browser sign-in: a random `state` and PKCE code
+/// verifier (RFC 7636: 43 to 128 unreserved characters, from at least 32
+/// random bytes), and the verifier's S256 challenge, the base64url SHA-256
+/// of it without padding.
+///
+/// # Errors
+///
+/// [`CryptoError::Failed`] if the random source fails.
+pub(crate) fn flow_secrets() -> Result<FlowSecrets, CryptoError> {
+    let provider = aws_lc_rs::default_provider();
+    let verifier = random_text(&provider)?;
+    Ok(FlowSecrets {
+        state: random_text(&provider)?,
+        challenge: challenge(&provider, &verifier)?,
+        verifier: Secret::new(verifier),
+    })
+}
 
-    fn flow_secrets(&self) -> Result<FlowSecrets, CryptoError> {
-        let provider = aws_lc_rs::default_provider();
-        let verifier = random_text(&provider)?;
-        Ok(FlowSecrets {
-            state: random_text(&provider)?,
-            challenge: challenge(&provider, &verifier)?,
-            verifier: Secret::new(verifier),
-        })
-    }
-
-    fn same(&self, left: &[u8], right: &[u8]) -> bool {
-        left.ct_eq(right).into()
-    }
+/// Whether `left` and `right` are equal, taking time that depends on their
+/// lengths only, not on where they differ.
+pub(crate) fn same(left: &[u8], right: &[u8]) -> bool {
+    left.ct_eq(right).into()
 }
 
 /// [`RANDOM_BYTES`] from `provider`'s secure random source, in base64url.
@@ -161,7 +146,7 @@ fn challenge(provider: &CryptoProvider, verifier: &str) -> Result<String, Crypto
 mod tests {
     use rustls::crypto::aws_lc_rs;
 
-    use super::{Crypto, CryptoError, JwtClaims, RustlsCrypto, challenge};
+    use super::{CryptoError, JwtClaims, challenge, flow_secrets, same, sign_jwt};
     use crate::Secret;
 
     #[test]
@@ -177,8 +162,8 @@ mod tests {
 
     #[test]
     fn each_sign_in_gets_new_unreserved_secrets() -> Result<(), CryptoError> {
-        let first = RustlsCrypto.flow_secrets()?;
-        let second = RustlsCrypto.flow_secrets()?;
+        let first = flow_secrets()?;
+        let second = flow_secrets()?;
         for secrets in [&first, &second] {
             let verifier = secrets.verifier.expose();
             assert!((43..=128).contains(&verifier.len()), "{verifier}");
@@ -202,11 +187,11 @@ mod tests {
 
     #[test]
     fn same_compares_whole_values() {
-        assert!(RustlsCrypto.same(b"state", b"state"));
-        assert!(RustlsCrypto.same(b"", b""));
-        assert!(!RustlsCrypto.same(b"state", b"statf"));
-        assert!(!RustlsCrypto.same(b"state", b"stat"));
-        assert!(!RustlsCrypto.same(b"stat", b"state"));
+        assert!(same(b"state", b"state"));
+        assert!(same(b"", b""));
+        assert!(!same(b"state", b"statf"));
+        assert!(!same(b"state", b"stat"));
+        assert!(!same(b"stat", b"state"));
     }
 
     #[test]
@@ -224,7 +209,7 @@ mod tests {
             "-----BEGIN PRIVATE KEY-----\nU0VOVElORUwtUFJJVkFURS1LRVk=\n-----END PRIVATE KEY-----\n",
             "-----BEGIN RSA PRIVATE KEY-----\nU0VOVElORUwtUFJJVkFURS1LRVk=\n-----END RSA PRIVATE KEY-----\n",
         ] {
-            let Err(error) = RustlsCrypto.sign_jwt(&claims, &Secret::new(key)) else {
+            let Err(error) = sign_jwt(&claims, &Secret::new(key)) else {
                 return Err(format!("{key} signed"));
             };
             assert!(matches!(error, CryptoError::InvalidKey), "{key}");

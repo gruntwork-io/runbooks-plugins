@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use runbooks_credential_google::{GooglePlugin, Host, OAuthError, RustlsCrypto, TokenRequest};
+use runbooks_credential_google::{GooglePlugin, Host, OAuthError, TokenRequest};
 use serde_json::json;
 
 use crate::support::{
@@ -172,10 +172,6 @@ fn the_plugins_debug_names_it_and_shows_nothing_it_holds() {
         now,
     };
     let google = google();
-    let plugin = GooglePlugin::new(
-        host,
-        Box::new(move |_network| Ok(google.clone())),
-        RustlsCrypto,
-    );
+    let plugin = GooglePlugin::new(host, Box::new(move |_network| Ok(google.clone())));
     assert_eq!(format!("{plugin:?}"), "GooglePlugin { .. }");
 }

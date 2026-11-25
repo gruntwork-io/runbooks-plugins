@@ -17,7 +17,6 @@ use time::OffsetDateTime;
 use crate::Secret;
 use crate::api::{GoogleApi, Network, NetworkError, Project};
 use crate::credential::{Credential, MAX_DOCUMENT_BYTES, Origin, api_error, parse_document};
-use crate::crypto::Crypto;
 use crate::files::{self, CREDENTIALS_FILE, ReadError};
 use crate::gcloud::{ADC_LOGIN, Configuration, ConfigurationName, Root};
 use crate::oauth::{self, ClientFields, DEFAULT_SCOPES};
@@ -61,10 +60,9 @@ impl fmt::Debug for Host {
 pub type Connect<A> = Box<dyn Fn(&Network) -> Result<A, NetworkError> + Send + Sync>;
 
 /// The Google credential plugin, for one block.
-pub struct GooglePlugin<A, C> {
+pub struct GooglePlugin<A> {
     host: Host,
     connect: Connect<A>,
-    crypto: C,
     state: Mutex<State<A>>,
 }
 
@@ -116,20 +114,20 @@ struct Configured<A> {
 }
 
 // The host's environment and the session hold secrets.
-impl<A, C> fmt::Debug for GooglePlugin<A, C> {
+impl<A> fmt::Debug for GooglePlugin<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GooglePlugin").finish_non_exhaustive()
     }
 }
 
-impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
-    /// A plugin that reads `host`, reaches Google through what `connect`
-    /// builds, and signs with `crypto`.
-    pub fn new(host: Host, connect: Connect<A>, crypto: C) -> Self {
+impl<A: GoogleApi> GooglePlugin<A> {
+    /// A plugin that reads `host` and reaches Google through what `connect`
+    /// builds.
+    #[must_use]
+    pub fn new(host: Host, connect: Connect<A>) -> Self {
         Self {
             host,
             connect,
-            crypto,
             state: Mutex::new(State {
                 configured: None,
                 session: None,
@@ -161,10 +159,9 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
             .ok_or_else(|| PluginError::new(ErrorKind::NotSignedIn, "Sign in first."))
     }
 
-    fn prover<'a>(&'a self, api: &'a A) -> Prover<'a, A, C> {
+    fn prover<'a>(&'a self, api: &'a A) -> Prover<'a, A> {
         Prover {
             api,
-            crypto: &self.crypto,
             now: (self.host.now)(),
         }
     }
@@ -246,7 +243,7 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
         } else {
             constraints.scopes.clone()
         };
-        let document = oauth::sign_in(&*api, &self.crypto, &client, &scopes, prompts).await?;
+        let document = oauth::sign_in(&*api, &client, &scopes, prompts).await?;
         let candidate = Candidate {
             credential: Credential::Document(document),
             method: OAUTH.to_owned(),
@@ -555,7 +552,7 @@ enum Lookup {
     Gcloud,
 }
 
-impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
+impl<A: GoogleApi> CredentialPlugin for GooglePlugin<A> {
     async fn configure(&self, params: ConfigureParams) -> Result<ConfigureResult, PluginError> {
         let state_dir = PathBuf::from(&params.state_dir);
         if !state_dir.is_absolute() {

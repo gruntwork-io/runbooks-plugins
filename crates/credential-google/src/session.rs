@@ -14,7 +14,6 @@ use crate::api::GoogleApi;
 use crate::credential::{
     Credential, CredentialType, Origin, access_token, api_error, denies_project,
 };
-use crate::crypto::Crypto;
 
 /// The one target level: the project commands operate on.
 pub(crate) const PROJECT: &str = "project";
@@ -144,13 +143,12 @@ pub(crate) struct Session {
 }
 
 /// What proving a credential needs from the plugin.
-pub(crate) struct Prover<'a, A, C> {
+pub(crate) struct Prover<'a, A> {
     pub(crate) api: &'a A,
-    pub(crate) crypto: &'a C,
     pub(crate) now: OffsetDateTime,
 }
 
-impl<A: GoogleApi, C: Crypto> Prover<'_, A, C> {
+impl<A: GoogleApi> Prover<'_, A> {
     /// Mints a token for `candidate` and asks Google who it is, then checks
     /// the required scopes and that a pinned project is readable.
     ///
@@ -231,7 +229,7 @@ impl<A: GoogleApi, C: Crypto> Prover<'_, A, C> {
         &self,
         credential: &Credential,
     ) -> Result<crate::Secret, PluginError> {
-        access_token(self.api, self.crypto, self.now.unix_timestamp(), credential).await
+        access_token(self.api, self.now.unix_timestamp(), credential).await
     }
 
     /// The project as a target, named by its display name when Google says it.

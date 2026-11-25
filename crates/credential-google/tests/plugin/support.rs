@@ -15,8 +15,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonschema::{Draft, Registry, Validator};
 use reqwest::Url;
 use runbooks_credential_google::{
-    ApiError, GoogleApi, GooglePlugin, Host, OAuthError, Project, ProjectPage, RustlsCrypto,
-    Secret, Token, TokenInfo, TokenRequest,
+    ApiError, GoogleApi, GooglePlugin, Host, OAuthError, Project, ProjectPage, Secret, Token,
+    TokenInfo, TokenRequest,
 };
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_transport::{ServeError, serve};
@@ -378,11 +378,7 @@ impl App {
             now,
         };
         let google = google.clone();
-        let plugin = GooglePlugin::new(
-            host,
-            Box::new(move |_network| Ok(google.clone())),
-            RustlsCrypto,
-        );
+        let plugin = GooglePlugin::new(host, Box::new(move |_network| Ok(google.clone())));
         let (stdin, plugin_stdin) = duplex(1024 * 1024);
         let (plugin_stdout, stdout) = duplex(1024 * 1024);
         let message = json!({ "oneOf": [

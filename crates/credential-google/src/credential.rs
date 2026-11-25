@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::Secret;
 use crate::api::{ApiError, GoogleApi, OAuthError, TOKEN_URL, TokenRequest};
-use crate::crypto::{Crypto, CryptoError, JwtClaims};
+use crate::crypto::{self, CryptoError, JwtClaims};
 
 pub(crate) const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 /// The largest credentials document read. Google's are about 2 KB.
@@ -205,9 +205,8 @@ impl Origin {
 }
 
 /// An access token for `credential`, minted fresh unless it is one.
-pub(crate) async fn access_token<A: GoogleApi, C: Crypto>(
+pub(crate) async fn access_token<A: GoogleApi>(
     api: &A,
-    crypto: &C,
     now_unix: i64,
     credential: &Credential,
 ) -> Result<Secret, PluginError> {
@@ -226,9 +225,8 @@ pub(crate) async fn access_token<A: GoogleApi, C: Crypto>(
                     issued_at: now_unix,
                     expires_at: now_unix + ASSERTION_SECONDS,
                 };
-                let assertion = crypto
-                    .sign_jwt(&claims, private_key)
-                    .map_err(|error| crypto_error(&error))?;
+                let assertion =
+                    crypto::sign_jwt(&claims, private_key).map_err(|error| crypto_error(&error))?;
                 TokenRequest::JwtBearer { assertion }
             }
             DocumentKind::AuthorizedUser {

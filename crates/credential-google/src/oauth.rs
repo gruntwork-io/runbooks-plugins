@@ -21,7 +21,7 @@ use crate::api::{ApiError, GoogleApi, OAuthError, Token, TokenRequest};
 use crate::credential::{
     CLOUD_PLATFORM_SCOPE, Document, Origin, api_error, crypto_error, parse_document,
 };
-use crate::crypto::Crypto;
+use crate::crypto;
 use crate::files::{self, ReadError};
 use crate::session::invalid_params;
 
@@ -212,16 +212,13 @@ fn parse_client(text: &str) -> Result<Client, &'static str> {
 ///
 /// `timedOut` if no sign-in arrives in [`SIGN_IN_WINDOW`], `cancelled` if the
 /// person declines, and the token exchange's failure as an error kind.
-pub(crate) async fn sign_in<A: GoogleApi, C: Crypto>(
+pub(crate) async fn sign_in<A: GoogleApi>(
     api: &A,
-    crypto: &C,
     client: &Client,
     scopes: &[String],
     prompts: &Prompts,
 ) -> Result<Document, PluginError> {
-    let secrets = crypto
-        .flow_secrets()
-        .map_err(|error| crypto_error(&error))?;
+    let secrets = crypto::flow_secrets().map_err(|error| crypto_error(&error))?;
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(|error| listener_error(&error))?;
@@ -261,7 +258,7 @@ pub(crate) async fn sign_in<A: GoogleApi, C: Crypto>(
             ));
         };
         let state = callback.param("state").unwrap_or_default();
-        if !crypto.same(state.as_bytes(), secrets.state.as_bytes()) {
+        if !crypto::same(state.as_bytes(), secrets.state.as_bytes()) {
             // Only a request that knows the state may end the sign-in.
             callback.respond(Page::BadRequest).await;
             continue;
