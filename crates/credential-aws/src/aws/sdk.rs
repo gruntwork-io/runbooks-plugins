@@ -589,17 +589,19 @@ fn kind_of_code(code: &str, server_error: bool) -> AwsErrorKind {
 }
 
 /// rustls reports a failed handshake, an untrusted certificate among them,
-/// as an `io::Error` of kind `InvalidData` somewhere in the error's sources.
+/// as an `io::Error` of kind `InvalidData`, which hyper-rustls wraps in
+/// another `io::Error`. An `io::Error`'s `source` skips its payload, so the
+/// payload is looked at instead.
 fn is_tls_failure(error: &(dyn StdError + 'static)) -> bool {
     let mut next = Some(error);
     while let Some(current) = next {
-        if current
-            .downcast_ref::<io::Error>()
-            .is_some_and(|io| io.kind() == io::ErrorKind::InvalidData)
-        {
-            return true;
-        }
-        next = current.source();
+        next = match current.downcast_ref::<io::Error>() {
+            Some(io) if io.kind() == io::ErrorKind::InvalidData => return true,
+            Some(io) => io
+                .get_ref()
+                .map_or_else(|| current.source(), |payload| Some(payload)),
+            None => current.source(),
+        };
     }
     false
 }
@@ -737,6 +739,13 @@ mod tests {
                 .ends_with(": invalid peer certificate: UnknownIssuer"),
             "{error}"
         );
+        // As hyper-rustls hands it on, under an I/O error of another kind.
+        let wrapped = io::Error::other(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        let error = dispatch(ConnectorError::io(Box::new(wrapped)));
+        assert_eq!(error.kind, AwsErrorKind::Tls, "{error}");
 
         let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused");
         let error = dispatch(ConnectorError::io(Box::new(refused)));
@@ -1245,14 +1254,18 @@ mod tests {
             ["/getRegionOptStatus with AKIATEST for account in us-east-1"]
         );
 
+        // A TLS failure, which the plugin answers with a hint to give
+        // Runbooks the CA certificate.
         let untrusted = FakeSso::start_tls(account, &Network::default())?;
         let refused = untrusted
             .aws
             .region_enabled(&signing_keys(), &target, &home)
             .await
             .err()
-            .map(|error| error.service);
-        assert_eq!(refused, Some(Service::Account));
+            .map(|error| (error.service, error.kind, error.detail));
+        let (service, kind, detail) = refused.ok_or("trusted without the bundle")?;
+        assert_eq!((service, kind), (Service::Account, AwsErrorKind::Tls));
+        assert!(detail.ends_with("UnknownIssuer"), "{detail}");
         assert_eq!(untrusted.requests(), Vec::<String>::new());
         Ok(())
     }
