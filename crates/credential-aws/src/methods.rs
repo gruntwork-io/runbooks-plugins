@@ -29,8 +29,8 @@ pub(crate) const DEFAULT_REGION: &str = "defaultRegion";
 /// The AWS access portal, like `https://my-org.awsapps.com/start`, and the
 /// region IAM Identity Center runs in. The block's `ssoStartUrl` and
 /// `ssoRegion` fill them in.
-pub const SSO_START_URL: &str = "ssoStartUrl";
-pub const SSO_REGION: &str = "ssoRegion";
+pub(crate) const SSO_START_URL: &str = "ssoStartUrl";
+pub(crate) const SSO_REGION: &str = "ssoRegion";
 
 /// The sign-in methods: the block's tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,7 +255,7 @@ impl<'a> Fields<'a> {
     /// # Errors
     ///
     /// [`InvalidFields::StartUrl`] for anything but an `https://` URL.
-    pub fn start_url(self) -> Result<&'a str, InvalidFields> {
+    pub(crate) fn start_url(self) -> Result<&'a str, InvalidFields> {
         let url = self.required(SSO_START_URL);
         let host = url.strip_prefix("https://").unwrap_or_default();
         if host.is_empty() || url.len() > MAX_URL_LEN || url.chars().any(char::is_whitespace) {

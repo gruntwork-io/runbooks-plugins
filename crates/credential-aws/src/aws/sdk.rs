@@ -4,6 +4,7 @@ use std::error::Error as StdError;
 use std::io;
 use std::time::{Duration, SystemTime};
 
+use aws_sdk_ssooidc::operation::create_token::CreateTokenError;
 use aws_sdk_sts::config::timeout::TimeoutConfig;
 use aws_sdk_sts::config::{BehaviorVersion, Credentials, Region as SdkRegion};
 use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
@@ -143,7 +144,7 @@ impl Aws for SdkAws {
             .map_err(|error| classify(Service::SsoOidc, &error))?;
         let verification_url = device
             .verification_uri_complete()
-            .or(device.verification_uri())
+            .or_else(|| device.verification_uri())
             .ok_or_else(|| missing("StartDeviceAuthorization", "a verificationUri"))?;
         Ok(DeviceAuthorization {
             client_id: client_id.to_owned(),
@@ -180,10 +181,10 @@ impl Aws for SdkAws {
             Ok(token) => token,
             Err(error) => {
                 let service_error = error.as_service_error();
-                if service_error.is_some_and(|e| e.is_authorization_pending_exception()) {
+                if service_error.is_some_and(CreateTokenError::is_authorization_pending_exception) {
                     return Ok(TokenPoll::Pending);
                 }
-                if service_error.is_some_and(|e| e.is_slow_down_exception()) {
+                if service_error.is_some_and(CreateTokenError::is_slow_down_exception) {
                     return Ok(TokenPoll::SlowDown);
                 }
                 return Err(classify(Service::SsoOidc, &error));
@@ -427,8 +428,8 @@ fn kind_of_code(code: &str, server_error: bool) -> AwsErrorKind {
         | "IncompleteSignature"
         | "AccessDenied"
         | "AccessDeniedException"
-        | "UnrecognizedClientException" => AwsErrorKind::Refused,
-        "ForbiddenException" => AwsErrorKind::Refused,
+        | "UnrecognizedClientException"
+        | "ForbiddenException" => AwsErrorKind::Refused,
         // SSO answers UnauthorizedException for an access token that has
         // expired or been revoked.
         "ExpiredToken" | "ExpiredTokenException" | "RequestExpired" | "UnauthorizedException" => {

@@ -94,14 +94,14 @@ type KeysAnswer = Result<AwsCredentials, AwsError>;
 /// IAM Identity Center, as the fake answers it.
 #[derive(Clone, Debug, Default)]
 struct FakeSso {
-    /// CreateToken's answers, in order. Pending once they run out.
+    /// `CreateToken`'s answers, in order. Pending once they run out.
     polls: Arc<Mutex<VecDeque<Result<TokenPoll, AwsError>>>>,
     accounts: Vec<SsoAccount>,
     /// Role names by account id.
     roles: HashMap<String, Vec<String>>,
-    /// GetRoleCredentials's answers by "account/role", in order; the last repeats.
+    /// `GetRoleCredentials`'s answers by "account/role", in order; the last repeats.
     keys: Arc<Mutex<HashMap<String, VecDeque<KeysAnswer>>>>,
-    /// Holds the next GetRoleCredentials until it is sent.
+    /// Holds the next `GetRoleCredentials` until it is sent.
     gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     /// Every SSO and SSO-OIDC call, as "<call> <detail> in <region>".
     log: Arc<Mutex<Vec<String>>>,
@@ -150,7 +150,7 @@ impl FakeAws {
             .clone()
     }
 
-    /// CreateToken answers these, in order, then Pending.
+    /// `CreateToken` answers these, in order, then Pending.
     fn polls(self, polls: Vec<Result<TokenPoll, AwsError>>) -> Self {
         *lock(&self.sso.polls) = polls.into();
         self
@@ -168,13 +168,13 @@ impl FakeAws {
         Ok(self)
     }
 
-    /// GetRoleCredentials for `role` in `account` answers these, in order.
+    /// `GetRoleCredentials` for `role` in `account` answers these, in order.
     fn role_keys(self, account: &str, role: &str, keys: Vec<KeysAnswer>) -> Self {
         lock(&self.sso.keys).insert(format!("{account}/{role}"), keys.into());
         self
     }
 
-    /// The next GetRoleCredentials waits until the returned sender is used.
+    /// The next `GetRoleCredentials` waits until the returned sender is used.
     fn hold_next_keys(&self) -> oneshot::Sender<()> {
         let (open, gate) = oneshot::channel();
         *lock(&self.sso.gate) = Some(gate);
@@ -214,11 +214,11 @@ impl FakeSso {
 }
 
 /// The token a person's approval gives, good for eight hours.
-fn approved() -> Result<TokenPoll, AwsError> {
-    Ok(TokenPoll::Approved(SsoToken {
+fn approved() -> TokenPoll {
+    TokenPoll::Approved(SsoToken {
         access_token: Secret::new(ACCESS_TOKEN),
-        expires_in: Some(Duration::from_secs(8 * 3600)),
-    }))
+        expires_in: Some(Duration::from_hours(8)),
+    })
 }
 
 fn sso_failure(kind: AwsErrorKind, detail: &str) -> AwsError {
@@ -252,54 +252,56 @@ impl Aws for FakeAws {
         )
     }
 
-    async fn start_device_authorization(
+    fn start_device_authorization(
         &self,
         start_url: &str,
         region: &Region,
-    ) -> Result<DeviceAuthorization, AwsError> {
+    ) -> impl Future<Output = Result<DeviceAuthorization, AwsError>> + Send {
         *lock(&self.sso.started) = Some(Instant::now());
         self.record(format!("start {start_url} in {region}"));
-        Ok(FakeSso::device())
+        future::ready(Ok(FakeSso::device()))
     }
 
-    async fn create_token(
+    fn create_token(
         &self,
         device: &DeviceAuthorization,
         region: &Region,
-    ) -> Result<TokenPoll, AwsError> {
+    ) -> impl Future<Output = Result<TokenPoll, AwsError>> + Send {
         assert_eq!(device.device_code.expose(), DEVICE_CODE);
         let started = (*lock(&self.sso.started)).ok_or("polled before starting");
         let after = started.map_or(0, |at| at.elapsed().as_secs());
         self.record(format!("poll at {after}s in {region}"));
-        lock(&self.sso.polls)
-            .pop_front()
-            .unwrap_or(Ok(TokenPoll::Pending))
+        future::ready(
+            lock(&self.sso.polls)
+                .pop_front()
+                .unwrap_or(Ok(TokenPoll::Pending)),
+        )
     }
 
-    async fn sso_accounts(
+    fn sso_accounts(
         &self,
         token: &SsoToken,
         region: &Region,
-    ) -> Result<Vec<SsoAccount>, AwsError> {
+    ) -> impl Future<Output = Result<Vec<SsoAccount>, AwsError>> + Send {
         assert_eq!(token.access_token.expose(), ACCESS_TOKEN);
         self.record(format!("accounts in {region}"));
-        Ok(self.sso.accounts.clone())
+        future::ready(Ok(self.sso.accounts.clone()))
     }
 
-    async fn sso_roles(
+    fn sso_roles(
         &self,
         token: &SsoToken,
         account: &AccountId,
         region: &Region,
-    ) -> Result<Vec<String>, AwsError> {
+    ) -> impl Future<Output = Result<Vec<String>, AwsError>> + Send {
         assert_eq!(token.access_token.expose(), ACCESS_TOKEN);
         self.record(format!("roles {account} in {region}"));
-        Ok(self
+        future::ready(Ok(self
             .sso
             .roles
             .get(account.as_str())
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default()))
     }
 
     async fn role_credentials(
@@ -315,12 +317,13 @@ impl Aws for FakeAws {
         if let Some(gate) = gate {
             let _opened = gate.await;
         }
-        let mut keys = lock(&self.sso.keys);
-        let queue = keys.get_mut(&format!("{account}/{role}"));
-        let answer = match queue {
-            Some(queue) if queue.len() > 1 => queue.pop_front(),
-            Some(queue) => queue.front().cloned(),
-            None => None,
+        let answer = {
+            let mut keys = lock(&self.sso.keys);
+            match keys.get_mut(&format!("{account}/{role}")) {
+                Some(queue) if queue.len() > 1 => queue.pop_front(),
+                Some(queue) => queue.front().cloned(),
+                None => None,
+            }
         };
         answer.unwrap_or_else(|| {
             Err(sso_failure(
@@ -429,16 +432,21 @@ impl App {
             self.message
                 .validate(&message)
                 .map_err(|e| format!("{line}: {e}"))?;
-            if let Some(answered) = message["id"].as_i64() {
+            if let Some(answered) = message.get("id").and_then(Value::as_i64) {
                 let method = self.methods.get(&answered).cloned().unwrap_or_default();
                 self.written.push((method, line));
                 self.early.insert(answered, message);
             } else {
-                let method = message["method"].as_str().ok_or("method")?.to_owned();
+                let method = message
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .ok_or("method")?
+                    .to_owned();
                 assert_eq!(method, "signIn.prompt", "{line}");
-                assert_valid("signInPrompt", &message["params"])?;
+                let params = at(&message, "/params");
+                assert_valid("signInPrompt", &params)?;
                 self.written.push((method, line));
-                self.notifications.push(message["params"].clone());
+                self.notifications.push(params);
             }
         }
     }
@@ -575,8 +583,9 @@ async fn configure_offers_static_keys_the_levels_and_every_name_a_run_gets() -> 
         .collect();
     assert_eq!(secret_fields, ["secretAccessKey", "sessionToken"]);
 
-    let sso = result["methods"]
-        .as_array()
+    let sso = result
+        .get("methods")
+        .and_then(Value::as_array)
         .ok_or("methods")?
         .iter()
         .find(|m| m["name"] == "sso")

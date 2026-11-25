@@ -16,14 +16,14 @@ use crate::identity::{ACCOUNT, AccountId, Pins};
 use crate::region::Region;
 
 /// The method an SSO identity names.
-pub const METHOD: &str = "sso";
+pub(crate) const METHOD: &str = "sso";
 
 /// What RFC 8628 adds to the polling interval for each `slow_down`.
 const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
 
 /// A person signed in to IAM Identity Center.
 #[derive(Clone, Debug)]
-pub struct SsoLogin {
+pub(crate) struct SsoLogin {
     pub start_url: String,
     pub token: SsoToken,
     pub expires_at: Option<OffsetDateTime>,
@@ -41,7 +41,7 @@ pub struct SsoLogin {
 impl SsoLogin {
     /// The identity card while no role is chosen: the access portal, and the
     /// account once one is.
-    pub fn identity(&self) -> Identity {
+    pub(crate) fn identity(&self) -> Identity {
         let targets = self
             .account
             .iter()
@@ -62,14 +62,14 @@ impl SsoLogin {
         }
     }
 
-    pub fn account_name(&self, id: &AccountId) -> String {
+    pub(crate) fn account_name(&self, id: &AccountId) -> String {
         self.account_names
             .get(id)
             .cloned()
             .unwrap_or_else(|| id.to_string())
     }
 
-    pub fn remember(&mut self, accounts: &[SsoAccount]) {
+    pub(crate) fn remember(&mut self, accounts: &[SsoAccount]) {
         for account in accounts {
             self.account_names
                 .insert(account.id.clone(), account.name.clone());
@@ -85,7 +85,7 @@ impl SsoLogin {
 ///
 /// `accessDenied` when the person refuses, `timedOut` when the request
 /// expires first, and the kind of any AWS failure.
-pub async fn device_sign_in<A: Aws>(
+pub(crate) async fn device_sign_in<A: Aws>(
     aws: &A,
     prompts: &Prompts,
     start_url: &str,
@@ -138,7 +138,10 @@ fn request_expired() -> PluginError {
 ///
 /// `accessDenied` with no accounts at all, `pinMismatch` when none is the
 /// pinned one, and the kind of any AWS failure.
-pub async fn accounts<A: Aws>(aws: &A, login: &SsoLogin) -> Result<Vec<SsoAccount>, PluginError> {
+pub(crate) async fn accounts<A: Aws>(
+    aws: &A,
+    login: &SsoLogin,
+) -> Result<Vec<SsoAccount>, PluginError> {
     let all = aws
         .sso_accounts(&login.token, &login.sso_region)
         .await
@@ -174,7 +177,7 @@ pub async fn accounts<A: Aws>(aws: &A, login: &SsoLogin) -> Result<Vec<SsoAccoun
 ///
 /// `accessDenied` with no roles at all, `pinMismatch` when none is the
 /// pinned one, and the kind of any AWS failure.
-pub async fn roles<A: Aws>(
+pub(crate) async fn roles<A: Aws>(
     aws: &A,
     login: &SsoLogin,
     account: &AccountId,
@@ -211,7 +214,7 @@ pub async fn roles<A: Aws>(
 /// # Errors
 ///
 /// `pinMismatch` naming the pin the choice breaks.
-pub fn check_choice(
+pub(crate) fn check_choice(
     pins: &Pins,
     account: &AccountId,
     role: Option<&str>,
@@ -237,7 +240,7 @@ pub fn check_choice(
 
 /// An SSO call that failed while `doing` something. The token is the
 /// person's sign-in, so a refused or expired one means signing in again.
-pub fn sso_error(error: &AwsError, doing: &str) -> PluginError {
+pub(crate) fn sso_error(error: &AwsError, doing: &str) -> PluginError {
     let detail = &error.detail;
     match error.kind {
         AwsErrorKind::Expired => PluginError::new(
@@ -250,6 +253,10 @@ pub fn sso_error(error: &AwsError, doing: &str) -> PluginError {
                 "IAM Identity Center refused {doing} ({detail}): check that you are assigned it, or sign in again"
             ),
         ),
-        _ => error::aws(error, doing),
+        AwsErrorKind::Unavailable
+        | AwsErrorKind::Network
+        | AwsErrorKind::TimedOut
+        | AwsErrorKind::Tls
+        | AwsErrorKind::Unexpected => error::aws(error, doing),
     }
 }

@@ -88,8 +88,11 @@ fn the_binary_answers_over_stdio_and_reports_an_unreachable_aws_as_network() -> 
         "signIn",
         json!({"method": "sso", "fields": {"ssoStartUrl": "https://my-org.awsapps.com/start", "ssoRegion": "eu-west-1"}, "pins": {}, "requirements": []}),
     )?;
-    assert_eq!(signed_in["error"]["data"]["kind"], "network", "{signed_in}");
-    let message = signed_in["error"]["message"].as_str().ok_or("message")?;
+    assert_eq!(at(&signed_in, "/error/data/kind"), "network", "{signed_in}");
+    let message = signed_in
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .ok_or("message")?;
     assert!(
         message.contains("SSO OIDC") && message.contains("eu-west-1"),
         "{message}"

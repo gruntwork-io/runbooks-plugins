@@ -28,7 +28,7 @@ async fn paused(aws: FakeAws) -> Result<App, Box<dyn Error>> {
     Ok(app)
 }
 
-fn sso_sign_in(pins: Value) -> Value {
+fn sso_sign_in(pins: &Value) -> Value {
     json!({
         "method": "sso",
         "fields": {"ssoStartUrl": START_URL, "ssoRegion": "eu-west-1", "defaultRegion": "eu-central-1"},
@@ -37,13 +37,13 @@ fn sso_sign_in(pins: Value) -> Value {
     })
 }
 
-fn keys(access_key_id: &str, expires_at: &str) -> Result<AwsCredentials, AwsError> {
-    Ok(AwsCredentials {
+fn keys(access_key_id: &str, expires_at: &str) -> AwsCredentials {
+    AwsCredentials {
         access_key_id: access_key_id.to_owned(),
         secret_access_key: Secret::new(ROLE_SECRET),
         session_token: Some(Secret::new(ROLE_TOKEN)),
         expires_at: OffsetDateTime::parse(expires_at, &Rfc3339).ok(),
-    })
+    }
 }
 
 fn message(error: &Value) -> Result<&str, Box<dyn Error>> {
@@ -57,14 +57,14 @@ async fn sso_shows_the_url_and_code_polls_at_awss_pace_and_takes_the_only_role()
             Ok(TokenPoll::Pending),
             Ok(TokenPoll::SlowDown),
             Ok(TokenPoll::Pending),
-            approved(),
+            Ok(approved()),
         ])
         .account(ACCOUNT, "Production", &["deploy"])?
-        .role_keys(ACCOUNT, "deploy", vec![keys("ASIASSO", IN_AN_HOUR)])
+        .role_keys(ACCOUNT, "deploy", vec![Ok(keys("ASIASSO", IN_AN_HOUR))])
         .caller("ASIASSO", ACCOUNT, SSO_ARN)?;
     let mut app = paused(aws.clone()).await?;
     let identity = app
-        .ok("signIn", sso_sign_in(json!({})), "signInResult")
+        .ok("signIn", sso_sign_in(&json!({})), "signInResult")
         .await?;
 
     // One prompt, for the signIn request: the page and the code to check.
@@ -97,46 +97,55 @@ async fn sso_shows_the_url_and_code_polls_at_awss_pace_and_takes_the_only_role()
             region: "us-east-1".to_owned(),
         }]
     );
-    assert_eq!(identity["method"], "sso");
-    assert_eq!(identity["kind"], "role");
-    assert_eq!(identity["principal"], SSO_ARN);
-    assert_eq!(identity["expiresAt"], IN_AN_HOUR);
+    assert_eq!(at(&identity, "/method"), "sso");
+    assert_eq!(at(&identity, "/kind"), "role");
+    assert_eq!(at(&identity, "/principal"), SSO_ARN);
+    assert_eq!(at(&identity, "/expiresAt"), IN_AN_HOUR);
     // The account by the name the person knows it, not the IAM alias.
     assert_eq!(
-        identity["targets"],
+        at(&identity, "/targets"),
         json!({"account": {"id": ACCOUNT, "name": "Production"}, "role": {"id": "deploy", "name": "deploy"}})
     );
 
     let env = app.ok("env", json!({}), "envResult").await?;
     let values = values_of(&env)?;
-    assert_eq!(values["AWS_ACCESS_KEY_ID"].0, "ASIASSO");
     assert_eq!(
-        values["AWS_SECRET_ACCESS_KEY"],
-        (
+        values.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "ASIASSO"
+    );
+    assert_eq!(
+        values.get("AWS_SECRET_ACCESS_KEY"),
+        Some(&(
             ROLE_SECRET.to_owned(),
             true,
             vec!["env".to_owned(), "output".to_owned()]
-        )
+        ))
     );
-    assert_eq!(values["AWS_SESSION_TOKEN"].0, ROLE_TOKEN);
-    assert_eq!(values["AWS_REGION"].0, "eu-central-1");
-    assert_eq!(env["expiresAt"], IN_AN_HOUR);
+    assert_eq!(
+        values.get("AWS_SESSION_TOKEN").ok_or("no token")?.0,
+        ROLE_TOKEN
+    );
+    assert_eq!(
+        values.get("AWS_REGION").ok_or("no region")?.0,
+        "eu-central-1"
+    );
+    assert_eq!(at(&env, "/expiresAt"), IN_AN_HOUR);
     Ok(())
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_pinned_account_and_role_are_signed_in_to_directly() -> TestResult {
     let aws = FakeAws::default()
-        .polls(vec![approved()])
+        .polls(vec![Ok(approved())])
         .account(ACCOUNT, "Production", &["deploy", "admin"])?
         .account(OTHER_ACCOUNT, "Staging", &["deploy"])?
-        .role_keys(ACCOUNT, "deploy", vec![keys("ASIASSO", IN_AN_HOUR)])
+        .role_keys(ACCOUNT, "deploy", vec![Ok(keys("ASIASSO", IN_AN_HOUR))])
         .caller("ASIASSO", ACCOUNT, SSO_ARN)?;
     let mut app = paused(aws.clone()).await?;
     let identity = app
         .ok(
             "signIn",
-            sso_sign_in(json!({"account": ACCOUNT, "role": "deploy"})),
+            sso_sign_in(&json!({"account": ACCOUNT, "role": "deploy"})),
             "signInResult",
         )
         .await?;
@@ -149,22 +158,22 @@ async fn a_pinned_account_and_role_are_signed_in_to_directly() -> TestResult {
         ]
     );
     // Never listed, so the account goes by its IAM alias.
-    assert_eq!(identity["targets"]["account"]["name"], "sandbox");
-    assert_eq!(identity["targets"]["role"]["id"], "deploy");
+    assert_eq!(at(&identity, "/targets/account/name"), "sandbox");
+    assert_eq!(at(&identity, "/targets/role/id"), "deploy");
     Ok(())
 }
 
 #[tokio::test(start_paused = true)]
 async fn with_a_choice_the_person_picks_an_account_then_a_role() -> TestResult {
     let aws = FakeAws::default()
-        .polls(vec![approved()])
+        .polls(vec![Ok(approved())])
         .account(ACCOUNT, "Production", &["deploy", "admin"])?
         .account(OTHER_ACCOUNT, "Staging", &["deploy"])?
-        .role_keys(ACCOUNT, "admin", vec![keys("ASIAADMIN", IN_AN_HOUR)])
+        .role_keys(ACCOUNT, "admin", vec![Ok(keys("ASIAADMIN", IN_AN_HOUR))])
         .caller("ASIAADMIN", ACCOUNT, ADMIN_ARN)?;
     let mut app = paused(aws.clone()).await?;
     let identity = app
-        .ok("signIn", sso_sign_in(json!({})), "signInResult")
+        .ok("signIn", sso_sign_in(&json!({})), "signInResult")
         .await?;
     assert_eq!(
         identity,
@@ -180,7 +189,7 @@ async fn with_a_choice_the_person_picks_an_account_then_a_role() -> TestResult {
         .ok("targets", json!({"level": "account"}), "targetsResult")
         .await?;
     assert_eq!(
-        accounts["targets"],
+        at(&accounts, "/targets"),
         json!([{"id": ACCOUNT, "name": "Production"}, {"id": OTHER_ACCOUNT, "name": "Staging"}])
     );
     let roles = app
@@ -191,7 +200,7 @@ async fn with_a_choice_the_person_picks_an_account_then_a_role() -> TestResult {
         )
         .await?;
     assert_eq!(
-        roles["targets"],
+        at(&roles, "/targets"),
         json!([{"id": "deploy", "name": "deploy"}])
     );
     // Without a parent, the role level needs an account chosen first.
@@ -206,14 +215,14 @@ async fn with_a_choice_the_person_picks_an_account_then_a_role() -> TestResult {
         )
         .await?;
     assert_eq!(
-        identity["targets"],
+        at(&identity, "/targets"),
         json!({"account": {"id": ACCOUNT, "name": "Production"}})
     );
     let roles = app
         .ok("targets", json!({"level": "role"}), "targetsResult")
         .await?;
     assert_eq!(
-        roles["targets"],
+        at(&roles, "/targets"),
         json!([{"id": "deploy", "name": "deploy"}, {"id": "admin", "name": "admin"}])
     );
     let identity = app
@@ -223,11 +232,14 @@ async fn with_a_choice_the_person_picks_an_account_then_a_role() -> TestResult {
             "selectResult",
         )
         .await?;
-    assert_eq!(identity["principal"], ADMIN_ARN);
-    assert_eq!(identity["targets"]["role"]["id"], "admin");
-    assert_eq!(identity["targets"]["account"]["name"], "Production");
+    assert_eq!(at(&identity, "/principal"), ADMIN_ARN);
+    assert_eq!(at(&identity, "/targets/role/id"), "admin");
+    assert_eq!(at(&identity, "/targets/account/name"), "Production");
     let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
-    assert_eq!(values["AWS_ACCESS_KEY_ID"].0, "ASIAADMIN");
+    assert_eq!(
+        values.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "ASIAADMIN"
+    );
 
     // Signed in to a role, the login still lists the others.
     app.ok("targets", json!({"level": "account"}), "targetsResult")
@@ -238,7 +250,7 @@ async fn with_a_choice_the_person_picks_an_account_then_a_role() -> TestResult {
 #[tokio::test(start_paused = true)]
 async fn pins_narrow_the_choice_and_refuse_anything_else() -> TestResult {
     let aws = FakeAws::default()
-        .polls(vec![approved()])
+        .polls(vec![Ok(approved())])
         .account(ACCOUNT, "Production", &["deploy", "admin"])?
         .account(OTHER_ACCOUNT, "Staging", &["deploy"])?;
     let mut app = paused(aws.clone()).await?;
@@ -246,16 +258,16 @@ async fn pins_narrow_the_choice_and_refuse_anything_else() -> TestResult {
     let identity = app
         .ok(
             "signIn",
-            sso_sign_in(json!({"account": ACCOUNT})),
+            sso_sign_in(&json!({"account": ACCOUNT})),
             "signInResult",
         )
         .await?;
-    assert_eq!(identity["targets"], json!({}));
+    assert_eq!(at(&identity, "/targets"), json!({}));
     let accounts = app
         .ok("targets", json!({"level": "account"}), "targetsResult")
         .await?;
     assert_eq!(
-        accounts["targets"],
+        at(&accounts, "/targets"),
         json!([{"id": ACCOUNT, "name": "Production"}])
     );
     app.fails(
@@ -295,14 +307,14 @@ async fn pins_narrow_the_choice_and_refuse_anything_else() -> TestResult {
         ),
         (json!({"account": "999999999999"}), "account 999999999999"),
     ] {
-        let aws = FakeAws::default().polls(vec![approved()]).account(
+        let aws = FakeAws::default().polls(vec![Ok(approved())]).account(
             ACCOUNT,
             "Production",
             &["deploy", "admin"],
         )?;
         let mut app = paused(aws).await?;
         let error = app
-            .fails("signIn", sso_sign_in(pins), "pinMismatch")
+            .fails("signIn", sso_sign_in(&pins), "pinMismatch")
             .await?;
         assert!(
             message(&error)?.contains(&format!("does not give you {named}")),
@@ -324,7 +336,7 @@ async fn a_refused_expired_or_unanswered_sign_in_says_which() -> TestResult {
     ]);
     let mut app = paused(refused).await?;
     let error = app
-        .fails("signIn", sso_sign_in(json!({})), "accessDenied")
+        .fails("signIn", sso_sign_in(&json!({})), "accessDenied")
         .await?;
     assert!(
         message(&error)?.contains("SSO sign-in was denied or cancelled in the browser"),
@@ -338,7 +350,7 @@ async fn a_refused_expired_or_unanswered_sign_in_says_which() -> TestResult {
     ))]);
     let mut app = paused(expired).await?;
     let error = app
-        .fails("signIn", sso_sign_in(json!({})), "timedOut")
+        .fails("signIn", sso_sign_in(&json!({})), "timedOut")
         .await?;
     assert!(
         message(&error)?.contains("The SSO sign-in request expired"),
@@ -349,7 +361,7 @@ async fn a_refused_expired_or_unanswered_sign_in_says_which() -> TestResult {
     let unanswered = FakeAws::default();
     let mut app = paused(unanswered.clone()).await?;
     let started = Instant::now();
-    app.fails("signIn", sso_sign_in(json!({})), "timedOut")
+    app.fails("signIn", sso_sign_in(&json!({})), "timedOut")
         .await?;
     assert_eq!(started.elapsed(), Duration::from_secs(600));
     let log = unanswered.sso_log();
@@ -363,9 +375,9 @@ async fn a_refused_expired_or_unanswered_sign_in_says_which() -> TestResult {
 
 #[tokio::test(start_paused = true)]
 async fn no_account_or_no_role_to_choose_is_access_denied() -> TestResult {
-    let mut app = paused(FakeAws::default().polls(vec![approved()])).await?;
+    let mut app = paused(FakeAws::default().polls(vec![Ok(approved())])).await?;
     let error = app
-        .fails("signIn", sso_sign_in(json!({})), "accessDenied")
+        .fails("signIn", sso_sign_in(&json!({})), "accessDenied")
         .await?;
     assert!(
         message(&error)?.contains("No AWS accounts are available to you in IAM Identity Center"),
@@ -373,11 +385,11 @@ async fn no_account_or_no_role_to_choose_is_access_denied() -> TestResult {
     );
 
     let aws = FakeAws::default()
-        .polls(vec![approved()])
+        .polls(vec![Ok(approved())])
         .account(ACCOUNT, "Production", &[])?;
     let mut app = paused(aws).await?;
     let error = app
-        .fails("signIn", sso_sign_in(json!({})), "accessDenied")
+        .fails("signIn", sso_sign_in(&json!({})), "accessDenied")
         .await?;
     assert!(
         message(&error)?.contains("No roles are available to you in account 123456789012"),
@@ -421,20 +433,26 @@ async fn the_sso_fields_are_checked_before_aws_is_called() -> TestResult {
 #[tokio::test(start_paused = true)]
 async fn env_gets_a_role_fresh_keys_before_its_keys_expire() -> TestResult {
     let aws = FakeAws::default()
-        .polls(vec![approved()])
+        .polls(vec![Ok(approved())])
         .account(ACCOUNT, "Production", &["deploy"])?
         .role_keys(
             ACCOUNT,
             "deploy",
-            vec![keys("ASIAOLD", IN_TWO_MINUTES), keys("ASIANEW", IN_AN_HOUR)],
+            vec![
+                Ok(keys("ASIAOLD", IN_TWO_MINUTES)),
+                Ok(keys("ASIANEW", IN_AN_HOUR)),
+            ],
         )
         .caller("ASIAOLD", ACCOUNT, SSO_ARN)?;
     let mut app = paused(aws.clone()).await?;
-    app.ok("signIn", sso_sign_in(json!({})), "signInResult")
+    app.ok("signIn", sso_sign_in(&json!({})), "signInResult")
         .await?;
     let env = app.ok("env", json!({}), "envResult").await?;
-    assert_eq!(values_of(&env)?["AWS_ACCESS_KEY_ID"].0, "ASIANEW");
-    assert_eq!(env["expiresAt"], IN_AN_HOUR);
+    assert_eq!(
+        values_of(&env)?.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "ASIANEW"
+    );
+    assert_eq!(at(&env, "/expiresAt"), IN_AN_HOUR);
     // Fresh keys are not due again for an hour.
     app.ok("env", json!({}), "envResult").await?;
     let fetched = aws
@@ -455,31 +473,34 @@ async fn keys_that_cannot_be_refreshed_are_used_until_they_expire() -> TestResul
         ))
     };
     let aws = FakeAws::default()
-        .polls(vec![approved()])
+        .polls(vec![Ok(approved())])
         .account(ACCOUNT, "Production", &["deploy"])?
         .role_keys(
             ACCOUNT,
             "deploy",
-            vec![keys("ASIAOLD", IN_TWO_MINUTES), token_expired()],
+            vec![Ok(keys("ASIAOLD", IN_TWO_MINUTES)), token_expired()],
         )
         .caller("ASIAOLD", ACCOUNT, SSO_ARN)?;
     let mut app = paused(aws).await?;
-    app.ok("signIn", sso_sign_in(json!({})), "signInResult")
+    app.ok("signIn", sso_sign_in(&json!({})), "signInResult")
         .await?;
     let env = app.ok("env", json!({}), "envResult").await?;
-    assert_eq!(values_of(&env)?["AWS_ACCESS_KEY_ID"].0, "ASIAOLD");
+    assert_eq!(
+        values_of(&env)?.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "ASIAOLD"
+    );
 
     let aws = FakeAws::default()
-        .polls(vec![approved()])
+        .polls(vec![Ok(approved())])
         .account(ACCOUNT, "Production", &["deploy"])?
         .role_keys(
             ACCOUNT,
             "deploy",
-            vec![keys("ASIAOLD", A_MINUTE_AGO), token_expired()],
+            vec![Ok(keys("ASIAOLD", A_MINUTE_AGO)), token_expired()],
         )
         .caller("ASIAOLD", ACCOUNT, SSO_ARN)?;
     let mut app = paused(aws).await?;
-    app.ok("signIn", sso_sign_in(json!({})), "signInResult")
+    app.ok("signIn", sso_sign_in(&json!({})), "signInResult")
         .await?;
     let error = app.fails("env", json!({}), "expired").await?;
     assert!(
@@ -492,16 +513,19 @@ async fn keys_that_cannot_be_refreshed_are_used_until_they_expire() -> TestResul
 #[tokio::test(start_paused = true)]
 async fn a_sign_out_during_a_refresh_stays_signed_out() -> TestResult {
     let aws = FakeAws::default()
-        .polls(vec![approved()])
+        .polls(vec![Ok(approved())])
         .account(ACCOUNT, "Production", &["deploy"])?
         .role_keys(
             ACCOUNT,
             "deploy",
-            vec![keys("ASIAOLD", IN_TWO_MINUTES), keys("ASIANEW", IN_AN_HOUR)],
+            vec![
+                Ok(keys("ASIAOLD", IN_TWO_MINUTES)),
+                Ok(keys("ASIANEW", IN_AN_HOUR)),
+            ],
         )
         .caller("ASIAOLD", ACCOUNT, SSO_ARN)?;
     let mut app = paused(aws.clone()).await?;
-    app.ok("signIn", sso_sign_in(json!({})), "signInResult")
+    app.ok("signIn", sso_sign_in(&json!({})), "signInResult")
         .await?;
 
     let open = aws.hold_next_keys();
@@ -526,15 +550,15 @@ async fn a_sign_out_during_a_refresh_stays_signed_out() -> TestResult {
 #[tokio::test(start_paused = true)]
 async fn the_device_flows_secrets_never_leave_and_a_roles_keys_leave_only_in_env() -> TestResult {
     let aws = FakeAws::default()
-        .polls(vec![approved()])
+        .polls(vec![Ok(approved())])
         .account(ACCOUNT, "Production", &["deploy", "admin"])?
         .account(OTHER_ACCOUNT, "Staging", &["deploy"])?
-        .role_keys(ACCOUNT, "deploy", vec![keys("ASIASSO", IN_AN_HOUR)])
+        .role_keys(ACCOUNT, "deploy", vec![Ok(keys("ASIASSO", IN_AN_HOUR))])
         .caller("ASIASSO", ACCOUNT, SSO_ARN)?;
     let mut app = paused(aws).await?;
     // Every SSO path: the prompt, listings, a choice the pins refuse, a role
     // AWS refuses, a role it gives, and env.
-    app.call("signIn", sso_sign_in(json!({"account": ACCOUNT})))
+    app.call("signIn", sso_sign_in(&json!({"account": ACCOUNT})))
         .await?;
     app.call("targets", json!({"level": "account"})).await?;
     app.call("targets", json!({"level": "role", "parent": ACCOUNT}))
