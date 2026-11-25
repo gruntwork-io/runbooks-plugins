@@ -130,10 +130,11 @@ async fn an_earlier_blocks_values_are_a_source() -> TestResult {
         .ok(
             "detect",
             "detectResult",
-            detect(&json!([{"kind": "values", "values": values}])),
+            detect(&json!([{"kind": "values", "from": "creds", "values": values}])),
         )
         .await?;
-    assert_eq!(at(&found, "/source"), "values");
+    assert_eq!(at(&found, "/source"), "creds");
+    assert_eq!(at(&found, "/identity/method"), "values");
     assert_eq!(at(&found, "/identity/principal"), SA_EMAIL);
     assert_eq!(at(&found, "/identity/targets/project/id"), "quota-5678");
     Ok(())

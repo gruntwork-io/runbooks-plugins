@@ -54,7 +54,7 @@ async fn no_line_but_envs_result_carries_a_secret() -> TestResult {
         "invalidParams",
     )
     .await?;
-    let values = json!([{"kind": "values", "values": {"GOOGLE_CREDENTIALS": format!("{{{SA_PRIVATE_KEY}")}}]);
+    let values = json!([{"kind": "values", "from": "creds", "values": {"GOOGLE_CREDENTIALS": format!("{{{SA_PRIVATE_KEY}")}}]);
     app.error("detect", detect(&values), "invalidParams")
         .await?;
     let typed = json!({"configuration": SA_PRIVATE_KEY});

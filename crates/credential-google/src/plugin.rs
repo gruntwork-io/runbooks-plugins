@@ -321,7 +321,9 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
     /// The credential a detection source names, or `None` if it has none.
     async fn find(&self, lookup: Lookup) -> Result<Option<Candidate>, PluginError> {
         match lookup {
-            Lookup::Vars { vars, prefix, name } => match sources::find(&vars, &prefix) {
+            Lookup::Vars {
+                vars, prefix, name, ..
+            } => match sources::find(&vars, &prefix) {
                 None => Ok(None),
                 Some(found) => candidate_from_vars(found, name).await.map(Some),
             },
@@ -543,6 +545,9 @@ enum Lookup {
         vars: HashMap<String, String>,
         prefix: Prefix,
         name: &'static str,
+        /// A values source's block, which a credential found here names as
+        /// its source.
+        from: Option<String>,
     },
     /// gcloud's Application Default Credentials file.
     Adc,
@@ -623,15 +628,17 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                         vars: self.host.env.clone(),
                         prefix,
                         name: "env",
+                        from: None,
                     }),
                     Err(prefix) => problems.push(format!(
                         "env prefix {prefix:?} must match ^[A-Z][A-Z0-9_]*_$"
                     )),
                 },
-                Source::Values { values } => lookups.push(Lookup::Vars {
+                Source::Values { values, from } => lookups.push(Lookup::Vars {
                     vars: values,
                     prefix: Prefix::default(),
                     name: "values",
+                    from: Some(from),
                 }),
                 Source::Named { name } => match name.as_str() {
                     ADC => lookups.push(Lookup::Adc),
@@ -650,6 +657,10 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
         // did; one that lacks a required scope stops the search.
         let mut failures: Vec<PluginError> = Vec::new();
         for lookup in lookups {
+            let from = match &lookup {
+                Lookup::Vars { from, .. } => from.clone(),
+                Lookup::Adc | Lookup::Gcloud => None,
+            };
             let proved = match self.find(lookup).await {
                 Ok(None) => continue,
                 Ok(Some(candidate)) => self.sign_in_with(candidate, &constraints).await,
@@ -657,7 +668,11 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
             };
             match proved {
                 Ok(session) => {
-                    return Ok(DetectResult::found(session.identity(), session.method));
+                    let identity = session.identity();
+                    return Ok(DetectResult::found(
+                        identity,
+                        from.unwrap_or(session.method),
+                    ));
                 }
                 Err(error) if error.kind() == ErrorKind::RequirementNotMet => return Err(error),
                 Err(error) => failures.push(error),

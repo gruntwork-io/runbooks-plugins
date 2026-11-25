@@ -41,10 +41,6 @@ use crate::state_dir::StateDir;
 /// The `source` of a credential found in the environment.
 const ENV_SOURCE: &str = "env";
 
-/// The `source` of a credential found in an earlier block's outputs. The
-/// source does not say which block they came from.
-const VALUES_SOURCE: &str = "values";
-
 /// The app's network settings from `configure`.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Network {
@@ -595,9 +591,9 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
                         .await,
                     ENV_SOURCE,
                 ),
-                Source::Values { values } => (
+                Source::Values { values, from } => (
                     self.detect_values(configured, values, &constraints).await,
-                    VALUES_SOURCE,
+                    from.as_str(),
                 ),
             };
             match found {

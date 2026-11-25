@@ -765,9 +765,13 @@ async fn detect_reads_an_earlier_blocks_values() -> TestResult {
         "AWS_CREDENTIAL_EXPIRATION": "2026-11-24T19:00:00Z",
     });
     let response = app
-        .detect(json!([{"kind": "values", "values": values}]), json!({}))
+        .detect(
+            json!([{"kind": "values", "from": "keys", "values": values}]),
+            json!({}),
+        )
         .await?;
-    assert_eq!(at(&response, "/result/source"), "values", "{response}");
+    assert_eq!(at(&response, "/result/source"), "keys", "{response}");
+    assert_eq!(at(&response, "/result/identity/method"), "values");
     assert_eq!(
         at(&response, "/result/identity/expiresAt"),
         "2026-11-24T19:00:00Z"
@@ -1183,7 +1187,7 @@ async fn a_secret_leaves_the_plugin_only_in_envs_result() -> TestResult {
     app.detect(json!([{"kind": "env"}]), json!({"account": OTHER_ACCOUNT}))
         .await?;
     app.detect(
-        json!([{"kind": "values", "values": {"AWS_ACCESS_KEY_ID": "AKIAWHO", "AWS_SECRET_ACCESS_KEY": SECRET, "AWS_SESSION_TOKEN": TOKEN}}]),
+        json!([{"kind": "values", "from": "keys", "values": {"AWS_ACCESS_KEY_ID": "AKIAWHO", "AWS_SECRET_ACCESS_KEY": SECRET, "AWS_SESSION_TOKEN": TOKEN}}]),
         json!({}),
     )
     .await?;

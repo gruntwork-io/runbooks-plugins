@@ -470,6 +470,7 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
             };
             let region = found.region.unwrap_or_else(Region::default_region);
             let origin = found.origin.to_string();
+            let source = found.origin.source();
             match self
                 .check(
                     found.credentials,
@@ -483,7 +484,7 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
                 Ok(ready) => {
                     let identity = ready.identity();
                     self.set(Session::Ready(Box::new(ready)));
-                    return Ok(DetectResult::found(identity, origin));
+                    return Ok(DetectResult::found(identity, source));
                 }
                 Err(error) => {
                     first_failure.get_or_insert(error);

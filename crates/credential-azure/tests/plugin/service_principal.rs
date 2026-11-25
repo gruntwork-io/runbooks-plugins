@@ -286,7 +286,7 @@ async fn detect_reuses_an_earlier_blocks_sign_in_and_its_choice() -> TestResult 
         earlier.path().join("msal_token_cache.json"),
         "earlier tokens",
     )?;
-    let values = json!([{"kind": "values", "values": {
+    let values = json!([{"kind": "values", "from": "earlier", "values": {
         "AZURE_CONFIG_DIR": earlier.path().to_str().ok_or("not UTF-8")?,
         "AZURE_TENANT_ID": CONTOSO,
         "AZURE_SUBSCRIPTION_ID": DEV,
@@ -296,7 +296,7 @@ async fn detect_reuses_an_earlier_blocks_sign_in_and_its_choice() -> TestResult 
         .app
         .result("detect", detect_params(&values, &json!({}), &json!([])))
         .await?;
-    assert_eq!(at(&detected, "/source"), "values", "{detected}");
+    assert_eq!(at(&detected, "/source"), "earlier", "{detected}");
     assert_eq!(at(&detected, "/identity/method"), "device_code");
     assert_eq!(at(&detected, "/identity/targets/subscription/id"), DEV);
     let env = fixture.env().await?;
@@ -312,7 +312,7 @@ async fn detect_reuses_an_earlier_blocks_sign_in_and_its_choice() -> TestResult 
     assert_eq!(fixture.logins(), Vec::new());
 
     // Outputs that hold a service principal sign it in afresh.
-    let values = json!([{"kind": "values", "values": {
+    let values = json!([{"kind": "values", "from": "earlier", "values": {
         "AZURE_CONFIG_DIR": earlier.path().to_str().ok_or("not UTF-8")?,
         "ARM_CLIENT_ID": CLIENT,
         "ARM_TENANT_ID": CONTOSO,
@@ -343,7 +343,7 @@ async fn an_earlier_sign_in_keeps_the_blocks_pin_and_skips_a_missing_extension_d
     let mut fixture = Fixture::new(World::service_principal()?, &[]).await?;
     let earlier = tempfile::tempdir()?;
     fs::write(earlier.path().join("azureProfile.json"), "{}")?;
-    let values = json!([{"kind": "values", "values": {
+    let values = json!([{"kind": "values", "from": "earlier", "values": {
         "AZURE_CONFIG_DIR": earlier.path().to_str().ok_or("not UTF-8")?,
         "AZURE_EXTENSION_DIR": earlier.path().join("gone").to_str().ok_or("not UTF-8")?,
         "AZURE_TENANT_ID": CONTOSO,

@@ -515,3 +515,23 @@ fn a_pin_always_names_a_target() -> TestResult {
         &json!({"subscription": null}),
     )
 }
+
+// Runbooks 0705c832 (draft PR #547): a values detection source names its
+// block.
+
+#[test]
+fn a_values_source_names_its_block() -> TestResult {
+    let def = "credential.schema.json#/$defs/detectParams";
+    let params = json!({"sources":[{"kind":"values","values":{"AWS_ACCESS_KEY_ID":"AKIAKEYS"},"from":"keys"}],"pins":{},"requirements":[]});
+    round_trip::<credential::DetectParams>(def, &params)?;
+    let typed: credential::DetectParams = serde_json::from_value(params)?;
+    assert!(
+        matches!(typed.sources.first(), Some(credential::Source::Values { from, .. }) if from == "keys"),
+        "{:?}",
+        typed.sources
+    );
+    assert_refused::<credential::DetectParams>(
+        def,
+        &json!({"sources":[{"kind":"values","values":{}}],"pins":{},"requirements":[]}),
+    )
+}

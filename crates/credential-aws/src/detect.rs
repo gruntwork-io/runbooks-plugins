@@ -72,14 +72,18 @@ impl EnvPrefix {
 #[derive(Clone)]
 pub(crate) enum DetectSource {
     Env(Option<EnvPrefix>),
-    Values(HashMap<String, String>),
+    /// An earlier block's outputs, and that block's id.
+    Values {
+        values: HashMap<String, String>,
+        from: String,
+    },
 }
 
 impl fmt::Debug for DetectSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Env(prefix) => f.debug_tuple("Env").field(prefix).finish(),
-            Self::Values(values) => write!(f, "Values({} values)", values.len()),
+            Self::Values { values, .. } => write!(f, "Values({} values)", values.len()),
         }
     }
 }
@@ -105,11 +109,26 @@ pub(crate) struct UnreadableSource {
     pub source: InvalidRegion,
 }
 
-/// Where a credential was found, as `detectResult.source` names it.
+/// Where a credential was found. It shows as the identity's method;
+/// [`Origin::source`] is what `detectResult.source` names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
     Env(Option<EnvPrefix>),
-    Values,
+    /// The outputs of the block `from`.
+    Values {
+        from: String,
+    },
+}
+
+impl Origin {
+    /// The source a detected credential names: a values source's block, or
+    /// the origin as it shows.
+    pub(crate) fn source(&self) -> String {
+        match self {
+            Self::Values { from } => from.clone(),
+            Self::Env(_) => self.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for Origin {
@@ -117,7 +136,7 @@ impl fmt::Display for Origin {
         match self {
             Self::Env(None) => f.write_str("env"),
             Self::Env(Some(EnvPrefix(prefix))) => write!(f, "env:{prefix}"),
-            Self::Values => f.write_str("values"),
+            Self::Values { .. } => f.write_str("values"),
         }
     }
 }
@@ -149,7 +168,7 @@ pub(crate) fn parse_sources(sources: Vec<Source>) -> Result<Vec<DetectSource>, I
             } => EnvPrefix::parse(&prefix)
                 .map(|prefix| DetectSource::Env(Some(prefix)))
                 .ok_or_else(|| InvalidSource::Prefix(prefix.chars().take(64).collect())),
-            Source::Values { values } => Ok(DetectSource::Values(values)),
+            Source::Values { values, from } => Ok(DetectSource::Values { values, from }),
             Source::Named { name } => Err(InvalidSource::Named(name.chars().take(64).collect())),
         })
         .collect()
@@ -173,11 +192,11 @@ impl DetectSource {
                     Origin::Env(prefix.clone()),
                 )
             }
-            Self::Values(values) => read(
+            Self::Values { values, from } => read(
                 |name| non_empty(values.get(name)),
                 str::to_owned,
                 &[AWS_REGION],
-                Origin::Values,
+                Origin::Values { from: from.clone() },
             ),
         }
     }
@@ -271,14 +290,27 @@ mod tests {
 
     #[test]
     fn values_read_the_output_names() -> Result<(), Box<dyn std::error::Error>> {
-        let source = DetectSource::Values(vars(&[
-            ("AWS_ACCESS_KEY_ID", "AKIA"),
-            ("AWS_SECRET_ACCESS_KEY", "secret"),
-            ("AWS_SESSION_TOKEN", ""),
-            ("AWS_CREDENTIAL_EXPIRATION", "not a date"),
-        ]));
+        let source = DetectSource::Values {
+            values: vars(&[
+                ("AWS_ACCESS_KEY_ID", "AKIA"),
+                ("AWS_SECRET_ACCESS_KEY", "secret"),
+                ("AWS_SESSION_TOKEN", ""),
+                ("AWS_CREDENTIAL_EXPIRATION", "not a date"),
+            ]),
+            from: "keys".to_owned(),
+        };
         let found = source.read(&Environment::default())?.ok_or("found")?;
-        assert_eq!(found.origin, Origin::Values);
+        assert_eq!(
+            found.origin,
+            Origin::Values {
+                from: "keys".to_owned()
+            }
+        );
+        assert_eq!(
+            (found.origin.to_string(), found.origin.source()),
+            ("values".to_owned(), "keys".to_owned()),
+            "the method is values, and the source is the block"
+        );
         assert!(found.credentials.session_token.is_none());
         assert!(found.credentials.expires_at.is_none());
         assert!(found.region.is_none());
@@ -329,7 +361,10 @@ mod tests {
     fn debug_shows_no_values() {
         let secret = "do-not-print-this";
         let env = Environment::new(vars(&[("AWS_SECRET_ACCESS_KEY", secret)]));
-        let source = DetectSource::Values(vars(&[("AWS_SECRET_ACCESS_KEY", secret)]));
+        let source = DetectSource::Values {
+            values: vars(&[("AWS_SECRET_ACCESS_KEY", secret)]),
+            from: "keys".to_owned(),
+        };
         assert_eq!(
             format!("{env:?} {source:?}"),
             "Environment(1 variables) Values(1 values)"
