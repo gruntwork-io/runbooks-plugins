@@ -18,7 +18,9 @@ use tokio::time::timeout;
 pub(crate) type TestResult = Result<(), Box<dyn Error>>;
 
 /// Longer than any answer takes on a loaded runner; a hang fails the test.
-pub(crate) const WAIT: Duration = Duration::from_secs(30);
+/// Under cargo-mutants' 20-second test timeout, so a mutant that leaves a
+/// call unanswered fails the run instead of timing it out.
+pub(crate) const WAIT: Duration = Duration::from_secs(10);
 
 const SCHEMAS: [&str; 2] = ["base.schema.json", "credential.schema.json"];
 const ROOT: &str = "json-schema:///";

@@ -58,6 +58,14 @@ impl Fixture {
         Ok(())
     }
 
+    /// `az login` on a machine with no extensions: no `cliextensions`.
+    fn log_in_locally_without_extensions(&self) -> TestResult {
+        let dir = self.local_dir();
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("azureProfile.json"), "{}")?;
+        Ok(())
+    }
+
     fn calls(&self) -> Vec<Call> {
         self.az.world().calls.clone()
     }
@@ -682,6 +690,46 @@ async fn bad_params_are_refused_before_anything_runs() -> TestResult {
     }
     assert_eq!(fixture.calls(), Vec::<Call>::new());
     assert_eq!(sign_in_dirs(fixture.state.path())?, Vec::<String>::new());
+    Ok(())
+}
+
+/// Without the person's extension directory, the copy uses its own, not a
+/// directory that isn't there.
+#[tokio::test]
+async fn detect_without_local_extensions_gives_the_copy_its_own() -> TestResult {
+    let mut fixture = Fixture::new(World::one_subscription()?).await?;
+    fixture.log_in_locally_without_extensions()?;
+    let detected = fixture.app.result("detect", cli_detect()).await?;
+    assert_eq!(at(&detected, "/found"), true, "{detected}");
+    let env = fixture.env().await?;
+    let config = PathBuf::from(env_value(&env, "AZURE_CONFIG_DIR").ok_or("no config dir")?);
+    assert_eq!(
+        env_value(&env, "AZURE_EXTENSION_DIR").map(PathBuf::from),
+        Some(config.join("cliextensions"))
+    );
+    Ok(())
+}
+
+/// Neither shows a proxy password; the plugin shows only whether it is
+/// configured.
+#[test]
+fn debug_shows_no_proxy_password_and_only_whether_configured() -> TestResult {
+    let network = runbooks_credential_azure::Network {
+        ca_bundle_file: Some(PathBuf::from("/etc/ca.pem")),
+        proxy: Some("http://user:hunter2@proxy.example:8080".to_owned()),
+    };
+    assert_eq!(
+        format!("{network:?}"),
+        r#"Network { ca_bundle_file: Some("/etc/ca.pem"), proxy: Some("<set>") }"#
+    );
+    let plugin = AzurePlugin::new(
+        LocalLogin::default(),
+        FakeAz::new(World::one_subscription()?),
+    );
+    assert_eq!(
+        format!("{plugin:?}"),
+        "AzurePlugin { configured: false, .. }"
+    );
     Ok(())
 }
 
