@@ -2,9 +2,11 @@
 
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_protocol::credential::{
-    ConfigureResult, ConfigureResultCloud, Field, Level, LevelChosen, Method, RequirementKind,
+    ConfigureResult, ConfigureResultCloud, Field, Level, LevelChosen, Method, MethodUnavailable,
+    RequirementKind,
 };
 
+use crate::az::Az;
 use crate::session::SignInMethod;
 
 pub(crate) const TENANT_LEVEL: &str = "tenant";
@@ -57,7 +59,7 @@ fn field(name: &str, label: &str, required: bool, secret: bool) -> Field {
     }
 }
 
-fn method(method: SignInMethod) -> Method {
+fn method(method: SignInMethod, unavailable: Option<&MethodUnavailable>) -> Method {
     let (label, fields) = match method {
         SignInMethod::Cli => (
             "Azure CLI",
@@ -87,7 +89,7 @@ fn method(method: SignInMethod) -> Method {
         label: label.to_owned(),
         name: method.name().to_owned(),
         one_of: Vec::new(),
-        unavailable: None,
+        unavailable: unavailable.cloned(),
     }
 }
 
@@ -100,7 +102,12 @@ fn level(name: &str, label: &str) -> Level {
     }
 }
 
-pub(crate) fn configure_result() -> ConfigureResult {
+/// Every method signs in through `az`, so without it none is available.
+pub(crate) fn configure_result(az: &impl Az) -> ConfigureResult {
+    let unavailable = az.installed().err().map(|missing| MethodUnavailable {
+        kind: missing.kind(),
+        message: missing.message().to_owned(),
+    });
     ConfigureResult {
         cloud: Some(ConfigureResultCloud::Azure),
         driver_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -108,7 +115,10 @@ pub(crate) fn configure_result() -> ConfigureResult {
             level(TENANT_LEVEL, "Tenant"),
             level(SUBSCRIPTION_LEVEL, "Subscription"),
         ],
-        methods: SignInMethod::ALL.into_iter().map(method).collect(),
+        methods: SignInMethod::ALL
+            .into_iter()
+            .map(|sign_in| method(sign_in, unavailable.as_ref()))
+            .collect(),
         names: NAMES.iter().map(|name| (*name).to_owned()).collect(),
         protocol_version: PROTOCOL_VERSION.to_owned(),
         requirements: vec![RequirementKind::Roles],

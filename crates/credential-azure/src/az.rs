@@ -111,6 +111,12 @@ pub struct Tenant {
 /// The Azure CLI, in Azure's terms. Every call names the config directory
 /// of the sign-in it is about. Dropping a call's future stops its `az`.
 pub trait Az: Send + Sync + 'static {
+    /// # Errors
+    ///
+    /// `toolMissing` when there is no `az` to run: the error every other
+    /// call answers.
+    fn installed(&self) -> Result<(), PluginError>;
+
     /// Signs in to `dir`. A device code is sent on `device_code` as soon as
     /// `az` prints it.
     fn login(
@@ -305,6 +311,10 @@ impl AzCli {
 }
 
 impl Az for AzCli {
+    fn installed(&self) -> Result<(), PluginError> {
+        self.program.as_ref().map(drop).ok_or_else(az_missing)
+    }
+
     async fn login(
         &self,
         dir: &AzDir,

@@ -135,7 +135,7 @@ impl<C: Connect> AzurePlugin<C> {
         };
         if let Some(configured) = self.configured.get() {
             return if configured.state.path() == state_dir && configured.network == network {
-                Ok(describe::configure_result())
+                Ok(describe::configure_result(&configured.az))
             } else {
                 Err(PluginError::new(
                     ErrorKind::InvalidParams,
@@ -144,6 +144,7 @@ impl<C: Connect> AzurePlugin<C> {
             };
         }
         let az = self.connect.connect(&network)?;
+        let described = describe::configure_result(&az);
         // Two configures at once both reach here; the second one's clients
         // are dropped and it answers as the first did.
         let _first = self.configured.set(Configured {
@@ -151,7 +152,7 @@ impl<C: Connect> AzurePlugin<C> {
             state: StateDir::new(state_dir),
             network,
         });
-        Ok(describe::configure_result())
+        Ok(described)
     }
 
     /// Makes `session` the block's sign-in, deleting the directory of the

@@ -277,6 +277,10 @@ fn signed_in(dir: &AzDir) -> Result<(), PluginError> {
 }
 
 impl Az for FakeAz {
+    fn installed(&self) -> Result<(), PluginError> {
+        Ok(())
+    }
+
     fn login(
         &self,
         dir: &AzDir,

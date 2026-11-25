@@ -174,6 +174,42 @@ async fn with_no_az_on_path_a_sign_in_is_tool_missing() -> TestResult {
     Ok(())
 }
 
+/// Each method's `unavailable` in `configure`'s answer, or null.
+async fn unavailable(az: InstalledAz, state: &Path) -> Result<Vec<Value>, Box<dyn Error>> {
+    let mut app = App::start(AzurePlugin::new(Host::new([], cfg!(windows)), az))?;
+    let configured = app.configure(state).await?;
+    Ok(configured
+        .pointer("/methods")
+        .and_then(Value::as_array)
+        .ok_or("methods")?
+        .iter()
+        .map(|method| at(method, "/unavailable"))
+        .collect())
+}
+
+/// Every method signs in through `az`, a service principal too.
+#[tokio::test]
+async fn with_no_az_on_path_configure_lists_every_method_as_unavailable() -> TestResult {
+    let (scripted, state) = (ScriptedAz::new()?, tempfile::tempdir()?);
+    let without = unavailable(InstalledAz::new(None, Vec::new()), state.path()).await?;
+    assert_eq!(without.len(), 3);
+    for why in &without {
+        assert_eq!(at(why, "/kind"), "toolMissing", "{why}");
+        let message = at(why, "/message");
+        assert!(
+            message.as_str().is_some_and(|message| message.contains(
+                "Install it from https://learn.microsoft.com/cli/azure/install-azure-cli"
+            )),
+            "{message}"
+        );
+    }
+    assert_eq!(
+        unavailable(installed(&scripted), state.path()).await?,
+        vec![Value::Null; 3]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn signs_in_through_the_az_on_path_with_the_blocks_own_config_dir() -> TestResult {
     let (scripted, state) = (ScriptedAz::new()?, tempfile::tempdir()?);
