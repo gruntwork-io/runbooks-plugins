@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#MISE description="Every static check; writes nothing"
+set -euo pipefail
+# Any cargo warning fails the gate. Unlike -D warnings, keeps the build cache. Set here, not in
+# mise.toml, so a half-written change still builds while iterating.
+export CARGO_BUILD_WARNINGS=deny
+
+# Cost-ordered: the cheap checks fail first.
+cargo fmt --all --check
+tombi format --check
+tombi lint
+shfmt --diff mise-tasks .claude/hooks
+shellcheck --enable=all mise-tasks/* .claude/hooks/*
+typos
+cargo clippy --workspace --all-targets --all-features --locked
+# Each feature combination builds. Resolver 3 keeps dev-dependencies from turning features on.
+cargo hack check --workspace --feature-powerset --depth 2 --locked
+cargo doc --workspace --no-deps --all-features --locked
+# Every platform's crates, for the offline deny.
+cargo fetch --locked
+cargo deny --offline --locked check bans licenses sources
+cargo shear

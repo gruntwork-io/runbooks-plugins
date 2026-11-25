@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Mutation-test only the code changed since a base ref"
+#USAGE arg "[base]" default="origin/main" help="Git ref to diff against"
+set -euo pipefail
+
+mkdir -p target
+git diff "${usage_base:?}...HEAD" >target/mutants.diff
+cargo mutants --workspace --in-diff target/mutants.diff

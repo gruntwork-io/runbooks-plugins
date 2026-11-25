@@ -1,0 +1,31 @@
+min_version = "2026.11.8"
+
+[tools]
+rust = { version = "1.100.0", components = "clippy,rustfmt", profile = "minimal" }
+cargo-binstall = "1.27.0"
+"cargo:cargo-nextest" = "0.9.152"
+"cargo:cargo-shear" = "1.14.1"
+"cargo:cargo-mutants" = "27.1.0"
+"cargo:cargo-semver-checks" = "0.51.0"
+"cargo:cargo-hack" = "0.6.46"
+"cargo:cargo-edit" = "0.13.14"
+pinact = "5.0.2"
+cargo-deny = "0.20.2"
+tombi = "1.11.2"
+typos = "1.52.2"
+# Maintained fork; upstream rhysd/actionlint has not released since 2026-03.
+"github:kjanat/actionlint" = "1.17.1"
+zizmor = "1.32.0"
+shellcheck = "0.11.0"
+shfmt = "3.14.1"
+jq = "1.8.2"
+gh = "2.104.0"
+
+[settings]
+lockfile = true
+minimum_release_age = "7d"
+
+[env]
+RUST_BACKTRACE = "1"
+# Mutants tested at once, each in its own copy of the tree.
+CARGO_MUTANTS_JOBS = "4"

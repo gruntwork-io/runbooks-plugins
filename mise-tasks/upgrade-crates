@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#MISE description="Raise each crates.io dependency to its newest release that Cargo's cooldown allows"
+set -euo pipefail
+
+# Resolve in a scratch crate so Cargo's cooldown picks each version.
+probe=$(mktemp -d)
+trap 'rm -rf "${probe}"' EXIT
+
+metadata=$(cargo metadata --no-deps --format-version 1)
+rust_version=$(jq -r '[.packages[].rust_version] | max' <<<"${metadata}")
+registry=$(jq -c '[.packages[].dependencies[]
+  | select(.source == "registry+https://github.com/rust-lang/crates.io-index")]' <<<"${metadata}")
+deps=$(jq -r 'map("\(.name) = \">=0\"") | unique[]' <<<"${registry}")
+current=$(jq -c 'map({(.name): (.req | ltrimstr("^"))}) | add' <<<"${registry}")
+
+mkdir "${probe}/src"
+touch "${probe}/src/lib.rs"
+cat >"${probe}/Cargo.toml" <<EOF
+[package]
+name = "probe"
+edition = "2024"
+rust-version = "${rust_version}"
+
+[dependencies]
+${deps}
+
+[workspace]
+EOF
+
+# The working directory's .cargo/config.toml sets the cooldown.
+cargo generate-lockfile --manifest-path "${probe}/Cargo.toml"
+resolved=$(cargo metadata --format-version 1 --manifest-path "${probe}/Cargo.toml")
+pins=$(jq -r --argjson current "${current}" 'def semver: split(".") | map(tonumber);
+  .resolve.root as $root
+  | [.resolve.nodes[] | select(.id == $root) | .deps[].pkg] as $direct
+  | .packages[] | select(.id | IN($direct[]))
+  | select((.version | semver) > ($current[.name] | semver))
+  | "--package=\(.name)@\(.version)"' <<<"${resolved}")
+# Without --package, cargo upgrade would raise every dependency.
+if [[ -z ${pins} ]]; then
+  exit 0
+fi
+mapfile -t packages <<<"${pins}"
+
+cargo upgrade --incompatible "${packages[@]}"

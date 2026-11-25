@@ -1,0 +1,11 @@
+{
+  "recommendations": [
+    "hverlin.mise-vscode",
+    "rust-lang.rust-analyzer",
+    "tombi-toml.tombi",
+    "timonwong.shellcheck",
+    "mkhl.shfmt",
+    "tekumara.typos-vscode"
+  ],
+  "unwantedRecommendations": ["tamasfe.even-better-toml"]
+}

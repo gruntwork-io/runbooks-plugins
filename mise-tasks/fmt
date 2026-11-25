@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#MISE description="Format Rust, TOML and shell in place"
+set -euo pipefail
+
+cargo fmt --all
+tombi format
+shfmt --write mise-tasks .claude/hooks

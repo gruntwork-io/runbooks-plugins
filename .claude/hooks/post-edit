@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# PostToolUse on Edit|Write: format, then lint.
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+file=$(mise exec -- jq -r '.tool_input.file_path // empty')
+
+# Claude Code drops any exit other than 2 as a non-blocking error, so every failure exits 2.
+check() {
+  local out
+  if ! out=$("$@" 2>&1); then
+    echo "${out}" >&2
+    exit 2
+  fi
+}
+
+case "${file}" in
+*.rs | *.toml)
+  if [[ ${file} == */Cargo.toml ]]; then
+    check mise run lock
+  fi
+  check mise exec -- cargo fmt --all
+  check mise exec -- tombi format
+  check env CARGO_BUILD_WARNINGS=deny mise exec -- cargo clippy --workspace --all-targets \
+    --all-features --locked --quiet --message-format=short
+  ;;
+*/mise-tasks/* | */.claude/hooks/*)
+  check mise exec -- shellcheck --enable=all "${file}"
+  ;;
+*) ;;
+esac

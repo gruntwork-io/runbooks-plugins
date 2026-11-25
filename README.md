@@ -14,6 +14,16 @@ The first are the credential plugins, which sign in to a cloud and hand a run it
 
 Being built as track A of the Runbooks rebuild (gruntwork-io/runbooks, PR stack #519). Nothing is released yet.
 
+## Development
+
+mise installs every tool and runs every gate:
+
+```sh
+mise install
+mise run check
+mise tasks
+```
+
 ## The protocol
 
 - One JSON object per line: requests on standard input, responses and notifications on standard output, logs on standard error.

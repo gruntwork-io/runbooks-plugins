@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# PreToolUse on Edit|Write: lockfiles are generated. Exit 2 blocks the edit.
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+file=$(mise exec -- jq -r '.tool_input.file_path // empty')
+
+case "${file}" in
+*/Cargo.lock)
+  echo "Cargo.lock is generated: change Cargo.toml, then run \`mise run lock\`." >&2
+  exit 2
+  ;;
+*/mise.lock)
+  echo "mise.lock is generated: change mise.toml, then run \`mise lock\`." >&2
+  exit 2
+  ;;
+*) ;;
+esac
