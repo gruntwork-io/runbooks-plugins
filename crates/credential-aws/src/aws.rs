@@ -177,6 +177,39 @@ pub trait Aws: Send + Sync + 'static {
     ) -> impl Future<Output = Result<bool, AwsError>> + Send;
 }
 
+/// How the plugin reaches AWS, as `configure` says.
+#[derive(Clone, Default)]
+pub struct Network {
+    /// Roots to trust beside the platform's, in PEM: `caBundleFile`'s bytes.
+    pub ca_bundle: Option<Vec<u8>>,
+    /// The proxy every AWS call goes through. It can hold a password, so
+    /// neither `Debug` nor an error shows it.
+    pub proxy: Option<String>,
+}
+
+impl fmt::Debug for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Network")
+            .field("ca_bundle", &self.ca_bundle.as_ref().map(Vec::len))
+            .field("proxy", &self.proxy.as_ref().map(|_set| "<set>"))
+            .finish()
+    }
+}
+
+/// Why [`SdkAws::new`] refused a [`Network`]. Never shows the proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum NetworkError {
+    /// The CA bundle has no PEM certificate in it.
+    #[error("holds no PEM certificate")]
+    NoCertificate,
+    /// A PEM block of the CA bundle is not a certificate rustls can trust.
+    #[error("holds a certificate that does not parse")]
+    BadCertificate,
+    /// The proxy is not an `http` or `https` URL with a host.
+    #[error("is not an http or https proxy URL")]
+    Proxy,
+}
+
 /// The AWS service a call went to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Service {

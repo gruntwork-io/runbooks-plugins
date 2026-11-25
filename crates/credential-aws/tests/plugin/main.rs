@@ -4,6 +4,8 @@
 
 mod profile;
 mod sso;
+#[path = "../support/tls.rs"]
+mod tls;
 
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
@@ -16,8 +18,8 @@ use std::time::Duration;
 use jsonschema::{Draft, Registry, Validator};
 use runbooks_credential_aws::{
     AccountId, AssumeRole, Aws, AwsCredentials, AwsError, AwsErrorKind, AwsPlugin, CallerIdentity,
-    Clock, DeviceAuthorization, Environment, Region, Secret, Service, SsoAccount, SsoToken,
-    TokenPoll,
+    Clock, Connect, DeviceAuthorization, Environment, Network, Region, SdkAws, Secret, Service,
+    SsoAccount, SsoToken, TokenPoll,
 };
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_protocol::credential::{DetectParams, ErrorKind};
@@ -95,6 +97,18 @@ struct FakeAws {
     regions: HashMap<String, Result<bool, AwsError>>,
     /// Every `GetRegionOptStatus`, as "<region> with <key> in <region>".
     region_checks: Arc<Mutex<Vec<String>>>,
+    /// The network of the last `configure` the real client accepted.
+    network: Arc<Mutex<Option<Network>>>,
+}
+
+/// Reaches `aws` once the real client has accepted the network, which it
+/// keeps for the test to read.
+fn connect(aws: FakeAws) -> Connect<FakeAws> {
+    Box::new(move |network| {
+        SdkAws::new(network)?;
+        *lock(&aws.network) = Some(network.clone());
+        Ok(aws.clone())
+    })
 }
 
 type KeysAnswer = Result<AwsCredentials, AwsError>;
@@ -203,6 +217,10 @@ impl FakeAws {
     fn region(mut self, region: &str, answer: Result<bool, AwsError>) -> Self {
         self.regions.insert(region.to_owned(), answer);
         self
+    }
+
+    fn network(&self) -> Option<Network> {
+        lock(&self.network).clone()
     }
 
     fn region_checks(&self) -> Vec<String> {
@@ -459,7 +477,7 @@ impl App {
             { "$ref": format!("{ROOT}base.schema.json#/$defs/notification") },
         ]});
         let clock = FixedClock(OffsetDateTime::parse(NOW, &Rfc3339)?);
-        let plugin = AwsPlugin::new(aws, clock, env);
+        let plugin = AwsPlugin::new(connect(aws), clock, env);
         let mut app = Self {
             stdin: Some(stdin),
             stdout: BufReader::new(stdout).lines(),
@@ -774,6 +792,114 @@ async fn settings_aws_does_not_have_or_a_bad_region_are_refused_by_name() -> Tes
             assert!(!message.contains(never), "{message}");
         }
     }
+    Ok(())
+}
+
+/// `configure`'s params, with the network the app passes.
+fn network_params(network: &[(&str, &str)]) -> Result<Value, Box<dyn Error>> {
+    let mut params = configure_params(&json!({}));
+    let object = params.as_object_mut().ok_or("not an object")?;
+    for (name, value) in network {
+        object.insert((*name).to_owned(), json!(value));
+    }
+    Ok(params)
+}
+
+/// The CA bundle and the proxy reach the AWS client. A bundle that cannot
+/// be read or holds no good certificate is refused by its path, and a proxy
+/// that is not an http or https URL is refused without repeating it.
+#[tokio::test]
+async fn configure_refuses_a_ca_bundle_or_proxy_it_cannot_use_by_name() -> TestResult {
+    let aws = FakeAws::default();
+    let mut app = App::start(aws.clone(), Environment::default()).await?;
+    assert_eq!(
+        aws.network()
+            .map(|network| (network.ca_bundle, network.proxy)),
+        Some((None, None))
+    );
+
+    let dir = tempfile::tempdir()?;
+    let file = |name: &str, bytes: &[u8]| -> Result<String, Box<dyn Error>> {
+        let path = dir.path().join(name);
+        fs::write(&path, bytes)?;
+        Ok(path.to_str().ok_or("a UTF-8 path")?.to_owned())
+    };
+    let missing = dir.path().join("missing.pem");
+    let missing = missing.to_str().ok_or("a UTF-8 path")?;
+    let folder = dir.path().to_str().ok_or("a UTF-8 path")?;
+    let large = file("large.pem", &vec![b'#'; 1024 * 1024 + 1])?;
+    let text = file("text.pem", b"not a certificate")?;
+    let bad = file(
+        "bad.pem",
+        b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+    )?;
+    for (network, says) in [
+        (
+            vec![("caBundleFile", missing)],
+            format!("caBundleFile {missing} does not exist"),
+        ),
+        (
+            vec![("caBundleFile", folder)],
+            format!("caBundleFile {folder} could not be read: "),
+        ),
+        (
+            vec![("caBundleFile", large.as_str())],
+            format!("caBundleFile {large} is larger than 1048576 bytes"),
+        ),
+        (
+            vec![("caBundleFile", text.as_str())],
+            format!("caBundleFile {text} holds no PEM certificate"),
+        ),
+        (
+            vec![("caBundleFile", bad.as_str())],
+            format!("caBundleFile {bad} holds a certificate that does not parse"),
+        ),
+        (
+            vec![(
+                "proxy",
+                "socks5://user:test-proxy-password@proxy.example.com",
+            )],
+            "proxy is not an http or https proxy URL".to_owned(),
+        ),
+        (
+            vec![("proxy", "http://user:test-proxy-password@[::1")],
+            "proxy is not an http or https proxy URL".to_owned(),
+        ),
+    ] {
+        let error = app
+            .fails("configure", network_params(&network)?, "invalidParams")
+            .await?;
+        let message = at(&error, "/message");
+        let message = message.as_str().ok_or("message")?;
+        assert!(message.starts_with(&says), "{message} should say {says}");
+        assert!(!message.contains("test-proxy-password"), "{message}");
+    }
+
+    tls::make_certificates(dir.path())?;
+    let bundle = dir.path().join("ca.pem");
+    let bundle = bundle.to_str().ok_or("a UTF-8 path")?;
+    let proxy = "http://user:test-proxy-password@proxy.example.com:3128";
+    app.ok(
+        "configure",
+        network_params(&[("caBundleFile", bundle), ("proxy", proxy)])?,
+        "configureResult",
+    )
+    .await?;
+    let network = aws.network().ok_or("no network")?;
+    assert_eq!(network.ca_bundle, Some(fs::read(bundle)?));
+    assert_eq!(network.proxy.as_deref(), Some(proxy));
+    assert!(!format!("{network:?}").contains("test-proxy-password"));
+
+    // A bundle of exactly the largest size is read.
+    let mut padded = fs::read(bundle)?;
+    padded.resize(1024 * 1024, b'\n');
+    let padded = file("padded.pem", &padded)?;
+    app.ok(
+        "configure",
+        network_params(&[("caBundleFile", padded.as_str())])?,
+        "configureResult",
+    )
+    .await?;
     Ok(())
 }
 
@@ -1279,7 +1405,11 @@ async fn the_plugins_debug_shows_its_credential_but_never_a_secret() -> TestResu
         ("AWS_SECRET_ACCESS_KEY", SECRET),
         ("AWS_SESSION_TOKEN", TOKEN),
     ]);
-    let plugin = AwsPlugin::new(aws, FixedClock(OffsetDateTime::parse(NOW, &Rfc3339)?), env);
+    let plugin = AwsPlugin::new(
+        connect(aws),
+        FixedClock(OffsetDateTime::parse(NOW, &Rfc3339)?),
+        env,
+    );
     let params: DetectParams = serde_json::from_value(
         json!({"sources": [{"kind": "env"}], "pins": {}, "requirements": []}),
     )?;
@@ -1299,7 +1429,7 @@ async fn the_plugins_debug_shows_its_credential_but_never_a_secret() -> TestResu
 #[tokio::test]
 async fn an_unconfigured_plugin_refuses_detect() -> TestResult {
     let plugin = AwsPlugin::new(
-        FakeAws::default(),
+        connect(FakeAws::default()),
         FixedClock(OffsetDateTime::parse(NOW, &Rfc3339)?),
         Environment::default(),
     );

@@ -16,18 +16,20 @@ aws-sdk-iam.workspace = true
 aws-sdk-sso.workspace = true
 aws-sdk-ssooidc.workspace = true
 aws-sdk-sts.workspace = true
+aws-smithy-http-client.workspace = true
 aws-types.workspace = true
 runbooks-plugin-protocol.workspace = true
 runbooks-plugin-transport.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
 
 [dev-dependencies]
 jsonschema.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "test-util"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "test-util"] }
 
 [lints]
 workspace = true

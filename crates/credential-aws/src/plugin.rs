@@ -1,5 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::future::{self, Future};
+use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use runbooks_plugin_protocol::credential::{
@@ -11,8 +13,10 @@ use runbooks_plugin_transport::{CredentialPlugin, PluginError, Prompts};
 use serde_json::Map;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::fs;
+use tokio::io::AsyncReadExt;
 
-use crate::aws::{Aws, AwsCredentials, SsoAccount, read_profiles};
+use crate::aws::{Aws, AwsCredentials, Network, NetworkError, SsoAccount, read_profiles};
 use crate::detect::{
     AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, Environment,
     parse_sources,
@@ -48,21 +52,36 @@ impl Clock for SystemClock {
     }
 }
 
+/// Makes the [`Aws`] the plugin calls once `configure` says how to reach AWS.
+pub type Connect<A> = Box<dyn Fn(&Network) -> Result<A, NetworkError> + Send + Sync>;
+
+/// The largest `caBundleFile` read.
+const MAX_CA_BUNDLE_BYTES: usize = 1024 * 1024;
+
 /// The AWS credential plugin for one block. It holds at most one credential:
 /// the last one `detect` found or a sign-in produced.
-#[derive(Debug)]
 pub struct AwsPlugin<A, C> {
-    aws: A,
+    connect: Connect<A>,
     clock: C,
     env: Environment,
-    state: Mutex<State>,
+    state: Mutex<State<A>>,
+}
+
+impl<A: fmt::Debug, C: fmt::Debug> fmt::Debug for AwsPlugin<A, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AwsPlugin")
+            .field("clock", &self.clock)
+            .field("env", &self.env)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
-struct State {
+struct State<A> {
     /// Set by each `configure`. The transport refuses every other call until
     /// one has succeeded.
-    configured: Option<Arc<Configured>>,
+    configured: Option<Arc<Configured<A>>>,
     /// Counts every change of session, so a call that read the session
     /// before an await can tell whether it is still the same one.
     generation: u64,
@@ -71,7 +90,9 @@ struct State {
 
 /// What `configure` set up.
 #[derive(Debug)]
-struct Configured {
+struct Configured<A> {
+    /// AWS, reached through the network `configure` gave.
+    aws: A,
     /// The run's region when neither the credential nor the sign-in names
     /// one: the block's `defaultRegion` setting, else us-east-1.
     default_region: Region,
@@ -80,7 +101,7 @@ struct Configured {
     profiles: BTreeSet<String>,
 }
 
-impl Configured {
+impl<A> Configured<A> {
     /// Whether the `profile` field lets the person give `name`.
     fn lists(&self, name: &str) -> bool {
         self.profiles.is_empty() || self.profiles.contains(name)
@@ -152,10 +173,12 @@ fn ready(ready: Ready) -> (Session, Identity) {
 }
 
 impl<A: Aws, C: Clock> AwsPlugin<A, C> {
-    /// `env` is the environment the `env` detection source reads.
-    pub const fn new(aws: A, clock: C, env: Environment) -> Self {
+    /// `connect` makes the [`Aws`] the plugin calls from what `configure`
+    /// says of the network. `env` is the environment the `env` detection
+    /// source reads.
+    pub fn new(connect: Connect<A>, clock: C, env: Environment) -> Self {
         Self {
-            aws,
+            connect,
             clock,
             env,
             state: Mutex::new(State {
@@ -167,11 +190,11 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
     }
 
     // No guard is held across an await or a call that can panic.
-    fn lock(&self) -> MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, State<A>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn configured(&self) -> Result<Arc<Configured>, PluginError> {
+    fn configured(&self) -> Result<Arc<Configured<A>>, PluginError> {
         self.lock().configured.clone().ok_or_else(|| {
             PluginError::new(ErrorKind::NotConfigured, "configure the AWS plugin first")
         })
@@ -247,8 +270,9 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
         method: String,
         pins: &Pins,
     ) -> Result<Ready, PluginError> {
+        let configured = self.configured()?;
         let home = sts_region.partition_home();
-        let caller = self
+        let caller = configured
             .aws
             .caller_identity(&credentials, &home)
             .await
@@ -258,7 +282,7 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
             .map_err(|mismatch| PluginError::new(ErrorKind::PinMismatch, mismatch.to_string()))?;
         // As in today's block, a check that fails (keys that may not call
         // account:GetRegionOptStatus, an SCP, the network) warns of nothing.
-        let region_not_enabled = match self
+        let region_not_enabled = match configured
             .aws
             .region_enabled(&credentials, &region, &region.partition_home())
             .await
@@ -333,10 +357,11 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
         plan: profile::Plan,
         region: Region,
     ) -> Result<Ready, PluginError> {
+        let configured = self.configured()?;
         let home = region.partition_home();
         let mut credentials = plan.base;
         for role in &plan.roles {
-            credentials = self
+            credentials = configured
                 .aws
                 .assume_role(&credentials, role, &home)
                 .await
@@ -375,7 +400,8 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
             .map_err(|error| invalid_params(&error))?
             .unwrap_or_else(Region::default_region);
         let run_region = self.run_region(fields)?;
-        let token = sso::device_sign_in(&self.aws, prompts, &start_url, &sso_region).await?;
+        let configured = self.configured()?;
+        let token = sso::device_sign_in(&configured.aws, prompts, &start_url, &sso_region).await?;
         let expires_at = token
             .expires_in
             .and_then(|lifetime| time::Duration::try_from(lifetime).ok())
@@ -393,10 +419,10 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
         if let (Some(account), Some(role)) = (login.pins.account.clone(), login.pins.role.clone()) {
             return Ok(ready(self.sign_in_to_role(login, account, role).await?));
         }
-        let accounts = sso::accounts(&self.aws, &login).await?;
+        let accounts = sso::accounts(&configured.aws, &login).await?;
         login.remember(&accounts);
         if let [only] = accounts.as_slice() {
-            let roles = sso::roles(&self.aws, &login, &only.id).await?;
+            let roles = sso::roles(&configured.aws, &login, &only.id).await?;
             if let [role] = roles.as_slice() {
                 let (account, role) = (only.id.clone(), role.clone());
                 return Ok(ready(self.sign_in_to_role(login, account, role).await?));
@@ -415,6 +441,7 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
     ) -> Result<Ready, PluginError> {
         sso::check_choice(&login.pins, &account, Some(&role))?;
         let credentials = self
+            .configured()?
             .aws
             .role_credentials(&login.token, &account, &role, &login.sso_region)
             .await
@@ -458,7 +485,8 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
             return Ok(ready);
         }
         let fresh = if let Some(sso) = &ready.sso {
-            self.aws
+            self.configured()?
+                .aws
                 .role_credentials(
                     &sso.login.token,
                     &sso.account,
@@ -505,6 +533,34 @@ fn not_signed_in() -> PluginError {
     )
 }
 
+/// The `caBundleFile`'s bytes, up to [`MAX_CA_BUNDLE_BYTES`]. Missing,
+/// unreadable and larger files are refused, by their path.
+async fn read_ca_bundle(path: &str) -> Result<Vec<u8>, PluginError> {
+    let refused = |why: &str| invalid_params(&format!("caBundleFile {path} {why}"));
+    let unreadable = |error: io::Error| refused(&format!("could not be read: {}", error.kind()));
+    let file = fs::File::open(path).await.map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            refused("does not exist")
+        } else {
+            unreadable(error)
+        }
+    })?;
+    let limit = u64::try_from(MAX_CA_BUNDLE_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(unreadable)?;
+    if bytes.len() > MAX_CA_BUNDLE_BYTES {
+        return Err(refused(&format!(
+            "is larger than {MAX_CA_BUNDLE_BYTES} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
 fn known_level(level: &str) -> Result<(), PluginError> {
     if level == ACCOUNT || level == ROLE {
         Ok(())
@@ -517,18 +573,36 @@ fn known_level(level: &str) -> Result<(), PluginError> {
 }
 
 impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
-    /// Takes the block's settings, and lists the shared files' profiles as
-    /// the `profile` field's choices. Files that do not parse list none:
-    /// signing in with a profile names the line.
+    /// Takes the block's settings and reaches AWS through the network it
+    /// names: `caBundleFile`'s roots beside the platform's, and `proxy` for
+    /// every call. Lists the shared files' profiles as the `profile` field's
+    /// choices. Files that do not parse list none: signing in with a profile
+    /// names the line.
     async fn configure(&self, params: ConfigureParams) -> Result<ConfigureResult, PluginError> {
         let default_region =
             settings::default_region(&params.settings).map_err(|error| invalid_params(&error))?;
+        let ca_bundle = match &params.ca_bundle_file {
+            Some(path) => Some(read_ca_bundle(path).await?),
+            None => None,
+        };
+        let network = Network {
+            ca_bundle,
+            proxy: params.proxy,
+        };
+        let aws = (self.connect)(&network).map_err(|error| match error {
+            NetworkError::NoCertificate | NetworkError::BadCertificate => invalid_params(&format!(
+                "caBundleFile {} {error}",
+                params.ca_bundle_file.as_deref().unwrap_or_default()
+            )),
+            NetworkError::Proxy => invalid_params(&format!("proxy {error}")),
+        })?;
         let choices = match read_profiles(profile::file_env(&self.env)).await {
             Ok(profiles) => profile::choices(&profiles),
             Err(_unparsed) => Vec::new(),
         };
         let profiles = choices.iter().map(|choice| choice.value.clone()).collect();
         self.lock().configured = Some(Arc::new(Configured {
+            aws,
             default_region,
             profiles,
         }));
@@ -628,8 +702,9 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
         let level = params.level.as_str();
         known_level(level)?;
         let login = self.sso_login(level)?;
+        let configured = self.configured()?;
         let targets = if level == ACCOUNT {
-            let accounts = sso::accounts(&self.aws, &login).await?;
+            let accounts = sso::accounts(&configured.aws, &login).await?;
             self.remember(&accounts);
             accounts
                 .into_iter()
@@ -648,7 +723,7 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
                 })?,
             };
             sso::check_choice(&login.pins, &account, None)?;
-            sso::roles(&self.aws, &login, &account)
+            sso::roles(&configured.aws, &login, &account)
                 .await?
                 .into_iter()
                 .map(|role| Target {
