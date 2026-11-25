@@ -276,6 +276,14 @@ impl App {
     }
 }
 
+fn keys_sign_in(access_key_id: &str, extra: &[(&str, &str)]) -> Value {
+    let mut fields = json!({"accessKeyId": access_key_id, "secretAccessKey": SECRET});
+    for (name, value) in extra {
+        fields[*name] = json!(value);
+    }
+    json!({"method": "credentials", "fields": fields, "pins": {}, "requirements": []})
+}
+
 /// One of `env`'s values: the value, whether it is sensitive, and where it goes.
 type Delivered = (String, bool, Vec<String>);
 
@@ -305,7 +313,7 @@ fn values_of(env: &Value) -> Result<HashMap<String, Delivered>, Box<dyn Error>> 
 // configure.
 
 #[tokio::test]
-async fn configure_declares_the_levels_and_every_name_a_run_gets() -> TestResult {
+async fn configure_offers_static_keys_the_levels_and_every_name_a_run_gets() -> TestResult {
     let mut app = App::start(FakeAws::default(), Environment::default()).await?;
     // App::start configured once; a second answer is the same.
     let result = app
@@ -333,6 +341,21 @@ async fn configure_declares_the_levels_and_every_name_a_run_gets() -> TestResult
         .filter_map(|l| l["name"].as_str())
         .collect();
     assert_eq!(levels, ["account", "role"]);
+
+    let credentials = result["methods"]
+        .as_array()
+        .ok_or("methods")?
+        .iter()
+        .find(|m| m["name"] == "credentials")
+        .ok_or("a credentials method")?;
+    let secret_fields: Vec<&str> = credentials["fields"]
+        .as_array()
+        .ok_or("fields")?
+        .iter()
+        .filter(|f| f["secret"] == true)
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    assert_eq!(secret_fields, ["secretAccessKey", "sessionToken"]);
     Ok(())
 }
 
@@ -631,18 +654,111 @@ async fn a_region_that_is_not_one_names_its_variable() -> TestResult {
     Ok(())
 }
 
+// signIn with static keys.
+
+#[tokio::test]
+async fn static_keys_sign_in_and_a_run_gets_them_with_the_chosen_region() -> TestResult {
+    let aws = FakeAws::default().caller("AKIAKEYS", OTHER_ACCOUNT, USER_ARN)?;
+    let mut app = App::start(aws.clone(), Environment::default()).await?;
+    let identity = app
+        .ok(
+            "signIn",
+            keys_sign_in(
+                "AKIAKEYS",
+                &[("defaultRegion", "ca-central-1"), ("sessionToken", "")],
+            ),
+            "signInResult",
+        )
+        .await?;
+    assert_eq!(identity["principal"], USER_ARN);
+    assert_eq!(identity["kind"], "user");
+    assert_eq!(identity["method"], "credentials");
+    assert!(identity.get("expiresAt").is_none(), "{identity}");
+    assert_eq!(aws.calls()[0].region, "us-east-1");
+
+    let env = app.ok("env", json!({}), "envResult").await?;
+    let values = values_of(&env)?;
+    let both = vec!["env".to_owned(), "output".to_owned()];
+    assert_eq!(
+        values["AWS_ACCESS_KEY_ID"],
+        ("AKIAKEYS".to_owned(), false, both.clone())
+    );
+    assert_eq!(
+        values["AWS_SECRET_ACCESS_KEY"],
+        (SECRET.to_owned(), true, both.clone())
+    );
+    assert_eq!(
+        values["AWS_REGION"],
+        ("ca-central-1".to_owned(), false, both)
+    );
+    // No session token: the output is empty and the variable unset.
+    assert_eq!(
+        values["AWS_SESSION_TOKEN"],
+        (String::new(), true, vec!["output".to_owned()])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sign_in_names_every_missing_and_unknown_field() -> TestResult {
+    let mut app = App::start(FakeAws::default(), Environment::default()).await?;
+    let params = json!({"method": "credentials", "fields": {"accessKeyId": "", "region": "us-east-1"}, "pins": {}, "requirements": []});
+    let error = app.fails("signIn", params, "invalidParams").await?;
+    let message = error["message"].as_str().ok_or("message")?;
+    for name in ["accessKeyId", "secretAccessKey", "region", "defaultRegion"] {
+        assert!(message.contains(name), "{message} should name {name}");
+    }
+
+    let error = app
+        .fails(
+            "signIn",
+            keys_sign_in("AKIA", &[("defaultRegion", "Ohio")]),
+            "invalidParams",
+        )
+        .await?;
+    let message = error["message"].as_str().ok_or("message")?;
+    assert!(
+        message.contains("defaultRegion") && message.contains("\"Ohio\""),
+        "{message}"
+    );
+
+    let error = app
+        .fails(
+            "signIn",
+            json!({"method": "oauth", "fields": {}, "pins": {}, "requirements": []}),
+            "invalidParams",
+        )
+        .await?;
+    assert!(
+        error["message"]
+            .as_str()
+            .ok_or("message")?
+            .contains("credentials"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn static_keys_for_another_account_than_the_pin_are_refused() -> TestResult {
+    let aws = FakeAws::default().caller("AKIAKEYS", OTHER_ACCOUNT, USER_ARN)?;
+    let mut app = App::start(aws, Environment::default()).await?;
+    let mut params = keys_sign_in("AKIAKEYS", &[]);
+    params["pins"] = json!({"account": ACCOUNT});
+    app.fails("signIn", params, "pinMismatch").await?;
+    app.fails("env", json!({}), "notSignedIn").await?;
+    Ok(())
+}
+
 // env and signOut.
 
 #[tokio::test]
-async fn env_needs_a_credential_and_sign_out_drops_it() -> TestResult {
-    let aws = FakeAws::default().caller("AKIAENV", OTHER_ACCOUNT, USER_ARN)?;
-    let env = environment(&[
-        ("AWS_ACCESS_KEY_ID", "AKIAENV"),
-        ("AWS_SECRET_ACCESS_KEY", SECRET),
-    ]);
-    let mut app = App::start(aws, env).await?;
+async fn env_needs_a_sign_in_and_sign_out_drops_it() -> TestResult {
+    let aws = FakeAws::default().caller("AKIAKEYS", OTHER_ACCOUNT, USER_ARN)?;
+    let mut app = App::start(aws, Environment::default()).await?;
     app.fails("env", json!({}), "notSignedIn").await?;
-    app.detect(json!([{"kind": "env"}]), json!({})).await?;
+    app.ok("signIn", keys_sign_in("AKIAKEYS", &[]), "signInResult")
+        .await?;
     app.ok("env", json!({}), "envResult").await?;
     app.ok("signOut", json!({}), "signOutResult").await?;
     app.fails("env", json!({}), "notSignedIn").await?;
@@ -692,7 +808,7 @@ async fn keys_past_their_expiration_are_expired() -> TestResult {
 }
 
 #[tokio::test]
-async fn targets_and_select_have_nothing_to_choose_for_detected_keys() -> TestResult {
+async fn targets_and_select_have_nothing_to_choose_for_static_keys() -> TestResult {
     let mut app = App::start(FakeAws::default(), Environment::default()).await?;
     app.fails("targets", json!({"level": "account"}), "invalidParams")
         .await?;
@@ -719,7 +835,9 @@ async fn targets_and_select_have_nothing_to_choose_for_detected_keys() -> TestRe
 
 #[tokio::test]
 async fn a_secret_leaves_the_plugin_only_in_envs_result() -> TestResult {
-    let aws = FakeAws::default().caller("AKIAENV", ACCOUNT, ROLE_ARN)?;
+    let aws = FakeAws::default()
+        .caller("AKIAKEYS", OTHER_ACCOUNT, USER_ARN)?
+        .caller("AKIAENV", ACCOUNT, ROLE_ARN)?;
     let env = environment(&[
         ("AWS_ACCESS_KEY_ID", "AKIAENV"),
         ("AWS_SECRET_ACCESS_KEY", SECRET),
@@ -730,7 +848,7 @@ async fn a_secret_leaves_the_plugin_only_in_envs_result() -> TestResult {
     ]);
     let mut app = App::start(aws, env).await?;
     // Every path that handles a secret: detection that finds, refuses and
-    // cannot read one, and each error.
+    // cannot read one; sign-ins that succeed and fail; each error.
     app.detect(json!([{"kind": "env", "prefix": "BAD_"}]), json!({}))
         .await?;
     app.detect(json!([{"kind": "env"}]), json!({"account": OTHER_ACCOUNT}))
@@ -740,12 +858,22 @@ async fn a_secret_leaves_the_plugin_only_in_envs_result() -> TestResult {
         json!({}),
     )
     .await?;
+    app.detect(json!([{"kind": "env"}]), json!({})).await?;
     app.call(
         "signIn",
-        json!({"method": "credentials", "fields": {"accessKeyId": "AKIA", "secretAccessKey": SECRET}, "pins": {}, "requirements": []}),
+        keys_sign_in("AKIAWHO", &[("sessionToken", TOKEN)]),
     )
     .await?;
-    app.detect(json!([{"kind": "env"}]), json!({})).await?;
+    app.call(
+        "signIn",
+        keys_sign_in("AKIAKEYS", &[("sessionToken", TOKEN), ("nope", SECRET)]),
+    )
+    .await?;
+    app.call(
+        "signIn",
+        keys_sign_in("AKIAKEYS", &[("sessionToken", TOKEN)]),
+    )
+    .await?;
     app.call("env", json!({})).await?;
 
     let mut env_lines = 0;

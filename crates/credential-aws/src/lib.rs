@@ -4,6 +4,8 @@
 //!   `AWS_SESSION_TOKEN`, `AWS_REGION` (then `AWS_DEFAULT_REGION`) and
 //!   `AWS_CREDENTIAL_EXPIRATION` from the environment, under a prefix when
 //!   the source has one, or the same names from an earlier block's outputs.
+//! - **Sign-in methods**: `credentials`, an access key with its secret and an
+//!   optional session token.
 //! - Every credential is checked with STS `GetCallerIdentity`, in the home
 //!   region of its region's partition, before it is used.
 //! - **Pins** are keyed by level: `account` (`ssoAccountId`) and `role`

@@ -18,8 +18,11 @@ use crate::detect::{
 };
 use crate::error::{self, invalid_params};
 use crate::identity::{ACCOUNT, Pins, Principal, ROLE};
-use crate::methods;
+use crate::methods::{
+    self, ACCESS_KEY_ID, DEFAULT_REGION, Fields, SECRET_ACCESS_KEY, SESSION_TOKEN, SignInMethod,
+};
 use crate::region::Region;
+use crate::secret::Secret;
 
 /// The wall clock, for expiry. Tests pass a fixed one.
 pub trait Clock: Send + Sync + 'static {
@@ -144,6 +147,26 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
             values: env_values(&ready),
         })
     }
+
+    async fn sign_in_with_keys(
+        &self,
+        fields: Fields<'_>,
+        pins: &Pins,
+    ) -> Result<Ready, PluginError> {
+        let region = fields
+            .region(DEFAULT_REGION)
+            .map_err(|error| invalid_params(&error))?
+            .unwrap_or_else(Region::default_region);
+        let credentials = AwsCredentials {
+            access_key_id: fields.required(ACCESS_KEY_ID).to_owned(),
+            secret_access_key: Secret::new(fields.required(SECRET_ACCESS_KEY)),
+            session_token: fields.get(SESSION_TOKEN).map(Secret::new),
+            expires_at: None,
+        };
+        let method = SignInMethod::Credentials.name().to_owned();
+        self.check(credentials, region.clone(), &region, method, pins)
+            .await
+    }
 }
 
 /// AWS has no requirement kinds: a request that names one is refused.
@@ -209,15 +232,29 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
         first_failure.map_or_else(|| Ok(DetectResult::not_found()), Err)
     }
 
-    fn sign_in(
+    async fn sign_in(
         &self,
         params: SignInParams,
         _prompts: Prompts,
-    ) -> impl Future<Output = Result<SignInResult, PluginError>> + Send {
-        future::ready(Err(invalid_params(&format!(
-            "AWS has no sign-in method {:?}",
-            params.method.chars().take(64).collect::<String>()
-        ))))
+    ) -> Result<SignInResult, PluginError> {
+        let Some(method) = SignInMethod::parse(&params.method) else {
+            let known: Vec<&str> = SignInMethod::ALL.iter().map(|m| m.name()).collect();
+            return Err(invalid_params(&format!(
+                "AWS has no sign-in method {:?}: its methods are {}",
+                params.method.chars().take(64).collect::<String>(),
+                known.join(", ")
+            )));
+        };
+        let pins = Pins::parse(&params.pins).map_err(|error| invalid_params(&error))?;
+        no_requirements(&params.requirements)?;
+        let fields =
+            Fields::parse(method, &params.fields).map_err(|error| invalid_params(&error))?;
+        let ready = match method {
+            SignInMethod::Credentials => self.sign_in_with_keys(fields, &pins).await?,
+        };
+        let identity = ready.identity();
+        self.set(Session::Ready(Box::new(ready)));
+        Ok(SignInResult(identity))
     }
 
     fn targets(
