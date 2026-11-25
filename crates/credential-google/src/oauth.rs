@@ -558,11 +558,24 @@ async fn respond(stream: &mut TcpStream, page: Page) {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::error::Error;
     use std::path::PathBuf;
+    use std::time::Duration;
 
-    use super::{Page, callback_params, error_code, expand_home, parse_client};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::{sleep, timeout};
+
+    use super::{
+        Callbacks, MAX_CONNECTIONS, Page, callback_params, error_code, expand_home, parse_client,
+        read_client_file, read_head,
+    };
+
+    type TestResult = Result<(), Box<dyn Error>>;
 
     const HOST: &str = "127.0.0.1:4567";
+    /// Well under the listener's 10-second request window.
+    const WAIT: Duration = Duration::from_secs(5);
 
     fn head(lines: &[&str]) -> String {
         lines.join("\r\n")
@@ -648,6 +661,13 @@ mod tests {
                 Page::NotFound,
             ),
             (
+                vec![
+                    "GET http://evil.example:4567/oauth2callback HTTP/1.1",
+                    "Host: 127.0.0.1:4567",
+                ],
+                Page::NotFound,
+            ),
+            (
                 vec!["GET /oauth2callback", "Host: 127.0.0.1:4567"],
                 Page::BadRequest,
             ),
@@ -708,6 +728,7 @@ mod tests {
             expand_home("~/client.json", &env),
             Some(PathBuf::from("/home/a").join("client.json"))
         );
+        assert_eq!(expand_home("~", &env), Some(PathBuf::from("/home/a")));
         assert_eq!(
             expand_home("/etc/client.json", &HashMap::new()),
             Some(PathBuf::from("/etc/client.json"))
@@ -723,5 +744,90 @@ mod tests {
     fn only_an_oauth_error_code_is_echoed() {
         assert_eq!(error_code("invalid_scope"), "invalid_scope");
         assert_eq!(error_code("<script>"), "an unknown error");
+    }
+
+    /// A client JSON file may be 64 KiB, whitespace and all; one byte more
+    /// is refused.
+    #[tokio::test]
+    async fn a_client_file_may_be_as_large_as_64_kib() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("client.json");
+        let client = r#"{"installed":{"client_id":"id.apps","client_secret":"s"}}"#;
+        let mut text = client.to_owned();
+        text.push_str(&" ".repeat(64 * 1024 - client.len()));
+        std::fs::write(&path, &text)?;
+        let path_text = path.to_str().ok_or("the path is not UTF-8")?;
+        let read = read_client_file(path_text, "clientFile", &HashMap::new()).await;
+        assert_eq!(
+            read.map(|client| client.id).ok(),
+            Some("id.apps".to_owned())
+        );
+
+        text.push(' ');
+        std::fs::write(&path, &text)?;
+        let refused = read_client_file(path_text, "clientFile", &HashMap::new())
+            .await
+            .err()
+            .ok_or("a file over 64 KiB was read")?;
+        assert!(
+            refused.message().contains("is larger than 65536 bytes"),
+            "{}",
+            refused.message()
+        );
+        Ok(())
+    }
+
+    /// Both ends of one loopback connection: the browser's and the
+    /// listener's.
+    async fn connection() -> std::io::Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let browser = TcpStream::connect(listener.local_addr()?).await?;
+        let (served, _peer) = listener.accept().await?;
+        Ok((browser, served))
+    }
+
+    /// A request head may be 16 KiB, even when its end arrives in a later
+    /// read; one byte more is dropped without waiting for the end.
+    #[tokio::test]
+    async fn a_request_head_may_be_as_long_as_16_kib() -> TestResult {
+        let (mut browser, mut served) = connection().await?;
+        let reading = tokio::spawn(async move { read_head(&mut served).await });
+        browser.write_all(&vec![b'a'; 16 * 1024]).await?;
+        // Long enough for the listener to read all of it before the end.
+        sleep(Duration::from_millis(100)).await;
+        browser.write_all(b"\r\n\r\n").await?;
+        let head = timeout(WAIT, reading).await??;
+        assert_eq!(head.map(|head| head.len()), Some(16 * 1024));
+
+        let (mut browser, mut served) = connection().await?;
+        let reading = tokio::spawn(async move { read_head(&mut served).await });
+        browser.write_all(&vec![b'a'; 16 * 1024 + 1]).await?;
+        assert_eq!(timeout(WAIT, reading).await??, None);
+        Ok(())
+    }
+
+    /// With [`MAX_CONNECTIONS`] open, the next connection is closed at once
+    /// rather than held for its request.
+    #[tokio::test]
+    async fn a_connection_past_the_limit_is_closed_unanswered() -> TestResult {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let _callbacks = Callbacks::listen(listener, address.to_string());
+        let mut open = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            open.push(TcpStream::connect(address).await?);
+        }
+        let mut extra = TcpStream::connect(address).await?;
+        let read = timeout(WAIT, extra.read(&mut [0_u8; 1])).await?;
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+
+        // A connection within the limit is still served.
+        let first = open.first_mut().ok_or("no connection")?;
+        let request = format!("GET /favicon.ico HTTP/1.1\r\nHost: {address}\r\n\r\n");
+        first.write_all(request.as_bytes()).await?;
+        let mut answer = String::new();
+        timeout(WAIT, first.read_to_string(&mut answer)).await??;
+        assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+        Ok(())
     }
 }

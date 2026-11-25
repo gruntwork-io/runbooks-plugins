@@ -98,3 +98,16 @@ impl Crypto for NoCrypto {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Crypto, NoCrypto};
+
+    /// Without a random source no two values match, so no state or
+    /// verifier check can pass by default.
+    #[test]
+    fn no_crypto_matches_nothing() {
+        assert!(!NoCrypto.same(b"state", b"state"));
+        assert!(!NoCrypto.same(b"", b""));
+    }
+}
