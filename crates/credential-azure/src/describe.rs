@@ -60,14 +60,16 @@ fn field(name: &str, label: &str, required: bool, secret: bool) -> Field {
 }
 
 fn method(method: SignInMethod, unavailable: Option<&MethodUnavailable>) -> Method {
-    let (label, fields) = match method {
+    let (label, fields, one_of) = match method {
         SignInMethod::Cli => (
             "Azure CLI",
             vec![field(TENANT_FIELD, "Tenant ID", false, false)],
+            Vec::new(),
         ),
         SignInMethod::DeviceCode => (
             "Device Code",
             vec![field(TENANT_FIELD, "Tenant ID", false, false)],
+            Vec::new(),
         ),
         SignInMethod::ServicePrincipal => (
             "Service Principal",
@@ -82,13 +84,17 @@ fn method(method: SignInMethod, unavailable: Option<&MethodUnavailable>) -> Meth
                     false,
                 ),
             ],
+            vec![vec![
+                CLIENT_SECRET_FIELD.to_owned(),
+                CERTIFICATE_FIELD.to_owned(),
+            ]],
         ),
     };
     Method {
         fields,
         label: label.to_owned(),
         name: method.name().to_owned(),
-        one_of: Vec::new(),
+        one_of,
         unavailable: unavailable.cloned(),
     }
 }

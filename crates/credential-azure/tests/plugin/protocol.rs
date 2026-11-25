@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use runbooks_credential_azure::AzurePlugin;
 use runbooks_credential_azure::az::Interactive;
 use runbooks_credential_azure::host::Host;
-use runbooks_plugin_protocol::credential::ErrorKind;
+use runbooks_plugin_protocol::credential::{ConfigureResult, ErrorKind};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -150,6 +150,44 @@ async fn configure_offers_the_methods_levels_and_every_name() -> TestResult {
             "{name}"
         );
     }
+    Ok(())
+}
+
+/// The schema can't say a group names only its own method's fields.
+#[tokio::test]
+async fn a_service_principal_takes_one_of_a_secret_and_a_certificate() -> TestResult {
+    let state = tempfile::tempdir()?;
+    let mut app = App::start(AzurePlugin::new(
+        Host::new([], cfg!(windows)),
+        FakeAz::new(World::one_subscription()?),
+    ))?;
+    let result: ConfigureResult = serde_json::from_value(app.configure(state.path()).await?)?;
+    for method in &result.methods {
+        for name in method.one_of.iter().flatten() {
+            assert!(
+                method.fields.iter().any(|field| &field.name == name),
+                "{name} is not a field of {}",
+                method.name
+            );
+        }
+    }
+    let groups: Vec<(&str, &[Vec<String>])> = result
+        .methods
+        .iter()
+        .map(|method| (method.name.as_str(), method.one_of.as_slice()))
+        .collect();
+    let credential = [vec![
+        "clientSecret".to_owned(),
+        "clientCertificatePath".to_owned(),
+    ]];
+    assert_eq!(
+        groups,
+        [
+            ("cli", &[][..]),
+            ("device_code", &[][..]),
+            ("service_principal", &credential[..]),
+        ]
+    );
     Ok(())
 }
 
