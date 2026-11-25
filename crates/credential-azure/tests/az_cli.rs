@@ -6,16 +6,28 @@ mod scripted_az;
 
 use std::error::Error;
 use std::path::Path;
+use std::time::Duration;
 
 use runbooks_credential_azure::az::{Az, AzCli, AzDir, DeviceCode, Interactive};
 use runbooks_credential_azure::ids::{ObjectId, SubscriptionId, TenantId, TenantRef};
 use runbooks_plugin_protocol::credential::ErrorKind;
 use serde_json::json;
 use tokio::sync::oneshot;
+use tokio::time::timeout;
 
 use scripted_az::{DEVICE_LINE, ScriptedAz, token};
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+/// How long a test waits for one call. Each runs a script in a moment, so
+/// a call that never ends fails its test rather than hanging the run.
+const WAIT: Duration = Duration::from_secs(10);
+
+/// `call`, or an error once [`WAIT`] has passed. Calls are boxed: each
+/// holds a whole `az` run.
+async fn bounded<T>(call: impl Future<Output = T>) -> Result<T, Box<dyn Error>> {
+    Ok(timeout(WAIT, call).await?)
+}
 
 const CONTOSO: &str = "11111111-1111-4111-8111-111111111111";
 const PROD: &str = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -64,7 +76,10 @@ async fn without_az_every_call_is_tool_missing() -> TestResult {
             assert!(
                 error
                     .message()
-                    .contains("https://learn.microsoft.com/cli/azure/install-azure-cli"),
+                    .starts_with("The Azure CLI (az) isn't installed")
+                    && error
+                        .message()
+                        .contains("https://learn.microsoft.com/cli/azure/install-azure-cli"),
                 "{error}"
             );
         }
@@ -96,22 +111,26 @@ async fn each_call_runs_az_quietly_in_the_sign_ins_config_dir() -> TestResult {
     let az = AzCli::new(Some(scripted.program()), scripted.env());
     let (tenant, subscription, object_id) = ids()?;
 
-    let accounts = az.accounts(&dir).await?;
+    let accounts = bounded(Box::pin(az.accounts(&dir))).await??;
     assert_eq!(accounts.subscriptions.len(), 1);
-    let principal = az
-        .principal(&dir, Some(&TenantRef::Id(tenant.clone())))
-        .await?;
+    let principal = bounded(Box::pin(
+        az.principal(&dir, Some(&TenantRef::Id(tenant.clone()))),
+    ))
+    .await??;
     assert_eq!(principal.name, "ana@contoso.com");
     assert_eq!(principal.tenant_id, tenant);
-    let tenants = az.tenants(&dir).await?;
+    let tenants = bounded(Box::pin(az.tenants(&dir))).await??;
     assert_eq!(
         tenants.first().and_then(|t| t.name.as_deref()),
         Some("Contoso")
     );
-    az.set_subscription(&dir, &subscription).await?;
-    let roles = az
-        .role_names(&dir, &format!("/subscriptions/{PROD}"), &object_id)
-        .await?;
+    bounded(Box::pin(az.set_subscription(&dir, &subscription))).await??;
+    let roles = bounded(Box::pin(az.role_names(
+        &dir,
+        &format!("/subscriptions/{PROD}"),
+        &object_id,
+    )))
+    .await??;
     assert_eq!(roles.into_iter().collect::<Vec<_>>(), ["owner", "reader"]);
 
     let calls = scripted.calls()?;
@@ -152,15 +171,15 @@ async fn a_device_code_is_sent_as_soon_as_az_prints_it() -> TestResult {
     let az = AzCli::new(Some(scripted.program()), scripted.env());
     let (sender, receiver) = oneshot::channel();
     let tenant = TenantRef::parse("contoso.onmicrosoft.com").ok_or("tenant")?;
-    az.login(
+    bounded(Box::pin(az.login(
         &az_dir(config.path(), None),
         Interactive::DeviceCode,
         Some(&tenant),
         sender,
-    )
-    .await?;
+    )))
+    .await??;
     assert_eq!(
-        receiver.await?,
+        bounded(receiver).await??,
         DeviceCode {
             url: "https://microsoft.com/devicelogin".to_owned(),
             code: "SCRIPTED1".to_owned()
@@ -202,9 +221,8 @@ async fn a_failure_is_answered_with_its_error_line_and_kind() -> TestResult {
     let az = AzCli::new(Some(scripted.program()), scripted.env());
 
     let (sender, _receiver) = oneshot::channel();
-    let login = az
-        .login(&dir, Interactive::Browser, None, sender)
-        .await
+    let login = bounded(Box::pin(az.login(&dir, Interactive::Browser, None, sender)))
+        .await?
         .err()
         .ok_or("login succeeded")?;
     assert_eq!(login.kind(), ErrorKind::AccessDenied);
@@ -213,9 +231,8 @@ async fn a_failure_is_answered_with_its_error_line_and_kind() -> TestResult {
         "{login}"
     );
 
-    let accounts = az
-        .accounts(&dir)
-        .await
+    let accounts = bounded(Box::pin(az.accounts(&dir)))
+        .await?
         .err()
         .ok_or("account list succeeded")?;
     assert_eq!(accounts.kind(), ErrorKind::NotSignedIn);
@@ -235,12 +252,53 @@ async fn output_that_is_not_what_az_documents_is_never_quoted() -> TestResult {
     )?;
     let config = tempfile::tempdir()?;
     let az = AzCli::new(Some(scripted.program()), scripted.env());
-    let error = az
-        .principal(&az_dir(config.path(), None), None)
-        .await
+    let error = bounded(Box::pin(az.principal(&az_dir(config.path(), None), None)))
+        .await?
         .err()
         .ok_or("a malformed token was accepted")?;
     assert_eq!(error.kind(), ErrorKind::Internal);
     assert!(!format!("{error:?}").contains("SECRET"), "{error:?}");
+    Ok(())
+}
+
+/// A token for a named tenant that az can't get without a new sign-in says
+/// to sign in with that tenant, and keeps az's own reason and kind. Without
+/// a tenant, az's error is passed on as it is.
+#[tokio::test]
+async fn a_token_az_cant_get_for_a_tenant_says_to_sign_in_with_it() -> TestResult {
+    let scripted = ScriptedAz::new()?;
+    scripted.respond("account-get-access-token.fail", "")?;
+    scripted.respond(
+        "account-get-access-token.err",
+        "ERROR: AADSTS50076: Due to a configuration change made by your administrator, you must use multi-factor authentication.\n",
+    )?;
+    let config = tempfile::tempdir()?;
+    let dir = az_dir(config.path(), None);
+    let az = AzCli::new(Some(scripted.program()), scripted.env());
+    let (tenant, _, _) = ids()?;
+
+    let error = bounded(Box::pin(az.principal(&dir, Some(&TenantRef::Id(tenant)))))
+        .await?
+        .err()
+        .ok_or("a token was got")?;
+    assert_eq!(error.kind(), ErrorKind::AccessDenied);
+    assert!(
+        error.message().starts_with(&format!(
+            "az could not get a token for tenant {CONTOSO} without signing in again (az account get-access-token failed: AADSTS50076"
+        )),
+        "{error}"
+    );
+
+    let error = bounded(Box::pin(az.principal(&dir, None)))
+        .await?
+        .err()
+        .ok_or("a token was got")?;
+    assert_eq!(error.kind(), ErrorKind::AccessDenied);
+    assert!(
+        error
+            .message()
+            .starts_with("az account get-access-token failed: AADSTS50076"),
+        "{error}"
+    );
     Ok(())
 }

@@ -196,6 +196,36 @@ pub(crate) mod tests {
         );
     }
 
+    /// An app token is a service principal even when it carries a user
+    /// name.
+    #[test]
+    fn an_app_token_with_a_user_name_is_still_a_service_principal() {
+        let principal = principal_of_token(&token(&json!({
+            "oid": OID, "tid": TENANT, "idtyp": "app", "upn": "ana@contoso.com",
+            "appid": "11111111-2222-3333-4444-555555555555"
+        })));
+        assert_eq!(
+            principal.map(|p| (p.kind, p.name)),
+            Some((
+                PrincipalKind::ServicePrincipal,
+                "11111111-2222-3333-4444-555555555555".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn each_kind_is_named_as_azure_principal_type_wants() {
+        assert_eq!(
+            [
+                PrincipalKind::User,
+                PrincipalKind::Guest,
+                PrincipalKind::ServicePrincipal
+            ]
+            .map(PrincipalKind::as_str),
+            ["user", "guest", "servicePrincipal"]
+        );
+    }
+
     #[test]
     fn a_token_without_an_object_id_or_tenant_names_nobody() {
         for text in [

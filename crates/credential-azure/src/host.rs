@@ -127,15 +127,18 @@ impl Host {
     }
 }
 
-#[cfg(unix)]
+/// Whether a file may be run. Only Unix has an execute bit; elsewhere any
+/// file may.
 fn executable(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn executable(_meta: &std::fs::Metadata) -> bool {
-    true
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
 }
 
 #[cfg(test)]
@@ -216,6 +219,17 @@ mod tests {
         let host = host(&[("Path", &path), ("PATHEXT", &pathext)], true);
         assert_eq!(host.find_program("az"), Some(cli.join("az.cmd")));
         Ok(())
+    }
+
+    /// Off Windows a variable's name must match exactly.
+    #[test]
+    fn a_variables_name_ignores_case_only_on_windows() {
+        let value = OsString::from("/usr/bin");
+        assert_eq!(host(&[("path", &value)], false).var("PATH"), None);
+        assert_eq!(
+            host(&[("path", &value)], true).var("PATH"),
+            Some(value.as_os_str())
+        );
     }
 
     #[test]

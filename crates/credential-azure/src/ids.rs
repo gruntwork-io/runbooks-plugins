@@ -133,6 +133,18 @@ mod tests {
             TenantRef::parse("Contoso.onmicrosoft.com"),
             Some(TenantRef::Domain("contoso.onmicrosoft.com".to_owned()))
         );
+        for (text, shown) in [
+            (
+                "72F988BF-86F1-41AF-91AB-2D7CD011DB47",
+                "72f988bf-86f1-41af-91ab-2d7cd011db47",
+            ),
+            ("Contoso.onmicrosoft.com", "contoso.onmicrosoft.com"),
+        ] {
+            assert_eq!(
+                TenantRef::parse(text).map(|tenant| tenant.to_string()),
+                Some(shown.to_owned())
+            );
+        }
         for bad in [
             "contoso",
             "-contoso.com",

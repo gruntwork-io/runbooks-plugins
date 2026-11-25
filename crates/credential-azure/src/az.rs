@@ -647,7 +647,10 @@ mod tests {
     use runbooks_plugin_protocol::credential::ErrorKind;
     use serde_json::json;
 
-    use super::{DeviceCode, RawAccount, TenantId, accounts_of, failure, parse_device_code};
+    use super::{
+        DeviceCode, RawAccount, Tail, TenantId, accounts_of, failure, parse_device_code,
+        read_capped, read_stderr,
+    };
 
     #[test]
     fn reads_msals_device_code_line() {
@@ -664,6 +667,20 @@ mod tests {
             parse_device_code("open https://example.com/ and enter the code abc"),
             None
         );
+        let code = |line: &str| parse_device_code(line).map(|device| device.code);
+        assert_eq!(
+            code("open https://example.com/ and enter the code ABCD-1234"),
+            Some("ABCD-1234".to_owned())
+        );
+        for short_or_lower in ["ABC12", "abcd1234"] {
+            assert_eq!(
+                code(&format!(
+                    "open https://example.com/ and enter the code {short_or_lower}"
+                )),
+                None,
+                "{short_or_lower}"
+            );
+        }
     }
 
     fn stderr(lines: &[&str]) -> Vec<String> {
@@ -728,6 +745,15 @@ mod tests {
         assert_eq!(error.message(), "az login failed: Something broke.");
         let error = failure("az login", &stderr(&["WARNING: only a warning"]));
         assert_eq!(error.message(), "az login failed: az exited with an error.");
+        // Without an ERROR: line, the last line that is no Python warning.
+        let error = failure(
+            "az login",
+            &stderr(&[
+                "The token is not valid",
+                "/opt/az/lib/python3.12/site-packages/x.py:1: UserWarning: deprecated",
+            ]),
+        );
+        assert_eq!(error.message(), "az login failed: The token is not valid.");
     }
 
     #[test]
@@ -739,6 +765,7 @@ mod tests {
             {"id": "11111111-1111-1111-1111-111111111111", "name": "Prod", "tenantId": tenant, "state": "Enabled"},
             {"id": "22222222-2222-2222-2222-222222222222", "name": "Old", "tenantId": tenant, "state": "Disabled"},
             {"id": guest, "name": "N/A(tenant level account)", "tenantId": guest, "state": "Enabled"},
+            {"id": guest, "name": "Fabrikam", "tenantId": guest, "state": "Enabled"},
             {"id": "33333333-3333-3333-3333-333333333333", "tenantId": "not-a-guid"},
         ]))?;
         let accounts = accounts_of(raw);
@@ -751,5 +778,64 @@ mod tests {
         let tenants: Vec<&str> = accounts.tenants.iter().map(TenantId::as_str).collect();
         assert_eq!(tenants, [tenant, guest]);
         Ok(())
+    }
+
+    /// `az`'s standard output may be 16 MiB. One byte more and none of it is
+    /// kept, though all of it is read.
+    #[tokio::test]
+    async fn standard_output_may_be_16_mib() -> std::io::Result<()> {
+        let most = vec![b'a'; 16 * 1024 * 1024];
+        let read = read_capped(Some(most.as_slice())).await?;
+        assert_eq!(read.map(|out| out.len()), Some(16 * 1024 * 1024));
+        let over = vec![b'a'; 16 * 1024 * 1024 + 1];
+        let read = read_capped(Some(over.as_slice())).await?;
+        assert_eq!(read.map(|out| out.len()), None);
+        assert_eq!(read_capped(None::<&[u8]>).await?, Some(Vec::new()));
+        Ok(())
+    }
+
+    /// Each line of standard error reaches `on_line` as it is read, without
+    /// its `\r`, a last line without a newline too. A line is cut at 64 KiB.
+    #[tokio::test]
+    async fn standard_error_is_read_line_by_line_and_a_line_is_cut_at_64_kib() -> std::io::Result<()>
+    {
+        let mut input = b"WARNING: one\r\ntwo\n".to_vec();
+        input.extend(vec![b'x'; 64 * 1024 + 10]);
+        input.extend(b"\nlast");
+        let mut seen = Vec::new();
+        let kept = read_stderr(Some(input.as_slice()), &mut |line: &str| {
+            seen.push(line.len());
+        })
+        .await?;
+        assert_eq!(seen, [12, 3, 64 * 1024, 4]);
+        assert_eq!(kept, ["last"], "only the last line fits beside the cut one");
+        Ok(())
+    }
+
+    fn push(tail: &mut Tail, byte: u8, len: usize) {
+        tail.push(&vec![byte; len], &mut |_line: &str| {});
+    }
+
+    /// The first byte of each line the tail keeps.
+    fn kept(tail: &Tail) -> String {
+        tail.lines
+            .iter()
+            .filter_map(|line| line.chars().next())
+            .collect()
+    }
+
+    /// The tail keeps the last lines that fit in 64 KiB, dropping the
+    /// oldest first.
+    #[test]
+    fn the_tail_keeps_the_last_64_kib_of_lines() {
+        let half = 32 * 1024;
+        let mut tail = Tail::default();
+        push(&mut tail, b'a', half);
+        push(&mut tail, b'b', half);
+        assert_eq!(kept(&tail), "ab", "exactly 64 KiB fits");
+        push(&mut tail, b'c', 1);
+        assert_eq!(kept(&tail), "bc");
+        push(&mut tail, b'd', half);
+        assert_eq!(kept(&tail), "cd");
     }
 }
