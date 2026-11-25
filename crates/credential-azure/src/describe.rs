@@ -49,6 +49,7 @@ pub(crate) const NAMES: [&str; 19] = [
 
 fn field(name: &str, label: &str, required: bool, secret: bool) -> Field {
     Field {
+        choices: Vec::new(),
         label: label.to_owned(),
         name: name.to_owned(),
         required,

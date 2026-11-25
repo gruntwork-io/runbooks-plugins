@@ -149,6 +149,7 @@ pub(crate) fn describe() -> ConfigureResult {
                     .fields()
                     .iter()
                     .map(|field| Field {
+                        choices: Vec::new(),
                         label: field.label.to_owned(),
                         name: field.name.to_owned(),
                         required: field.required,

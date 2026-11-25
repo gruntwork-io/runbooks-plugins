@@ -371,3 +371,34 @@ fn a_warning_without_a_message_is_refused() -> TestResult {
         &identity_with_warnings(json!([{"text": "no message"}]))?,
     )
 }
+
+// Runbooks d4c7da5f (draft PR #547): a sign-in field can list its choices.
+
+fn field_with_choices(choices: &Value) -> Value {
+    json!({"name":"profile","label":"Profile","required":true,"secret":false,"choices":choices})
+}
+
+#[test]
+fn a_field_lists_up_to_a_thousand_choices() -> TestResult {
+    let def = "credential.schema.json#/$defs/field";
+    let choice = json!({"value": "dev", "label": "dev (us-east-1)"});
+    let field = field_with_choices(&items(&choice, 1000));
+    round_trip::<credential::Field>(def, &field)?;
+    let typed: credential::Field = serde_json::from_value(field)?;
+    assert_eq!(
+        typed
+            .choices
+            .first()
+            .map(|c| (c.value.as_str(), c.label.as_str())),
+        Some(("dev", "dev (us-east-1)"))
+    );
+    assert_schema_refuses(def, &field_with_choices(&items(&choice, 1001)))
+}
+
+#[test]
+fn a_choice_without_a_label_is_refused() -> TestResult {
+    assert_refused::<credential::Field>(
+        "credential.schema.json#/$defs/field",
+        &field_with_choices(&json!([{"value": "dev"}])),
+    )
+}

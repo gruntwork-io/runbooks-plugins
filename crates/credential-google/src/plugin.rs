@@ -485,6 +485,7 @@ async fn read_document(
 
 fn methods() -> Vec<Method> {
     let field = |name: &str, label: &str, secret: bool| Field {
+        choices: Vec::new(),
         label: label.to_owned(),
         name: name.to_owned(),
         required: false,
