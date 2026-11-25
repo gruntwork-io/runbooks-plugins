@@ -11,8 +11,16 @@ publish.workspace = true
 [dependencies]
 aws-sdk-iam.workspace = true
 aws-sdk-sts.workspace = true
+runbooks-plugin-protocol.workspace = true
+runbooks-plugin-transport.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+jsonschema.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros"] }
 
 [lints]
 workspace = true
