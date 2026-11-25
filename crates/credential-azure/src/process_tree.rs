@@ -17,6 +17,14 @@ use std::time::Duration;
 
 use tokio::process::{Child, Command};
 
+/// How long [`ProcessTree::stop`] gives a process group between `SIGTERM`
+/// and `SIGKILL`: as long as the Runbooks app gives a script.
+pub const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// How long [`ProcessTree::stop`] waits to reap the child once it has been
+/// killed.
+const REAP_WAIT: Duration = Duration::from_secs(5);
+
 /// How often a `kill` or `taskkill` run is checked for its exit, and how
 /// many times: 5 seconds in all.
 const KILLER_POLL: Duration = Duration::from_millis(5);
@@ -37,12 +45,19 @@ pub enum Killer {
     ChildOnly,
 }
 
+#[derive(Clone, Copy)]
+enum Signal {
+    Term,
+    Kill,
+}
+
 /// A child process and every process it starts, ended together when the
-/// tree is dropped.
+/// tree is stopped or dropped.
 ///
-/// A tree that is dropped is killed at once. A cancelled call is dropped,
-/// and the app cancels a sign-in by closing the plugin's input, after which
-/// the plugin exits: a signal left for later would never be sent.
+/// A tree that is dropped is killed at once, with no grace. A cancelled
+/// call is dropped, and the app cancels a sign-in by closing the plugin's
+/// input, after which the plugin exits: a `SIGKILL` left for later would
+/// never be sent.
 #[derive(Debug)]
 pub struct ProcessTree {
     child: Child,
@@ -72,13 +87,34 @@ impl ProcessTree {
         &mut self.child
     }
 
+    /// Ends the child and what it started, and reaps the child. A process
+    /// group gets `SIGTERM`, `grace` to end, then `SIGKILL`; `taskkill`
+    /// ends a tree at once, since a console program on Windows has no
+    /// `SIGTERM`.
+    pub async fn stop(&mut self, grace: Duration) {
+        let Some(pid) = self.child.id() else {
+            return;
+        };
+        if self.killer == Killer::ProcessGroup {
+            signal_group(pid, Signal::Term);
+            // The child is not reaped while it may end: its pid keeps the
+            // group's id from being reused before `SIGKILL`.
+            tokio::time::sleep(grace).await;
+        }
+        self.kill(pid);
+        match tokio::time::timeout(REAP_WAIT, self.child.wait()).await {
+            Ok(Ok(_status)) => {}
+            Ok(Err(error)) => crate::log(format_args!("reaping a stopped az: {}", error.kind())),
+            Err(_elapsed) => crate::log(format_args!(
+                "a stopped az did not exit within {} seconds",
+                REAP_WAIT.as_secs()
+            )),
+        }
+    }
+
     fn kill(&mut self, pid: u32) {
         match &self.killer {
-            Killer::ProcessGroup => {
-                if let Err(failed) = run_killer(Path::new(KILL), &kill_args(pid)) {
-                    crate::log(format_args!("ending what az started: kill {failed}"));
-                }
-            }
+            Killer::ProcessGroup => signal_group(pid, Signal::Kill),
             Killer::Taskkill(program) => {
                 if let Err(failed) = run_killer(program, &taskkill_args(pid)) {
                     crate::log(format_args!("ending what az started: taskkill {failed}"));
@@ -101,9 +137,19 @@ impl Drop for ProcessTree {
     }
 }
 
-/// `kill`'s arguments to kill process group `pid`.
-fn kill_args(pid: u32) -> [String; 3] {
-    ["-KILL".to_owned(), "--".to_owned(), format!("-{pid}")]
+fn signal_group(pid: u32, signal: Signal) {
+    if let Err(failed) = run_killer(Path::new(KILL), &kill_args(pid, signal)) {
+        crate::log(format_args!("ending what az started: kill {failed}"));
+    }
+}
+
+/// `kill`'s arguments to signal process group `pid`.
+fn kill_args(pid: u32, signal: Signal) -> [String; 3] {
+    let name = match signal {
+        Signal::Term => "-TERM",
+        Signal::Kill => "-KILL",
+    };
+    [name.to_owned(), "--".to_owned(), format!("-{pid}")]
 }
 
 /// `taskkill`'s arguments to end process `pid` and its descendants.
@@ -166,11 +212,12 @@ fn run_killer(program: &Path, args: &[String]) -> Result<(), KillerFailed> {
 mod tests {
     use std::io;
 
-    use super::{KillerFailed, kill_args, run_killer, taskkill_args};
+    use super::{KillerFailed, Signal, kill_args, run_killer, taskkill_args};
 
     #[test]
     fn kill_signals_the_group_and_taskkill_ends_the_tree() {
-        assert_eq!(kill_args(4242), ["-KILL", "--", "-4242"]);
+        assert_eq!(kill_args(4242, Signal::Term), ["-TERM", "--", "-4242"]);
+        assert_eq!(kill_args(4242, Signal::Kill), ["-KILL", "--", "-4242"]);
         assert_eq!(taskkill_args(4242), ["/T", "/F", "/PID", "4242"]);
     }
 

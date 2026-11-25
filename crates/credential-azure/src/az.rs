@@ -20,7 +20,7 @@ use tokio::sync::oneshot;
 
 use crate::claims::{Principal, principal_of_token};
 use crate::ids::{ObjectId, SubscriptionId, TenantId, TenantRef};
-use crate::process_tree::{Killer, ProcessTree};
+use crate::process_tree::{Killer, ProcessTree, STOP_GRACE};
 use crate::service_principal::{Credential, Secret, ServicePrincipal};
 
 /// Where the error for a missing `az` sends the person to install it.
@@ -192,7 +192,7 @@ impl fmt::Debug for AzCli {
 impl AzCli {
     /// Runs `program` with exactly `env`, plus the sign-in's config
     /// directory and settings that keep `az` quiet. `killer` ends a call's
-    /// `az`, and what it started, when the call is dropped.
+    /// `az`, and what it started, when the call times out or is dropped.
     #[must_use]
     pub const fn new(
         program: Option<PathBuf>,
@@ -268,6 +268,7 @@ impl AzCli {
         })
         .await;
         let Ok((stdout, stderr, status)) = finished else {
+            tree.stop(STOP_GRACE).await;
             return Err(PluginError::new(
                 ErrorKind::TimedOut,
                 format!(
