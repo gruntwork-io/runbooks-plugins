@@ -106,18 +106,21 @@ impl HangingAz {
         env
     }
 
-    /// The pids the script recorded, once it has started its child.
+    /// The pids the script recorded, once it has started its child and one
+    /// of them is seen running, so `still_running` can see a process.
     pub(crate) async fn started(&self) -> Result<Vec<u32>, Box<dyn Error>> {
         tokio::time::timeout(START, self.recorded_soon())
             .await
             .map_err(|_elapsed| {
-                format!("the script did not start its child within {START:?}").into()
+                format!("the script did not start a child seen running within {START:?}").into()
             })
     }
 
     async fn recorded_soon(&self) -> Vec<u32> {
         loop {
-            if let Some(pids) = self.recorded() {
+            if let Some(pids) = self.recorded()
+                && pids.iter().any(|pid| alive(*pid))
+            {
                 return pids;
             }
             tokio::time::sleep(POLL).await;
@@ -187,10 +190,16 @@ fn system32(program: &str) -> PathBuf {
 #[cfg(windows)]
 fn alive(pid: u32) -> bool {
     Command::new(system32("tasklist.exe"))
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .stderr(Stdio::null())
         .output()
-        .is_ok_and(|listed| String::from_utf8_lossy(&listed.stdout).contains(&format!("\"{pid}\"")))
+        .is_ok_and(|listed| {
+            let pid = pid.to_string();
+            listed
+                .stdout
+                .split(u8::is_ascii_whitespace)
+                .any(|word| word == pid.as_bytes())
+        })
 }
 
 #[cfg(windows)]
