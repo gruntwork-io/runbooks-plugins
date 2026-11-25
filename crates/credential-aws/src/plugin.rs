@@ -1,3 +1,4 @@
+use std::future::{self, Future};
 use std::sync::{Mutex, PoisonError};
 
 use runbooks_plugin_protocol::credential::{
@@ -22,9 +23,11 @@ use crate::region::Region;
 
 /// The wall clock, for expiry. Tests pass a fixed one.
 pub trait Clock: Send + Sync + 'static {
+    /// The current time.
     fn now(&self) -> OffsetDateTime;
 }
 
+/// The system's clock, in UTC.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
 
@@ -36,6 +39,7 @@ impl Clock for SystemClock {
 
 /// The AWS credential plugin for one block. It holds at most one credential:
 /// the last one `detect` found or a sign-in produced.
+#[derive(Debug)]
 pub struct AwsPlugin<A, C> {
     aws: A,
     clock: C,
@@ -43,13 +47,14 @@ pub struct AwsPlugin<A, C> {
     session: Mutex<Session>,
 }
 
+#[derive(Debug)]
 enum Session {
     SignedOut,
     Ready(Box<Ready>),
 }
 
 /// A credential AWS accepted, with what a run gets besides the keys.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Ready {
     credentials: AwsCredentials,
     /// The run's `AWS_REGION`.
@@ -68,7 +73,7 @@ impl Ready {
 
 impl<A: Aws, C: Clock> AwsPlugin<A, C> {
     /// `env` is the environment the `env` detection source reads.
-    pub fn new(aws: A, clock: C, env: Environment) -> Self {
+    pub const fn new(aws: A, clock: C, env: Environment) -> Self {
         Self {
             aws,
             clock,
@@ -115,6 +120,30 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
             method,
         })
     }
+
+    /// What `env` answers.
+    fn env_now(&self) -> Result<EnvResult, PluginError> {
+        let ready = self.ready().ok_or_else(|| {
+            PluginError::new(
+                ErrorKind::NotSignedIn,
+                "not signed in to AWS: sign in first",
+            )
+        })?;
+        let expires_at = ready.credentials.expires_at;
+        if let Some(expired) = expires_at.filter(|at| *at <= self.clock.now()) {
+            let at = expired
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| expired.to_string());
+            return Err(PluginError::new(
+                ErrorKind::Expired,
+                format!("the AWS credentials expired at {at}: sign in again"),
+            ));
+        }
+        Ok(EnvResult {
+            expires_at: expires_at.map(Into::into),
+            values: env_values(&ready),
+        })
+    }
 }
 
 /// AWS has no requirement kinds: a request that names one is refused.
@@ -123,14 +152,17 @@ fn no_requirements(requirements: &[Requirement]) -> Result<(), PluginError> {
         Ok(())
     } else {
         Err(invalid_params(
-            "AWS sign-in takes no requirements: remove them from the request",
+            &"AWS sign-in takes no requirements: remove them from the request",
         ))
     }
 }
 
 impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
-    async fn configure(&self, _params: ConfigureParams) -> Result<ConfigureResult, PluginError> {
-        Ok(methods::describe())
+    fn configure(
+        &self,
+        _params: ConfigureParams,
+    ) -> impl Future<Output = Result<ConfigureResult, PluginError>> + Send {
+        future::ready(Ok(methods::describe()))
     }
 
     /// Tries each source in order and keeps the first credential AWS accepts
@@ -138,9 +170,9 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
     /// refused or the pins ruled out answers with that error, so the block
     /// can say why; with no credential in any source, nothing was found.
     async fn detect(&self, params: DetectParams) -> Result<DetectResult, PluginError> {
-        let pins = Pins::parse(&params.pins).map_err(invalid_params)?;
+        let pins = Pins::parse(&params.pins).map_err(|error| invalid_params(&error))?;
         no_requirements(&params.requirements)?;
-        let sources = parse_sources(params.sources).map_err(invalid_params)?;
+        let sources = parse_sources(params.sources).map_err(|error| invalid_params(&error))?;
 
         let mut first_failure = None;
         for source in &sources {
@@ -148,7 +180,7 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
                 Ok(Some(found)) => found,
                 Ok(None) => continue,
                 Err(unreadable) => {
-                    first_failure.get_or_insert(invalid_params(unreadable));
+                    first_failure.get_or_insert_with(|| invalid_params(&unreadable));
                     continue;
                 }
             };
@@ -174,68 +206,52 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
                 }
             }
         }
-        match first_failure {
-            Some(error) => Err(error),
-            None => Ok(DetectResult::not_found()),
-        }
+        first_failure.map_or_else(|| Ok(DetectResult::not_found()), Err)
     }
 
-    async fn sign_in(
+    fn sign_in(
         &self,
         params: SignInParams,
         _prompts: Prompts,
-    ) -> Result<SignInResult, PluginError> {
-        Err(invalid_params(format!(
+    ) -> impl Future<Output = Result<SignInResult, PluginError>> + Send {
+        future::ready(Err(invalid_params(&format!(
             "AWS has no sign-in method {:?}",
             params.method.chars().take(64).collect::<String>()
-        )))
+        ))))
     }
 
-    async fn targets(&self, params: TargetsParams) -> Result<TargetsResult, PluginError> {
-        Err(no_targets(&params.level))
+    fn targets(
+        &self,
+        params: TargetsParams,
+    ) -> impl Future<Output = Result<TargetsResult, PluginError>> + Send {
+        future::ready(Err(no_targets(&params.level)))
     }
 
-    async fn select(&self, params: SelectParams) -> Result<SelectResult, PluginError> {
+    fn select(
+        &self,
+        params: SelectParams,
+    ) -> impl Future<Output = Result<SelectResult, PluginError>> + Send {
         let level = params.targets.keys().next().map_or(ACCOUNT, String::as_str);
-        Err(no_targets(level))
+        future::ready(Err(no_targets(level)))
     }
 
-    async fn env(&self) -> Result<EnvResult, PluginError> {
-        let ready = self.ready().ok_or_else(|| {
-            PluginError::new(
-                ErrorKind::NotSignedIn,
-                "not signed in to AWS: sign in first",
-            )
-        })?;
-        let expires_at = ready.credentials.expires_at;
-        if let Some(expired) = expires_at.filter(|at| *at <= self.clock.now()) {
-            let at = expired
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| expired.to_string());
-            return Err(PluginError::new(
-                ErrorKind::Expired,
-                format!("the AWS credentials expired at {at}: sign in again"),
-            ));
-        }
-        Ok(EnvResult {
-            expires_at: expires_at.map(Into::into),
-            values: env_values(&ready),
-        })
+    fn env(&self) -> impl Future<Output = Result<EnvResult, PluginError>> + Send {
+        future::ready(self.env_now())
     }
 
-    async fn sign_out(&self) -> Result<SignOutResult, PluginError> {
+    fn sign_out(&self) -> impl Future<Output = Result<SignOutResult, PluginError>> + Send {
         self.set(Session::SignedOut);
-        Ok(SignOutResult(Map::new()))
+        future::ready(Ok(SignOutResult(Map::new())))
     }
 }
 
 fn no_targets(level: &str) -> PluginError {
     if level == ACCOUNT || level == ROLE {
-        invalid_params(format!(
+        invalid_params(&format!(
             "AWS has no {level} to choose for these credentials: their account and role are fixed"
         ))
     } else {
-        invalid_params(format!(
+        invalid_params(&format!(
             "AWS has no level {:?}: its levels are {ACCOUNT} and {ROLE}",
             level.chars().take(64).collect::<String>()
         ))
@@ -261,10 +277,10 @@ fn env_values(ready: &Ready) -> Vec<EnvValue> {
             true,
             both(),
         ),
-        match &credentials.session_token {
-            Some(token) => value(AWS_SESSION_TOKEN, token.expose(), true, both()),
-            None => value(AWS_SESSION_TOKEN, "", true, vec![EnvValueToItem::Output]),
-        },
+        credentials.session_token.as_ref().map_or_else(
+            || value(AWS_SESSION_TOKEN, "", true, vec![EnvValueToItem::Output]),
+            |token| value(AWS_SESSION_TOKEN, token.expose(), true, both()),
+        ),
         value(AWS_REGION, ready.region.as_str(), false, both()),
     ]
 }

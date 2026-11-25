@@ -13,10 +13,10 @@ use crate::aws::AwsCredentials;
 use crate::region::{InvalidRegion, Region};
 use crate::secret::Secret;
 
-pub const AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
-pub const AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
-pub const AWS_SESSION_TOKEN: &str = "AWS_SESSION_TOKEN";
-pub const AWS_REGION: &str = "AWS_REGION";
+pub(crate) const AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
+pub(crate) const AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
+pub(crate) const AWS_SESSION_TOKEN: &str = "AWS_SESSION_TOKEN";
+pub(crate) const AWS_REGION: &str = "AWS_REGION";
 const AWS_DEFAULT_REGION: &str = "AWS_DEFAULT_REGION";
 /// When temporary keys expire, as the AWS SDKs read it.
 const AWS_CREDENTIAL_EXPIRATION: &str = "AWS_CREDENTIAL_EXPIRATION";
@@ -27,12 +27,15 @@ const AWS_CREDENTIAL_EXPIRATION: &str = "AWS_CREDENTIAL_EXPIRATION";
 pub struct Environment(HashMap<String, String>);
 
 impl Environment {
-    pub fn new(vars: HashMap<String, String>) -> Self {
+    /// An environment of `vars`.
+    #[must_use]
+    pub const fn new(vars: HashMap<String, String>) -> Self {
         Self(vars)
     }
 
     /// The variable's value. An empty one counts as unset, as it does for the
     /// AWS CLI.
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
         non_empty(self.0.get(name))
     }
@@ -52,7 +55,7 @@ fn non_empty(value: Option<&String>) -> Option<&str> {
 /// the rest. Upper-case letters, digits and underscores, starting with a
 /// letter and ending with an underscore.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EnvPrefix(String);
+pub(crate) struct EnvPrefix(String);
 
 impl EnvPrefix {
     fn parse(value: &str) -> Option<Self> {
@@ -67,7 +70,7 @@ impl EnvPrefix {
 
 /// A detection source the plugin can read.
 #[derive(Clone)]
-pub enum DetectSource {
+pub(crate) enum DetectSource {
     Env(Option<EnvPrefix>),
     Values(HashMap<String, String>),
 }
@@ -84,7 +87,7 @@ impl fmt::Debug for DetectSource {
 /// A source the params name wrongly. Each displays only what the author
 /// wrote, never a value.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum InvalidSource {
+pub(crate) enum InvalidSource {
     #[error(
         "the env source's prefix {0:?} is invalid: use upper-case letters, digits and underscores, starting with a letter and ending with an underscore, like PROD_"
     )]
@@ -96,7 +99,7 @@ pub enum InvalidSource {
 /// A source's credential failed to read: its region is not a region name.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{variable}: {source}")]
-pub struct UnreadableSource {
+pub(crate) struct UnreadableSource {
     pub variable: String,
     #[source]
     pub source: InvalidRegion,
@@ -104,7 +107,7 @@ pub struct UnreadableSource {
 
 /// Where a credential was found, as `detectResult.source` names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Origin {
+pub(crate) enum Origin {
     Env(Option<EnvPrefix>),
     Values,
 }
@@ -121,7 +124,7 @@ impl fmt::Display for Origin {
 
 /// A credential read from a source, not yet checked with AWS.
 #[derive(Clone, Debug)]
-pub struct Found {
+pub(crate) struct Found {
     pub origin: Origin,
     pub credentials: AwsCredentials,
     /// The region the source names, if it names one.
@@ -133,7 +136,7 @@ pub struct Found {
 /// # Errors
 ///
 /// [`InvalidSource`] for the first source the plugin cannot read.
-pub fn parse_sources(sources: Vec<Source>) -> Result<Vec<DetectSource>, InvalidSource> {
+pub(crate) fn parse_sources(sources: Vec<Source>) -> Result<Vec<DetectSource>, InvalidSource> {
     sources
         .into_iter()
         .map(|source| match source {
@@ -158,7 +161,7 @@ impl DetectSource {
     /// # Errors
     ///
     /// [`UnreadableSource`] when it holds keys and a region that is not one.
-    pub fn read(&self, env: &Environment) -> Result<Option<Found>, UnreadableSource> {
+    pub(crate) fn read(&self, env: &Environment) -> Result<Option<Found>, UnreadableSource> {
         match self {
             Self::Env(prefix) => {
                 let p = prefix.as_ref().map_or("", |EnvPrefix(p)| p.as_str());

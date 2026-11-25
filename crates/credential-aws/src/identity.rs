@@ -9,8 +9,8 @@ use time::OffsetDateTime;
 use crate::aws::CallerIdentity;
 
 /// The target levels, in the order they are chosen.
-pub const ACCOUNT: &str = "account";
-pub const ROLE: &str = "role";
+pub(crate) const ACCOUNT: &str = "account";
+pub(crate) const ROLE: &str = "role";
 
 /// A 12-digit AWS account id.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -53,14 +53,14 @@ impl fmt::Display for AccountId {
 
 /// What a block pins: `ssoAccountId` and `ssoRoleName`, keyed by level.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Pins {
+pub(crate) struct Pins {
     pub account: Option<AccountId>,
     pub role: Option<String>,
 }
 
 /// A pin the protocol params name wrongly.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum InvalidPin {
+pub(crate) enum InvalidPin {
     #[error("pins has level {level:?}, but AWS's levels are account and role")]
     UnknownLevel { level: String },
     #[error("the account pin is invalid: {0}")]
@@ -71,7 +71,7 @@ pub enum InvalidPin {
 
 /// A credential that is not the one the block pins.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Mismatch {
+pub(crate) enum Mismatch {
     #[error("these credentials are for account {found}, but this block needs account {pinned}")]
     Account { pinned: AccountId, found: AccountId },
     #[error("these credentials are for {found}, but this block needs role {pinned}")]
@@ -82,7 +82,7 @@ impl Pins {
     /// # Errors
     ///
     /// [`InvalidPin`] for a level AWS does not have, or a value that cannot be one.
-    pub fn parse(pins: &WirePins) -> Result<Self, InvalidPin> {
+    pub(crate) fn parse(pins: &WirePins) -> Result<Self, InvalidPin> {
         let mut parsed = Self::default();
         for (level, value) in pins.iter() {
             match level.as_str() {
@@ -105,7 +105,7 @@ impl Pins {
     /// # Errors
     ///
     /// [`Mismatch`] naming the first pin `principal` does not match.
-    pub fn check(&self, principal: &Principal) -> Result<(), Mismatch> {
+    pub(crate) fn check(&self, principal: &Principal) -> Result<(), Mismatch> {
         if let Some(pinned) = &self.account
             && *pinned != principal.account
         {
@@ -119,10 +119,10 @@ impl Pins {
         {
             return Err(Mismatch::Role {
                 pinned: pinned.clone(),
-                found: match &principal.role {
-                    Some(role) => format!("role {role}"),
-                    None => principal.arn.clone(),
-                },
+                found: principal
+                    .role
+                    .as_ref()
+                    .map_or_else(|| principal.arn.clone(), |role| format!("role {role}")),
             });
         }
         Ok(())
@@ -131,7 +131,7 @@ impl Pins {
 
 /// Who a set of keys belongs to, read from the ARN STS returned.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Principal {
+pub(crate) struct Principal {
     pub arn: String,
     pub account: AccountId,
     /// The account's name for the card: an SSO account name or IAM alias.
@@ -146,7 +146,7 @@ pub struct Principal {
 const SSO_ROLE_PREFIX: &str = "AWSReservedSSO_";
 
 impl Principal {
-    pub fn from_caller(caller: CallerIdentity) -> Self {
+    pub(crate) fn from_caller(caller: CallerIdentity) -> Self {
         // arn:partition:service:region:account:resource. An assumed role's
         // resource is assumed-role/<role>/<session>.
         let role = caller
@@ -170,7 +170,7 @@ impl Principal {
     }
 
     /// The identity card: the ARN, the account, and the role of a role session.
-    pub fn identity(&self, method: &str, expires_at: Option<OffsetDateTime>) -> Identity {
+    pub(crate) fn identity(&self, method: &str, expires_at: Option<OffsetDateTime>) -> Identity {
         let mut targets = HashMap::from([(
             ACCOUNT.to_owned(),
             Target {

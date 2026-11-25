@@ -9,7 +9,7 @@ use crate::detect::{AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY, AWS_SE
 use crate::identity::{ACCOUNT, ROLE};
 
 /// Every name a run may get, as env and as outputs.
-pub const NAMES: [&str; 4] = [
+pub(crate) const NAMES: [&str; 4] = [
     AWS_ACCESS_KEY_ID,
     AWS_SECRET_ACCESS_KEY,
     AWS_SESSION_TOKEN,
@@ -17,7 +17,7 @@ pub const NAMES: [&str; 4] = [
 ];
 
 /// The answer to `configure`.
-pub fn describe() -> ConfigureResult {
+pub(crate) fn describe() -> ConfigureResult {
     let level = |name: &str, label: &str| Level {
         chosen: LevelChosen::AfterSignIn,
         label: label.to_owned(),

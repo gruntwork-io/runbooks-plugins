@@ -2,6 +2,8 @@
 //! credential protocol on standard input and output.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::io::{self, Write as _};
 use std::process::ExitCode;
 
 use runbooks_credential_aws::{AwsPlugin, Environment, SdkAws, SystemClock};
@@ -20,10 +22,7 @@ fn main() -> ExitCode {
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("runbooks-credential-aws: starting the async runtime: {error}");
-            return ExitCode::FAILURE;
-        }
+        Err(error) => return fail(format_args!("starting the async runtime: {error}")),
     };
     let served = runtime.block_on(serve_stdio(plugin));
     // Standard input's blocking read cannot be cancelled, so waiting for the
@@ -31,9 +30,14 @@ fn main() -> ExitCode {
     runtime.shutdown_background();
     match served {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("runbooks-credential-aws: {error}");
-            ExitCode::FAILURE
-        }
+        Err(error) => fail(format_args!("{error}")),
+    }
+}
+
+/// Writes `message` to standard error and fails.
+fn fail(message: fmt::Arguments<'_>) -> ExitCode {
+    match writeln!(io::stderr(), "runbooks-credential-aws: {message}") {
+        // With standard error gone, the exit code is the only report left.
+        Ok(()) | Err(_) => ExitCode::FAILURE,
     }
 }

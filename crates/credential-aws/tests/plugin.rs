@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
+use std::future::{self, Future};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -15,7 +16,8 @@ use runbooks_credential_aws::{
     Environment, Region, Service,
 };
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
-use runbooks_plugin_transport::{ServeError, serve};
+use runbooks_plugin_protocol::credential::DetectParams;
+use runbooks_plugin_transport::{CredentialPlugin, ServeError, serve};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -69,16 +71,21 @@ fn assert_valid(def: &str, value: &Value) -> TestResult {
     Ok(())
 }
 
+/// The member of `value` at JSON Pointer `pointer`, or `null` if there is none.
+fn at(value: &Value, pointer: &str) -> Value {
+    value.pointer(pointer).cloned().unwrap_or(Value::Null)
+}
+
 // The fake AWS.
 
 /// What the fake answers for each access key, and the calls it got.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 struct FakeAws {
     callers: HashMap<String, Result<CallerIdentity, AwsError>>,
     calls: Arc<Mutex<Vec<Call>>>,
 }
 
-/// One GetCallerIdentity: the key it was signed with and the region it went to.
+/// One `GetCallerIdentity`: the key it was signed with and the region it went to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Call {
     access_key_id: String,
@@ -118,11 +125,11 @@ impl FakeAws {
 }
 
 impl Aws for FakeAws {
-    async fn caller_identity(
+    fn caller_identity(
         &self,
         credentials: &AwsCredentials,
         region: &Region,
-    ) -> Result<CallerIdentity, AwsError> {
+    ) -> impl Future<Output = Result<CallerIdentity, AwsError>> + Send {
         self.calls
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -130,19 +137,22 @@ impl Aws for FakeAws {
                 access_key_id: credentials.access_key_id.clone(),
                 region: region.to_string(),
             });
-        self.callers
-            .get(&credentials.access_key_id)
-            .cloned()
-            .unwrap_or_else(|| {
-                Err(AwsError::new(
-                    Service::Sts,
-                    AwsErrorKind::Refused,
-                    "InvalidClientTokenId: The security token included in the request is invalid.",
-                ))
-            })
+        future::ready(
+            self.callers
+                .get(&credentials.access_key_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    Err(AwsError::new(
+                        Service::Sts,
+                        AwsErrorKind::Refused,
+                        "InvalidClientTokenId: The security token included in the request is invalid.",
+                    ))
+                }),
+        )
     }
 }
 
+#[derive(Debug)]
 struct FixedClock(OffsetDateTime);
 
 impl Clock for FixedClock {
@@ -197,7 +207,7 @@ impl App {
                 json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/state/aws-auth"}),
             )
             .await?;
-        assert_valid("configureResult", &configured["result"])?;
+        assert_valid("configureResult", &at(&configured, "/result"))?;
         Ok(app)
     }
 
@@ -221,7 +231,7 @@ impl App {
         let stdin = self.stdin.as_mut().ok_or("the plugin's input is closed")?;
         stdin.write_all(format!("{request}\n").as_bytes()).await?;
         let response = self.receive(method).await?;
-        assert_eq!(response["id"], self.next_id, "{response}");
+        assert_eq!(at(&response, "/id"), self.next_id, "{response}");
         Ok(response)
     }
 
@@ -253,7 +263,7 @@ impl App {
             .get("error")
             .ok_or_else(|| format!("{method} succeeded: {response}"))?
             .clone();
-        assert_eq!(error["data"]["kind"], kind, "{response}");
+        assert_eq!(at(&error, "/data/kind"), kind, "{response}");
         Ok(error)
     }
 
@@ -305,9 +315,9 @@ async fn configure_declares_the_levels_and_every_name_a_run_gets() -> TestResult
             "configureResult",
         )
         .await?;
-    assert_eq!(result["cloud"], "aws");
+    assert_eq!(at(&result, "/cloud"), "aws");
     assert_eq!(
-        result["names"],
+        at(&result, "/names"),
         json!([
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
@@ -315,8 +325,9 @@ async fn configure_declares_the_levels_and_every_name_a_run_gets() -> TestResult
             "AWS_REGION"
         ])
     );
-    let levels: Vec<&str> = result["levels"]
-        .as_array()
+    let levels: Vec<&str> = result
+        .get("levels")
+        .and_then(Value::as_array)
         .ok_or("levels")?
         .iter()
         .filter_map(|l| l["name"].as_str())
@@ -338,15 +349,15 @@ async fn detect_finds_env_keys_and_checks_them_in_the_partition_of_their_region(
     ]);
     let mut app = App::start(aws.clone(), env).await?;
     let response = app.detect(json!([{"kind": "env"}]), json!({})).await?;
-    let result = &response["result"];
+    let result = &at(&response, "/result");
     assert_valid("detectResult", result)?;
     assert_eq!(result["found"], true, "{response}");
     assert_eq!(result["source"], "env");
-    assert_eq!(result["identity"]["principal"], ROLE_ARN);
-    assert_eq!(result["identity"]["kind"], "role");
-    assert_eq!(result["identity"]["targets"]["account"]["id"], ACCOUNT);
-    assert_eq!(result["identity"]["targets"]["account"]["name"], "sandbox");
-    assert_eq!(result["identity"]["targets"]["role"]["id"], "deploy");
+    assert_eq!(at(result, "/identity/principal"), ROLE_ARN);
+    assert_eq!(at(result, "/identity/kind"), "role");
+    assert_eq!(at(result, "/identity/targets/account/id"), ACCOUNT);
+    assert_eq!(at(result, "/identity/targets/account/name"), "sandbox");
+    assert_eq!(at(result, "/identity/targets/role/id"), "deploy");
     assert_eq!(
         aws.calls(),
         [Call {
@@ -361,20 +372,20 @@ async fn detect_finds_env_keys_and_checks_them_in_the_partition_of_their_region(
     let values = values_of(&env)?;
     let both = vec!["env".to_owned(), "output".to_owned()];
     assert_eq!(
-        values["AWS_ACCESS_KEY_ID"],
-        ("AKIAGOV".to_owned(), false, both.clone())
+        values.get("AWS_ACCESS_KEY_ID"),
+        Some(&("AKIAGOV".to_owned(), false, both.clone()))
     );
     assert_eq!(
-        values["AWS_SECRET_ACCESS_KEY"],
-        (SECRET.to_owned(), true, both.clone())
+        values.get("AWS_SECRET_ACCESS_KEY"),
+        Some(&(SECRET.to_owned(), true, both.clone()))
     );
     assert_eq!(
-        values["AWS_SESSION_TOKEN"],
-        (TOKEN.to_owned(), true, both.clone())
+        values.get("AWS_SESSION_TOKEN"),
+        Some(&(TOKEN.to_owned(), true, both.clone()))
     );
     assert_eq!(
-        values["AWS_REGION"],
-        ("us-gov-east-1".to_owned(), false, both)
+        values.get("AWS_REGION"),
+        Some(&("us-gov-east-1".to_owned(), false, both))
     );
     assert_eq!(values.len(), 4);
     Ok(())
@@ -396,7 +407,11 @@ async fn a_prefixed_source_reads_only_its_own_names_and_an_unset_region_is_us_ea
     let response = app
         .detect(json!([{"kind": "env", "prefix": "PROD_"}]), json!({}))
         .await?;
-    assert_eq!(response["result"], json!({"found": false}), "{response}");
+    assert_eq!(
+        at(&response, "/result"),
+        json!({"found": false}),
+        "{response}"
+    );
     assert_eq!(aws.calls(), []);
 
     let env = environment(&[
@@ -407,15 +422,18 @@ async fn a_prefixed_source_reads_only_its_own_names_and_an_unset_region_is_us_ea
     let response = app
         .detect(json!([{"kind": "env", "prefix": "PROD_"}]), json!({}))
         .await?;
-    assert_eq!(response["result"]["source"], "env:PROD_", "{response}");
-    assert_eq!(aws.calls()[0].region, "us-east-1");
+    assert_eq!(at(&response, "/result/source"), "env:PROD_", "{response}");
+    assert_eq!(aws.calls().first().ok_or("no call")?.region, "us-east-1");
     let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
-    assert_eq!(values["AWS_ACCESS_KEY_ID"].0, "AKIAPROD");
-    assert_eq!(values["AWS_REGION"].0, "us-east-1");
+    assert_eq!(
+        values.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "AKIAPROD"
+    );
+    assert_eq!(values.get("AWS_REGION").ok_or("no region")?.0, "us-east-1");
     // No session token: the output is empty and the variable unset.
     assert_eq!(
-        values["AWS_SESSION_TOKEN"],
-        (String::new(), true, vec!["output".to_owned()])
+        values.get("AWS_SESSION_TOKEN"),
+        Some(&(String::new(), true, vec!["output".to_owned()]))
     );
     Ok(())
 }
@@ -434,14 +452,17 @@ async fn detect_reads_an_earlier_blocks_values() -> TestResult {
     let response = app
         .detect(json!([{"kind": "values", "values": values}]), json!({}))
         .await?;
-    assert_eq!(response["result"]["source"], "values", "{response}");
+    assert_eq!(at(&response, "/result/source"), "values", "{response}");
     assert_eq!(
-        response["result"]["identity"]["expiresAt"],
+        at(&response, "/result/identity/expiresAt"),
         "2026-11-24T19:00:00Z"
     );
     let env = app.ok("env", json!({}), "envResult").await?;
-    assert_eq!(env["expiresAt"], "2026-11-24T19:00:00Z");
-    assert_eq!(values_of(&env)?["AWS_REGION"].0, "eu-west-1");
+    assert_eq!(at(&env, "/expiresAt"), "2026-11-24T19:00:00Z");
+    assert_eq!(
+        values_of(&env)?.get("AWS_REGION").ok_or("no region")?.0,
+        "eu-west-1"
+    );
     Ok(())
 }
 
@@ -461,7 +482,7 @@ async fn a_credential_the_pins_rule_out_is_skipped_for_the_next_source() -> Test
     let response = app
         .detect(both.clone(), json!({"account": ACCOUNT, "role": "deploy"}))
         .await?;
-    assert_eq!(response["result"]["source"], "env:PROD_", "{response}");
+    assert_eq!(at(&response, "/result/source"), "env:PROD_", "{response}");
 
     // With only the unprefixed source, the block learns why nothing matched.
     let error = app
@@ -471,7 +492,10 @@ async fn a_credential_the_pins_rule_out_is_skipped_for_the_next_source() -> Test
             "pinMismatch",
         )
         .await?;
-    let message = error["message"].as_str().ok_or("message")?;
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or("message")?;
     assert!(
         message.contains(OTHER_ACCOUNT) && message.contains(ACCOUNT),
         "{message}"
@@ -485,7 +509,7 @@ async fn a_credential_the_pins_rule_out_is_skipped_for_the_next_source() -> Test
         )
         .await?;
     assert!(
-        error["message"]
+        at(&error, "/message")
             .as_str()
             .ok_or("message")?
             .contains(USER_ARN),
@@ -514,7 +538,7 @@ async fn keys_aws_refuses_fail_detect_with_its_reason() -> TestResult {
         )
         .await?;
     assert!(
-        error["message"]
+        at(&error, "/message")
             .as_str()
             .ok_or("message")?
             .contains("ExpiredToken"),
@@ -569,7 +593,10 @@ async fn detect_refuses_bad_params_before_calling_aws() -> TestResult {
         ),
     ] {
         let error = app.fails("detect", params, "invalidParams").await?;
-        let message = error["message"].as_str().ok_or("message")?;
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .ok_or("message")?;
         assert!(message.contains(names), "{message} should name {names}");
     }
     assert_eq!(aws.calls(), []);
@@ -592,7 +619,10 @@ async fn a_region_that_is_not_one_names_its_variable() -> TestResult {
             "invalidParams",
         )
         .await?;
-    let message = error["message"].as_str().ok_or("message")?;
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or("message")?;
     assert!(
         message.contains("PROD_AWS_REGION") && message.contains("\"Oregon\""),
         "{message}"
@@ -620,6 +650,26 @@ async fn env_needs_a_credential_and_sign_out_drops_it() -> TestResult {
 }
 
 #[tokio::test]
+async fn the_plugins_debug_shows_its_credential_but_never_a_secret() -> TestResult {
+    let aws = FakeAws::default().caller("AKIADEBUG", ACCOUNT, ROLE_ARN)?;
+    let env = environment(&[
+        ("AWS_ACCESS_KEY_ID", "AKIADEBUG"),
+        ("AWS_SECRET_ACCESS_KEY", SECRET),
+        ("AWS_SESSION_TOKEN", TOKEN),
+    ]);
+    let plugin = AwsPlugin::new(aws, FixedClock(OffsetDateTime::parse(NOW, &Rfc3339)?), env);
+    let params: DetectParams = serde_json::from_value(
+        json!({"sources": [{"kind": "env"}], "pins": {}, "requirements": []}),
+    )?;
+    plugin.detect(params).await?;
+    let shown = format!("{plugin:?}");
+    // Only the detected credential's keys show as redacted secrets.
+    assert!(shown.contains("Secret(redacted)"), "{shown}");
+    assert!(!shown.contains(SECRET) && !shown.contains(TOKEN), "{shown}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn keys_past_their_expiration_are_expired() -> TestResult {
     let aws = FakeAws::default().caller("ASIA", ACCOUNT, ROLE_ARN)?;
     let env = environment(&[
@@ -629,10 +679,10 @@ async fn keys_past_their_expiration_are_expired() -> TestResult {
     ]);
     let mut app = App::start(aws, env).await?;
     let response = app.detect(json!([{"kind": "env"}]), json!({})).await?;
-    assert_eq!(response["result"]["found"], true, "{response}");
+    assert_eq!(at(&response, "/result/found"), true, "{response}");
     let error = app.fails("env", json!({}), "expired").await?;
     assert!(
-        error["message"]
+        at(&error, "/message")
             .as_str()
             .ok_or("message")?
             .contains("2026-11-24T17:59:59Z"),
@@ -650,7 +700,7 @@ async fn targets_and_select_have_nothing_to_choose_for_detected_keys() -> TestRe
         .fails("targets", json!({"level": "project"}), "invalidParams")
         .await?;
     assert!(
-        error["message"]
+        at(&error, "/message")
             .as_str()
             .ok_or("message")?
             .contains("account and role"),

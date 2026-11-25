@@ -8,13 +8,13 @@ use runbooks_plugin_transport::PluginError;
 use crate::aws::{AwsError, AwsErrorKind};
 
 /// Kind `invalidParams`: the call named something the plugin does not have.
-pub fn invalid_params(error: impl ToString) -> PluginError {
+pub(crate) fn invalid_params(error: &impl ToString) -> PluginError {
     PluginError::new(ErrorKind::InvalidParams, error.to_string())
 }
 
 /// An AWS call that failed while the plugin was `doing` something, such as
 /// "checking the credentials in us-east-1".
-pub fn aws(error: &AwsError, doing: &str) -> PluginError {
+pub(crate) fn aws(error: &AwsError, doing: &str) -> PluginError {
     let AwsError {
         service,
         kind,
