@@ -14,6 +14,7 @@ use runbooks_credential_azure::az::{
 };
 use runbooks_credential_azure::claims::{Principal, PrincipalKind};
 use runbooks_credential_azure::ids::{ObjectId, SubscriptionId, TenantId, TenantRef};
+use runbooks_credential_azure::service_principal::{Credential, ServicePrincipal};
 use runbooks_credential_azure::{Connect, Network};
 use runbooks_plugin_protocol::credential::ErrorKind;
 use runbooks_plugin_transport::PluginError;
@@ -26,6 +27,7 @@ pub(crate) const DEV: &str = "aaaaaaaa-0000-4000-8000-000000000002";
 pub(crate) const SHARED: &str = "aaaaaaaa-0000-4000-8000-000000000003";
 pub(crate) const DEVICE_URL: &str = "https://microsoft.com/devicelogin";
 pub(crate) const DEVICE_CODE: &str = "FAKECODE1";
+pub const CLIENT: &str = "33333333-3333-4333-8333-333333333333";
 
 fn tenant_id(id: &str) -> Result<TenantId, Box<dyn Error>> {
     Ok(TenantId::parse(id).ok_or_else(|| format!("{id} is not a GUID"))?)
@@ -65,6 +67,12 @@ pub(crate) enum Call {
     SetSubscription {
         config: PathBuf,
         subscription: String,
+    },
+    LoginServicePrincipal {
+        config: PathBuf,
+        client_id: String,
+        tenant: String,
+        credential: Credential,
     },
 }
 
@@ -132,6 +140,25 @@ impl World {
             id: tenant_id(FABRIKAM)?,
             name: Some("Fabrikam".to_owned()),
         });
+        Ok(world)
+    }
+
+    /// An app in Contoso with Prod and Dev.
+    pub fn service_principal() -> Result<Self, Box<dyn Error>> {
+        let mut world = Self::one_subscription()?;
+        world.principals.insert(
+            tenant_id(CONTOSO)?,
+            principal(
+                CLIENT,
+                "00000000-0000-4000-8000-0000000000c3",
+                PrincipalKind::ServicePrincipal,
+                CONTOSO,
+            )?,
+        );
+        world
+            .accounts
+            .subscriptions
+            .push(subscription(DEV, "Dev", CONTOSO)?);
         Ok(world)
     }
 
@@ -234,6 +261,28 @@ impl Az for FakeAz {
         device_code: oneshot::Sender<DeviceCode>,
     ) -> impl Future<Output = Result<(), PluginError>> + Send {
         future::ready(self.log_in(dir, how, tenant, device_code))
+    }
+
+    async fn login_service_principal(
+        &self,
+        dir: &AzDir,
+        service_principal: &ServicePrincipal,
+    ) -> Result<(), PluginError> {
+        let error = {
+            let mut world = self.world();
+            world.calls.push(Call::LoginServicePrincipal {
+                config: dir.config.clone(),
+                client_id: service_principal.client_id.to_string(),
+                tenant: service_principal.tenant.as_str().to_owned(),
+                credential: service_principal.credential.clone(),
+            });
+            world.login_error.clone()
+        };
+        if let Some(error) = error {
+            return Err(error);
+        }
+        fs::write(dir.config.join("azureProfile.json"), "{}")
+            .map_err(|e| PluginError::new(ErrorKind::Internal, e.to_string()))
     }
 
     fn principal(

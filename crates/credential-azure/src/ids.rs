@@ -50,6 +50,10 @@ guid_type!(
     /// A principal's object id in one tenant.
     ObjectId
 );
+guid_type!(
+    /// An app registration's client (application) id.
+    ClientId
+);
 
 /// A tenant as a person names it: its id, or one of its domains.
 #[derive(Clone, Debug, PartialEq, Eq)]

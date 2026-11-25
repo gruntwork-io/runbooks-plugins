@@ -8,4 +8,5 @@ mod protocol;
 mod real_az;
 #[path = "../common/scripted_az.rs"]
 mod scripted_az;
+mod service_principal;
 mod support;

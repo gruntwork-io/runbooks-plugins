@@ -8,9 +8,15 @@ use runbooks_plugin_protocol::credential::{
 };
 use runbooks_plugin_transport::PluginError;
 
-use crate::describe::{SUBSCRIPTION_LEVEL, TENANT_FIELD, TENANT_LEVEL};
-use crate::ids::{SubscriptionId, TenantId, TenantRef};
+use std::path::PathBuf;
+
+use crate::describe::{
+    CERTIFICATE_FIELD, CLIENT_ID_FIELD, CLIENT_SECRET_FIELD, SUBSCRIPTION_LEVEL, TENANT_FIELD,
+    TENANT_LEVEL,
+};
+use crate::ids::{ClientId, SubscriptionId, TenantId, TenantRef};
 use crate::roles::RoleRequirement;
+use crate::service_principal::{Credential, Secret, ServicePrincipal, is_pkcs12, pkcs12_message};
 
 /// What `detect` and `signIn` check a credential against, before a tenant
 /// domain is resolved.
@@ -136,6 +142,69 @@ pub(crate) fn login_tenant(
     }
 }
 
+/// A service principal from `signIn`'s fields. The tenant is the pinned
+/// one when the block pins it.
+///
+/// # Errors
+///
+/// `invalidParams` naming each field that is missing or malformed, and
+/// `pinMismatch` for a tenant that is not the pinned one. No message
+/// repeats the secret.
+pub fn service_principal(
+    fields: &HashMap<String, String>,
+    constraints: &Constraints,
+) -> Result<ServicePrincipal, PluginError> {
+    let tenant = login_tenant(fields, constraints)?
+        .ok_or_else(|| format!("fields.{TENANT_FIELD} is required for a service principal"));
+    let field = |name: &str| fields.get(name).and_then(|value| given(value));
+    let client_id = match field(CLIENT_ID_FIELD) {
+        None => Err(format!("fields.{CLIENT_ID_FIELD} is required")),
+        Some(value) => ClientId::parse(value).ok_or_else(|| {
+            format!("fields.{CLIENT_ID_FIELD} must be the app's client ID, a GUID, not {value:?}")
+        }),
+    };
+    // The secret as typed: only a template's blank counts as unset.
+    let secret = fields
+        .get(CLIENT_SECRET_FIELD)
+        .filter(|value| !value.trim().is_empty());
+    let credential = match (secret, field(CERTIFICATE_FIELD).map(PathBuf::from)) {
+        (Some(_), Some(_)) => Err(format!(
+            "fill in fields.{CLIENT_SECRET_FIELD} or fields.{CERTIFICATE_FIELD}, not both"
+        )),
+        (None, None) => Err(format!(
+            "a service principal needs fields.{CLIENT_SECRET_FIELD} or fields.{CERTIFICATE_FIELD}"
+        )),
+        (Some(secret), None) => Ok(Credential::Secret(Secret::new(secret.clone()))),
+        (None, Some(path)) if is_pkcs12(&path) => Err(format!(
+            "fields.{CERTIFICATE_FIELD}: {}",
+            pkcs12_message(&path)
+        )),
+        (None, Some(path)) if !path.is_absolute() => Err(format!(
+            "fields.{CERTIFICATE_FIELD} must be an absolute path, not {}",
+            path.display()
+        )),
+        (None, Some(path)) => Ok(Credential::Certificate(path)),
+    };
+    let mut problems = Problems::default();
+    for problem in [
+        client_id.as_ref().err(),
+        tenant.as_ref().err(),
+        credential.as_ref().err(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        problems.add(problem.clone());
+    }
+    problems.check("signIn")?;
+    let invalid = |problem: String| PluginError::new(ErrorKind::InvalidParams, problem);
+    Ok(ServicePrincipal {
+        client_id: client_id.map_err(invalid)?,
+        tenant: tenant.map_err(invalid)?,
+        credential: credential.map_err(invalid)?,
+    })
+}
+
 /// A `select` call's choice: a tenant, and a subscription unless the
 /// sign-in is tenant-level.
 ///
@@ -189,8 +258,102 @@ mod tests {
         ErrorKind, Pins, Requirement, RequirementRolesItem,
     };
 
-    use super::{choice, constraints, login_tenant};
+    use super::{Constraints, choice, constraints, login_tenant, service_principal};
     use crate::ids::TenantRef;
+    use crate::service_principal::{Credential, Secret};
+
+    const CLIENT: &str = "33333333-3333-4333-8333-333333333333";
+    const TENANT: &str = "11111111-1111-4111-8111-111111111111";
+
+    #[test]
+    fn a_service_principal_takes_a_secret_or_a_pem_certificate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pinned = Constraints {
+            tenant: TenantRef::parse(TENANT),
+            ..Constraints::default()
+        };
+        let fields = map(&[("clientId", CLIENT), ("clientSecret", " s3cr3t ")]);
+        let principal = service_principal(&fields, &pinned)?;
+        assert_eq!(
+            principal.tenant.as_str(),
+            TENANT,
+            "the pin fills the tenant"
+        );
+        assert_eq!(
+            principal.credential,
+            Credential::Secret(Secret::new(" s3cr3t ".to_owned())),
+            "a secret is taken as typed"
+        );
+        let pem = if cfg!(windows) {
+            r"C:\sp.pem"
+        } else {
+            "/sp.pem"
+        };
+        let fields = map(&[
+            ("clientId", CLIENT),
+            ("tenantId", TENANT),
+            ("clientCertificatePath", pem),
+        ]);
+        let principal = service_principal(&fields, &Constraints::default())?;
+        assert_eq!(principal.credential, Credential::Certificate(pem.into()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_service_principal_names_each_bad_field_and_never_the_secret() {
+        for (fields, expected) in [
+            (
+                map(&[("clientSecret", "s3cr3t")]),
+                vec!["fields.clientId is required", "fields.tenantId is required"],
+            ),
+            (
+                map(&[
+                    ("clientId", "my-app"),
+                    ("tenantId", TENANT),
+                    ("clientSecret", "s3cr3t"),
+                    ("clientCertificatePath", "/sp.pem"),
+                ]),
+                vec!["fields.clientId must be the app's client ID", "not both"],
+            ),
+            (
+                map(&[
+                    ("clientId", CLIENT),
+                    ("tenantId", TENANT),
+                    ("clientSecret", " "),
+                ]),
+                vec!["needs fields.clientSecret or"],
+            ),
+            (
+                map(&[
+                    ("clientId", CLIENT),
+                    ("tenantId", TENANT),
+                    ("clientCertificatePath", "/sp.pfx"),
+                ]),
+                vec!["PEM certificate, not /sp.pfx"],
+            ),
+            (
+                map(&[
+                    ("clientId", CLIENT),
+                    ("tenantId", TENANT),
+                    ("clientCertificatePath", "sp.pem"),
+                ]),
+                vec!["must be an absolute path"],
+            ),
+        ] {
+            let error = service_principal(&fields, &Constraints::default())
+                .err()
+                .unwrap_or_else(|| unreachable!("{:?} is refused", fields.keys()));
+            assert_eq!(error.kind(), ErrorKind::InvalidParams);
+            for part in expected {
+                assert!(
+                    error.message().contains(part),
+                    "{part:?} in {}",
+                    error.message()
+                );
+            }
+            assert!(!error.message().contains("s3cr3t"), "{}", error.message());
+        }
+    }
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

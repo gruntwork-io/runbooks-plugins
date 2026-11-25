@@ -7,12 +7,14 @@
 //!   they return is the one `targets`, `select` and `env` then use. One that
 //!   replaces another deletes the other's directory.
 //! - `env` calls nothing: `az` refreshes its own tokens during the run.
+//! - A service principal signs in through `az` too, so a script's bare `az`
+//!   works; `env` adds its credential for the tools that read it directly.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::future::{self, Future};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use runbooks_plugin_protocol::credential::{
@@ -28,12 +30,20 @@ use crate::az::{Az, AzDir, Interactive};
 use crate::choose::{self, Pins, Resolution, TenantPin};
 use crate::claims::Principal;
 use crate::describe::{self, CLI_SOURCE, SUBSCRIPTION_LEVEL, TENANT_LEVEL};
-use crate::host::LocalLogin;
+use crate::host::Host;
 use crate::ids::{SubscriptionId, TenantId, TenantRef};
 use crate::params::{self, Constraints};
 use crate::roles::{self, MissingRole, RoleRequirement};
+use crate::service_principal::{self, Credential, Found, ServicePrincipal};
 use crate::session::{Chosen, Session, SignInMethod, Stage};
 use crate::state_dir::StateDir;
+
+/// The `source` of a credential found in the environment.
+const ENV_SOURCE: &str = "env";
+
+/// The `source` of a credential found in an earlier block's outputs. The
+/// source does not say which block they came from.
+const VALUES_SOURCE: &str = "values";
 
 /// The app's network settings from `configure`.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -67,7 +77,9 @@ pub trait Connect: Send + Sync + 'static {
 
 /// The Azure credential plugin. One process serves one block.
 pub struct AzurePlugin<C: Connect> {
-    local: LocalLogin,
+    /// The environment `main` read: the `env` source, and where the
+    /// person's own `az` login is.
+    host: Host,
     connect: C,
     configured: OnceLock<Configured<C::Az>>,
     /// The block's sign-in. Every call but the interactive part of `signIn`
@@ -92,10 +104,9 @@ struct Configured<A> {
 }
 
 impl<C: Connect> AzurePlugin<C> {
-    /// `local` is the person's own `az` login, which the `cli` source copies.
-    pub fn new(local: LocalLogin, connect: C) -> Self {
+    pub fn new(host: Host, connect: C) -> Self {
         Self {
-            local,
+            host,
             connect,
             configured: OnceLock::new(),
             session: Mutex::new(None),
@@ -155,45 +166,164 @@ impl<C: Connect> AzurePlugin<C> {
         }
     }
 
-    async fn detect_cli(
+    /// A copy of the `az` login in `from`, if it is one the block can use.
+    async fn detect_copy(
         &self,
         configured: &Configured<C::Az>,
+        method: SignInMethod,
+        from: &Path,
+        extensions: Option<&Path>,
         constraints: &Constraints,
     ) -> Result<Option<Session>, PluginError> {
-        let Some(from) = &self.local.config_dir else {
-            return Ok(None);
-        };
         let Some(config) = configured.state.copy_login(from).await? else {
             return Ok(None);
         };
-        let extensions = match &self.local.extension_dir {
-            Some(dir) if tokio::fs::try_exists(dir).await.unwrap_or(false) => Some(dir.clone()),
+        let extensions = match extensions {
+            Some(dir) if tokio::fs::try_exists(dir).await.unwrap_or(false) => Some(dir.to_owned()),
             Some(_) | None => None,
         };
         let dir = AzDir { config, extensions };
-        match establish(&configured.az, SignInMethod::Cli, dir.clone(), constraints).await {
-            Ok(session) => Ok(Some(session)),
-            Err(error) => {
-                configured.state.remove(&dir.config).await?;
-                match error.kind() {
-                    // Nothing here the block can use as it is.
-                    ErrorKind::NotSignedIn
-                    | ErrorKind::Expired
-                    | ErrorKind::PinMismatch
-                    | ErrorKind::ToolMissing => Ok(None),
-                    ErrorKind::NotConfigured
-                    | ErrorKind::UnsupportedProtocolVersion
-                    | ErrorKind::InvalidParams
-                    | ErrorKind::RequirementNotMet
-                    | ErrorKind::AccessDenied
-                    | ErrorKind::Cancelled
-                    | ErrorKind::TimedOut
-                    | ErrorKind::Network
-                    | ErrorKind::TlsError
-                    | ErrorKind::Internal => Err(error),
-                }
-            }
+        let session = establish(&configured.az, method, dir.clone(), constraints, None).await;
+        let session = keep_or_remove(&configured.state, &dir, session).await;
+        unusable_is_none(session, &[ErrorKind::NotSignedIn, ErrorKind::Expired])
+    }
+
+    /// A service principal from the environment or an earlier block, signed
+    /// in to a new directory, if the pins allow it. Its subscription is the
+    /// block's unless the block pins one.
+    async fn detect_service_principal(
+        &self,
+        configured: &Configured<C::Az>,
+        found: Found,
+        constraints: &Constraints,
+    ) -> Result<Option<Session>, PluginError> {
+        if let (Some(TenantRef::Id(pin)), TenantRef::Id(tenant)) =
+            (&constraints.tenant, &found.principal.tenant)
+            && pin != tenant
+        {
+            return Ok(None);
         }
+        let mut constraints = constraints.clone();
+        if constraints.subscription.is_none() {
+            constraints.subscription = found.subscription;
+        }
+        let session = self
+            .sign_in_service_principal(configured, found.principal, &constraints)
+            .await;
+        // A secret that az refuses is an error the person should see.
+        unusable_is_none(session, &[])
+    }
+
+    /// What an earlier block's outputs hold: a service principal, or else
+    /// the `az` login in its `AZURE_CONFIG_DIR`, with its choice of tenant
+    /// and subscription where the block pins none.
+    async fn detect_values(
+        &self,
+        configured: &Configured<C::Az>,
+        values: &HashMap<String, String>,
+        constraints: &Constraints,
+    ) -> Result<Option<Session>, PluginError> {
+        let get = |name: &str| values.get(name).cloned();
+        if let Some(found) = service_principal::from_vars("", get) {
+            return self
+                .detect_service_principal(configured, found, constraints)
+                .await;
+        }
+        let Some(from) = values
+            .get("AZURE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+        else {
+            return Ok(None);
+        };
+        let mut constraints = constraints.clone();
+        let tenant = values
+            .get("AZURE_TENANT_ID")
+            .and_then(|id| TenantRef::parse(id));
+        if constraints.tenant.is_none() {
+            constraints.tenant.clone_from(&tenant);
+        }
+        if constraints.subscription.is_none() && constraints.tenant == tenant {
+            constraints.subscription = values.get("AZURE_SUBSCRIPTION_ID").cloned();
+        }
+        let method = values
+            .get("AZURE_AUTH_TYPE")
+            .and_then(|name| SignInMethod::parse(name))
+            .filter(|method| *method != SignInMethod::ServicePrincipal)
+            .unwrap_or(SignInMethod::Cli);
+        let extensions = values.get("AZURE_EXTENSION_DIR").map(PathBuf::from);
+        self.detect_copy(
+            configured,
+            method,
+            &from,
+            extensions.as_deref(),
+            &constraints,
+        )
+        .await
+    }
+
+    /// Signs `principal` in to a new directory: `az` with its secret or
+    /// with the block's own copy of its certificate.
+    async fn sign_in_service_principal(
+        &self,
+        configured: &Configured<C::Az>,
+        mut principal: ServicePrincipal,
+        constraints: &Constraints,
+    ) -> Result<Session, PluginError> {
+        let dir = AzDir {
+            config: configured.state.create().await?,
+            extensions: None,
+        };
+        let session = async {
+            if let Credential::Certificate(path) = &principal.credential {
+                let copy = configured.state.copy_certificate(path, &dir.config).await?;
+                principal.credential = Credential::Certificate(copy);
+            }
+            configured
+                .az
+                .login_service_principal(&dir, &principal)
+                .await?;
+            let method = SignInMethod::ServicePrincipal;
+            establish(
+                &configured.az,
+                method,
+                dir.clone(),
+                constraints,
+                Some(principal),
+            )
+            .await
+        }
+        .await;
+        keep_or_remove(&configured.state, &dir, session).await
+    }
+}
+
+/// `session`, or its directory removed if it failed.
+async fn keep_or_remove(
+    state: &StateDir,
+    dir: &AzDir,
+    session: Result<Session, PluginError>,
+) -> Result<Session, PluginError> {
+    if session.is_err() {
+        state.remove(&dir.config).await?;
+    }
+    session
+}
+
+/// A detected credential the block cannot use as it is is not found: one
+/// the pins rule out, one with no `az` to use it, or one of `unusable`'s
+/// kinds. Any other error is the answer.
+fn unusable_is_none(
+    session: Result<Session, PluginError>,
+    unusable: &[ErrorKind],
+) -> Result<Option<Session>, PluginError> {
+    match session {
+        Ok(session) => Ok(Some(session)),
+        Err(error) => match error.kind() {
+            ErrorKind::PinMismatch | ErrorKind::ToolMissing => Ok(None),
+            kind if unusable.contains(&kind) => Ok(None),
+            _ => Err(error),
+        },
     }
 }
 
@@ -204,6 +334,7 @@ async fn establish<A: Az>(
     method: SignInMethod,
     dir: AzDir,
     constraints: &Constraints,
+    service_principal: Option<ServicePrincipal>,
 ) -> Result<Session, PluginError> {
     let home = az.principal(&dir, None).await?;
     let tenant = match &constraints.tenant {
@@ -241,6 +372,7 @@ async fn establish<A: Az>(
         pins,
         roles: constraints.roles.clone(),
         stage: Stage::Choosing { tenant: None },
+        service_principal,
     };
     session.stage = match resolution {
         Resolution::Chosen {
@@ -329,18 +461,18 @@ async fn check_roles<A: Az>(
 /// Runs the interactive `az login`, telling the person what to do.
 async fn login<A: Az>(
     az: &A,
-    method: SignInMethod,
+    how: Interactive,
     dir: &AzDir,
     tenant: Option<&TenantRef>,
     prompts: &Prompts,
 ) -> Result<(), PluginError> {
     let (sender, receiver) = oneshot::channel();
-    match method {
-        SignInMethod::Cli => {
+    match how {
+        Interactive::Browser => {
             prompts.waiting().await?;
             az.login(dir, Interactive::Browser, tenant, sender).await
         }
-        SignInMethod::DeviceCode => {
+        Interactive::DeviceCode => {
             let forward = async {
                 match receiver.await {
                     Ok(code) => prompts.open_url(code.url, Some(code.code)).await,
@@ -385,28 +517,65 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
         let constraints = params::constraints("detect", &params.pins, &params.requirements)?;
         let mut problems = params::Problems::default();
         for source in &params.sources {
-            if let Source::Named { name } = source
-                && name != CLI_SOURCE
-            {
-                problems.add(format!(
+            match source {
+                Source::Named { name } if name != CLI_SOURCE => problems.add(format!(
                     "source {name:?} is not one this plugin names: it names {CLI_SOURCE:?}"
-                ));
+                )),
+                Source::Env {
+                    prefix: Some(prefix),
+                } if !prefix.is_empty() && !service_principal::is_prefix(prefix) => {
+                    problems.add(format!(
+                        "the env source's prefix must be capital letters, digits and underscores, starting with a letter and ending with _, such as CI_, not {prefix:?}"
+                    ));
+                }
+                Source::Named { .. } | Source::Env { .. } | Source::Values { .. } => {}
             }
         }
         problems.check("detect")?;
 
         let mut first_error = None;
         for source in &params.sources {
-            let found = match source {
-                Source::Named { .. } => self.detect_cli(configured, &constraints).await,
-                // These hold service principals, and no method here signs one in.
-                Source::Env { .. } | Source::Values { .. } => Ok(None),
+            let (found, name) = match source {
+                Source::Named { .. } => {
+                    let local = self.host.local_login();
+                    let found = match &local.config_dir {
+                        Some(from) => {
+                            let extensions = local.extension_dir.as_deref();
+                            let method = SignInMethod::Cli;
+                            self.detect_copy(configured, method, from, extensions, &constraints)
+                                .await
+                        }
+                        None => Ok(None),
+                    };
+                    (found, CLI_SOURCE)
+                }
+                Source::Env { prefix } => {
+                    let prefix = prefix.as_deref().unwrap_or_default();
+                    let get = |name: &str| {
+                        self.host
+                            .var(name)
+                            .and_then(|value| value.to_str())
+                            .map(str::to_owned)
+                    };
+                    let found = match service_principal::from_vars(prefix, get) {
+                        Some(found) => {
+                            self.detect_service_principal(configured, found, &constraints)
+                                .await
+                        }
+                        None => Ok(None),
+                    };
+                    (found, ENV_SOURCE)
+                }
+                Source::Values { values } => (
+                    self.detect_values(configured, values, &constraints).await,
+                    VALUES_SOURCE,
+                ),
             };
             match found {
                 Ok(Some(session)) => {
                     let identity = session.identity();
                     self.install(&configured.state, session).await?;
-                    return Ok(DetectResult::found(identity, CLI_SOURCE));
+                    return Ok(DetectResult::found(identity, name));
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -435,28 +604,34 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
             )
         })?;
         let constraints = params::constraints("signIn", &params.pins, &params.requirements)?;
+        let how = match method {
+            SignInMethod::Cli => Interactive::Browser,
+            SignInMethod::DeviceCode => Interactive::DeviceCode,
+            SignInMethod::ServicePrincipal => {
+                let principal = params::service_principal(&params.fields, &constraints)?;
+                let session = self
+                    .sign_in_service_principal(configured, principal, &constraints)
+                    .await?;
+                let identity = session.identity();
+                self.install(&configured.state, session).await?;
+                return Ok(SignInResult(identity));
+            }
+        };
         let tenant = params::login_tenant(&params.fields, &constraints)?;
 
         let dir = AzDir {
             config: configured.state.create().await?,
             extensions: None,
         };
-        let signed_in = async {
-            login(&configured.az, method, &dir, tenant.as_ref(), &prompts).await?;
-            establish(&configured.az, method, dir.clone(), &constraints).await
+        let session = async {
+            login(&configured.az, how, &dir, tenant.as_ref(), &prompts).await?;
+            establish(&configured.az, method, dir.clone(), &constraints, None).await
         }
         .await;
-        match signed_in {
-            Ok(session) => {
-                let identity = session.identity();
-                self.install(&configured.state, session).await?;
-                Ok(SignInResult(identity))
-            }
-            Err(error) => {
-                configured.state.remove(&dir.config).await?;
-                Err(error)
-            }
-        }
+        let session = keep_or_remove(&configured.state, &dir, session).await?;
+        let identity = session.identity();
+        self.install(&configured.state, session).await?;
+        Ok(SignInResult(identity))
     }
 
     async fn targets(&self, params: TargetsParams) -> Result<TargetsResult, PluginError> {

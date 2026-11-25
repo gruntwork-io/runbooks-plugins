@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use runbooks_credential_azure::AzurePlugin;
 use runbooks_credential_azure::az::Interactive;
-use runbooks_credential_azure::host::LocalLogin;
+use runbooks_credential_azure::host::Host;
 use runbooks_plugin_protocol::credential::ErrorKind;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -29,13 +29,24 @@ struct Fixture {
 
 impl Fixture {
     async fn new(world: World) -> Result<Self, Box<dyn Error>> {
+        Self::with_env(world, &[]).await
+    }
+
+    /// The plugin started with `vars` in its environment, beside the
+    /// person's own `az` config directory.
+    async fn with_env(world: World, vars: &[(&str, &str)]) -> Result<Self, Box<dyn Error>> {
         let (state, home) = (tempfile::tempdir()?, tempfile::tempdir()?);
-        let local = LocalLogin {
-            config_dir: Some(home.path().join(".azure")),
-            extension_dir: Some(home.path().join(".azure").join("cliextensions")),
-        };
+        let mut env = vec![(
+            "AZURE_CONFIG_DIR".into(),
+            home.path().join(".azure").into_os_string(),
+        )];
+        env.extend(
+            vars.iter()
+                .map(|(name, value)| ((*name).into(), (*value).into())),
+        );
         let az = FakeAz::new(world);
-        let mut app = App::start(AzurePlugin::new(local, az.clone()))?;
+        let host = Host::new(env, cfg!(windows));
+        let mut app = App::start(AzurePlugin::new(host, az.clone()))?;
         app.configure(state.path()).await?;
         Ok(Self {
             app,
@@ -93,7 +104,7 @@ fn is_under(path: Option<&str>, dir: &Path) -> bool {
 async fn configure_offers_the_methods_levels_and_every_name() -> TestResult {
     let state = tempfile::tempdir()?;
     let mut app = App::start(AzurePlugin::new(
-        LocalLogin::default(),
+        Host::new([], cfg!(windows)),
         FakeAz::new(World::one_subscription()?),
     ))?;
     let result = app.configure(state.path()).await?;
@@ -104,7 +115,15 @@ async fn configure_offers_the_methods_levels_and_every_name() -> TestResult {
         .iter()
         .map(|m| &m["name"])
         .collect();
-    assert_eq!(methods, ["cli", "device_code"]);
+    assert_eq!(methods, ["cli", "device_code", "service_principal"]);
+    let secret_fields: Vec<&Value> = result["methods"][2]["fields"]
+        .as_array()
+        .ok_or("fields")?
+        .iter()
+        .filter(|field| field["secret"] == true)
+        .map(|field| &field["name"])
+        .collect();
+    assert_eq!(secret_fields, ["clientSecret"]);
     let levels: Vec<&Value> = result
         .pointer("/levels")
         .and_then(Value::as_array)
@@ -723,7 +742,7 @@ fn debug_shows_no_proxy_password_and_only_whether_configured() -> TestResult {
         r#"Network { ca_bundle_file: Some("/etc/ca.pem"), proxy: Some("<set>") }"#
     );
     let plugin = AzurePlugin::new(
-        LocalLogin::default(),
+        Host::new([], cfg!(windows)),
         FakeAz::new(World::one_subscription()?),
     );
     assert_eq!(

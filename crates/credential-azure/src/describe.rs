@@ -13,8 +13,14 @@ pub(crate) const SUBSCRIPTION_LEVEL: &str = "subscription";
 /// The one detection source the plugin names itself: the person's own `az` login.
 pub(crate) const CLI_SOURCE: &str = "cli";
 
-/// The optional tenant field of an interactive sign-in.
+/// The tenant field: optional for an interactive sign-in, required for a
+/// service principal.
 pub(crate) const TENANT_FIELD: &str = "tenantId";
+
+/// A service principal's fields. It takes a secret or a certificate.
+pub const CLIENT_ID_FIELD: &str = "clientId";
+pub const CLIENT_SECRET_FIELD: &str = "clientSecret";
+pub const CERTIFICATE_FIELD: &str = "clientCertificatePath";
 
 /// Every env and output name the plugin may set. The base environment
 /// strips them all, so a value from the app's own environment or an earlier
@@ -59,6 +65,20 @@ fn method(method: SignInMethod) -> Method {
         SignInMethod::DeviceCode => (
             "Device Code",
             vec![field(TENANT_FIELD, "Tenant ID", false, false)],
+        ),
+        SignInMethod::ServicePrincipal => (
+            "Service Principal",
+            vec![
+                field(CLIENT_ID_FIELD, "Client ID", true, false),
+                field(TENANT_FIELD, "Tenant ID", true, false),
+                field(CLIENT_SECRET_FIELD, "Client Secret", false, true),
+                field(
+                    CERTIFICATE_FIELD,
+                    "Certificate (PEM file path)",
+                    false,
+                    false,
+                ),
+            ],
         ),
     };
     Method {

@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use runbooks_credential_azure::az::{Az, AzCli, AzDir, DeviceCode, Interactive};
-use runbooks_credential_azure::ids::{ObjectId, SubscriptionId, TenantId, TenantRef};
+use runbooks_credential_azure::ids::{ClientId, ObjectId, SubscriptionId, TenantId, TenantRef};
+use runbooks_credential_azure::service_principal::{Credential, Secret, ServicePrincipal};
 use runbooks_plugin_protocol::credential::ErrorKind;
 use serde_json::json;
 use tokio::sync::oneshot;
@@ -32,6 +33,17 @@ async fn bounded<T>(call: impl Future<Output = T>) -> Result<T, Box<dyn Error>> 
 const CONTOSO: &str = "11111111-1111-4111-8111-111111111111";
 const PROD: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 const OBJECT_ID: &str = "00000000-0000-4000-8000-0000000000a1";
+const CLIENT: &str = "33333333-3333-4333-8333-333333333333";
+/// Letters and digits only, so the Windows script can echo it.
+const SECRET: &str = "Sp7SecretValue9";
+
+fn service_principal(credential: Credential) -> Result<ServicePrincipal, Box<dyn Error>> {
+    Ok(ServicePrincipal {
+        client_id: ClientId::parse(CLIENT).ok_or("client id")?,
+        tenant: TenantRef::parse(CONTOSO).ok_or("tenant")?,
+        credential,
+    })
+}
 
 fn ids() -> Result<(TenantId, SubscriptionId, ObjectId), Box<dyn Error>> {
     Ok((
@@ -60,10 +72,12 @@ async fn without_az_every_call_is_tool_missing() -> TestResult {
     ] {
         let (sender, _receiver) = oneshot::channel();
         let tenant = TenantRef::Id(tenant.clone());
+        let principal = service_principal(Credential::Secret(Secret::new(SECRET.to_owned())))?;
         let kinds = [
             az.login(&dir, Interactive::Browser, None, sender)
                 .await
                 .err(),
+            az.login_service_principal(&dir, &principal).await.err(),
             az.principal(&dir, Some(&tenant)).await.err(),
             az.accounts(&dir).await.err(),
             az.tenants(&dir).await.err(),
@@ -300,5 +314,64 @@ async fn a_token_az_cant_get_for_a_tenant_says_to_sign_in_with_it() -> TestResul
             .starts_with("az account get-access-token failed: AADSTS50076"),
         "{error}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_service_principal_secret_goes_on_stdin_and_never_into_a_message() -> TestResult {
+    let scripted = ScriptedAz::new()?;
+    let config = tempfile::tempdir()?;
+    let dir = az_dir(config.path(), None);
+    let az = AzCli::new(Some(scripted.program()), scripted.env());
+    let principal = service_principal(Credential::Secret(Secret::new(SECRET.to_owned())))?;
+
+    az.login_service_principal(&dir, &principal).await?;
+    assert_eq!(scripted.stdin()?, SECRET);
+    let calls = scripted.calls()?;
+    let call = calls.first().ok_or("no call")?;
+    assert!(
+        call.args.starts_with(&format!(
+            "login --service-principal --username {CLIENT} --tenant {CONTOSO} --allow-no-subscriptions"
+        )),
+        "{call:?}"
+    );
+    assert!(call.args.contains("--password=@-"), "{call:?}");
+    assert!(!call.args.contains(SECRET), "{call:?}");
+
+    // An az that repeats what it read: the message must not.
+    scripted.respond("login.fail", "")?;
+    scripted.respond(
+        "login.err",
+        &format!("ERROR: AADSTS7000215: Invalid client secret provided: {SECRET}\n"),
+    )?;
+    let error = az
+        .login_service_principal(&dir, &principal)
+        .await
+        .err()
+        .ok_or("a refused secret signed in")?;
+    assert_eq!(error.kind(), ErrorKind::AccessDenied);
+    assert!(error.message().contains("AADSTS7000215"), "{error}");
+    assert!(!format!("{error:?}").contains(SECRET), "{error:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_service_principal_certificate_is_passed_by_path() -> TestResult {
+    let scripted = ScriptedAz::new()?;
+    let config = tempfile::tempdir()?;
+    let pem = config.path().join("client-certificate.pem");
+    let az = AzCli::new(Some(scripted.program()), scripted.env());
+    let principal = service_principal(Credential::Certificate(pem.clone()))?;
+    az.login_service_principal(&az_dir(config.path(), None), &principal)
+        .await?;
+    let calls = scripted.calls()?;
+    let call = calls.first().ok_or("no call")?;
+    let pem = pem.to_str().ok_or("not UTF-8")?;
+    assert!(
+        call.args.contains(&format!("--certificate {pem}")),
+        "{call:?}"
+    );
+    assert!(!call.args.contains("--password"), "{call:?}");
+    assert_eq!(scripted.stdin()?, "", "nothing on stdin");
     Ok(())
 }

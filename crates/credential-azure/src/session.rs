@@ -11,6 +11,7 @@ use crate::claims::{Principal, PrincipalKind};
 use crate::describe::{SUBSCRIPTION_LEVEL, TENANT_LEVEL};
 use crate::ids::TenantId;
 use crate::roles::RoleRequirement;
+use crate::service_principal::{Credential, ServicePrincipal};
 
 /// A sign-in method: one tab in the auth view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,16 +19,18 @@ pub(crate) enum SignInMethod {
     /// `az login` in a browser, or the person's own `az` login, detected.
     Cli,
     DeviceCode,
+    ServicePrincipal,
 }
 
 impl SignInMethod {
-    pub(crate) const ALL: [Self; 2] = [Self::Cli, Self::DeviceCode];
+    pub(crate) const ALL: [Self; 3] = [Self::Cli, Self::DeviceCode, Self::ServicePrincipal];
 
     /// Its name in the protocol, and the value of `AZURE_AUTH_TYPE`.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Cli => "cli",
             Self::DeviceCode => "device_code",
+            Self::ServicePrincipal => "service_principal",
         }
     }
 
@@ -46,6 +49,10 @@ pub(crate) struct Session {
     pub pins: Pins,
     pub roles: Vec<RoleRequirement>,
     pub stage: Stage,
+    /// A service principal's credential, for the tools that read it from
+    /// the environment rather than from `az`. A certificate is the block's
+    /// own copy.
+    pub service_principal: Option<ServicePrincipal>,
 }
 
 pub(crate) enum Stage {
@@ -123,10 +130,28 @@ impl Session {
             values.both("ARM_SUBSCRIPTION_ID", subscription.id.to_string());
             values.output("AZURE_SUBSCRIPTION_NAME", subscription.name.clone());
         }
-        // No ARM_TENANT_ID: the azurerm backend passes it to `az account
-        // get-access-token` as --tenant beside --subscription, which the Azure
-        // CLI refuses. The sign-in in AZURE_CONFIG_DIR already has the tenant.
-        values.both("ARM_USE_CLI", "true".to_owned());
+        if let Some(principal) = &self.service_principal {
+            values.both("ARM_CLIENT_ID", principal.client_id.to_string());
+            values.both("AZURE_CLIENT_ID", principal.client_id.to_string());
+        }
+        match self.service_principal.as_ref().map(|sp| &sp.credential) {
+            Some(Credential::Secret(secret)) => {
+                values.secret("ARM_CLIENT_SECRET", secret.expose());
+                values.secret("AZURE_CLIENT_SECRET", secret.expose());
+                values.both("ARM_TENANT_ID", chosen.tenant.id.to_string());
+            }
+            certificate @ (Some(Credential::Certificate(_)) | None) => {
+                // No ARM_TENANT_ID: the azurerm backend passes it to `az
+                // account get-access-token` as --tenant beside --subscription,
+                // which the Azure CLI refuses. The sign-in in AZURE_CONFIG_DIR
+                // already has the tenant. azurerm reads only PKCS#12
+                // certificates, so a PEM one goes through az too.
+                values.both("ARM_USE_CLI", "true".to_owned());
+                if let Some(Credential::Certificate(copy)) = certificate {
+                    values.both("AZURE_CLIENT_CERTIFICATE_PATH", path(copy));
+                }
+            }
+        }
         values.both("AZURE_AUTH_TYPE", self.method.name().to_owned());
         values.both("AZURE_PRINCIPAL_NAME", chosen.principal.name.clone());
         values.both(
@@ -154,11 +179,17 @@ fn path(path: &std::path::Path) -> Option<String> {
 struct Values(Vec<EnvValue>);
 
 impl Values {
-    fn push(&mut self, name: &str, value: Option<String>, to: Vec<EnvValueToItem>) {
+    fn push(
+        &mut self,
+        name: &str,
+        value: Option<String>,
+        sensitive: bool,
+        to: Vec<EnvValueToItem>,
+    ) {
         if let Some(value) = value {
             self.0.push(EnvValue {
                 name: name.to_owned(),
-                sensitive: false,
+                sensitive,
                 to,
                 value,
             });
@@ -166,14 +197,17 @@ impl Values {
     }
 
     fn both(&mut self, name: &str, value: impl Into<Option<String>>) {
-        self.push(
-            name,
-            value.into(),
-            vec![EnvValueToItem::Env, EnvValueToItem::Output],
-        );
+        let to = vec![EnvValueToItem::Env, EnvValueToItem::Output];
+        self.push(name, value.into(), false, to);
+    }
+
+    /// A sensitive output: a template that shows it shows `<redacted>`.
+    fn secret(&mut self, name: &str, value: &str) {
+        let to = vec![EnvValueToItem::Env, EnvValueToItem::Output];
+        self.push(name, Some(value.to_owned()), true, to);
     }
 
     fn output(&mut self, name: &str, value: String) {
-        self.push(name, Some(value), vec![EnvValueToItem::Output]);
+        self.push(name, Some(value), false, vec![EnvValueToItem::Output]);
     }
 }

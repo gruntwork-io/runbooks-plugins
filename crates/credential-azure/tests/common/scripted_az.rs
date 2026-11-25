@@ -2,7 +2,8 @@
 //! runs. It answers `az <a> <b>` from `<a>-<b>.out` (standard output) and
 //! `<a>-<b>.err` (standard error) in its directory, and exits 1 if
 //! `<a>-<b>.fail` is there; `login` and `rest` are keyed by their first word.
-//! It records each call in `calls`.
+//! It records each call in `calls`, and what a `login` read on standard
+//! input in `stdin`.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -42,6 +43,7 @@ case "$1" in
   *) key="$1-$2" ;;
 esac
 printf '%s|%s|%s|%s\n' "$AZURE_CONFIG_DIR" "$AZURE_EXTENSION_DIR" "$AZURE_CORE_ONLY_SHOW_ERRORS" "$*" >> "$responses/calls"
+if [ "$1" = login ]; then cat > "$responses/stdin"; fi
 if [ -f "$responses/$key.err" ]; then cat "$responses/$key.err" >&2; fi
 if [ -f "$responses/$key.out" ]; then cat "$responses/$key.out"; fi
 if [ -f "$responses/$key.fail" ]; then exit 1; fi
@@ -58,6 +60,11 @@ set \"key=%~1-%~2\"\r\n\
 if \"%~1\"==\"login\" set \"key=login\"\r\n\
 if \"%~1\"==\"rest\" set \"key=rest\"\r\n\
 >>\"%FAKE_AZ_RESPONSES%\\calls\" echo %AZURE_CONFIG_DIR%^|%AZURE_EXTENSION_DIR%^|%AZURE_CORE_ONLY_SHOW_ERRORS%^|%*\r\n\
+if not \"%~1\"==\"login\" goto respond\r\n\
+set \"stdin=\"\r\n\
+set /p \"stdin=\"\r\n\
+>\"%FAKE_AZ_RESPONSES%\\stdin\" echo(%stdin%\r\n\
+:respond\r\n\
 if exist \"%FAKE_AZ_RESPONSES%\\%key%.err\" type \"%FAKE_AZ_RESPONSES%\\%key%.err\" 1>&2\r\n\
 if exist \"%FAKE_AZ_RESPONSES%\\%key%.out\" type \"%FAKE_AZ_RESPONSES%\\%key%.out\"\r\n\
 if exist \"%FAKE_AZ_RESPONSES%\\%key%.fail\" exit /b 1\r\n\
@@ -110,6 +117,12 @@ impl ScriptedAz {
     pub(crate) fn respond(&self, file: &str, contents: &str) -> Result<(), Box<dyn Error>> {
         fs::write(self.dir.path().join(file), contents)?;
         Ok(())
+    }
+
+    /// What the last `login` read on standard input, without line endings.
+    pub fn stdin(&self) -> Result<String, Box<dyn Error>> {
+        let stdin = fs::read_to_string(self.dir.path().join("stdin"))?;
+        Ok(stdin.trim_end_matches(['\r', '\n']).to_owned())
     }
 
     pub(crate) fn calls(&self) -> Result<Vec<ScriptCall>, Box<dyn Error>> {

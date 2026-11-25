@@ -35,6 +35,12 @@ const LOGIN_FILES: [&str; 8] = [
     "config",
 ];
 
+/// A service principal's certificate, in its sign-in directory.
+const CERTIFICATE: &str = "client-certificate.pem";
+
+/// A PEM certificate and key larger than this is not one.
+const MAX_CERTIFICATE_BYTES: u64 = 1024 * 1024;
+
 /// A login file larger than this is not one `az` wrote.
 const MAX_LOGIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -91,6 +97,34 @@ impl StateDir {
                     ))
                 }
             }
+        })
+        .await
+    }
+
+    /// Copies a service principal's PEM certificate into its sign-in
+    /// directory `dir`, readable by its owner only, and returns the copy.
+    /// `az` reads it again whenever it needs a token, so the block keeps its
+    /// own copy for as long as the sign-in lasts.
+    ///
+    /// # Errors
+    ///
+    /// `invalidParams` when the file cannot be read or is not a PEM file's
+    /// size.
+    pub async fn copy_certificate(&self, from: &Path, dir: &Path) -> Result<PathBuf, PluginError> {
+        let (from, target) = (from.to_owned(), dir.join(CERTIFICATE));
+        blocking(move || {
+            File::open(&from)
+                .and_then(|source| copy_private(source, &target, MAX_CERTIFICATE_BYTES))
+                .map(|()| target)
+                .map_err(|error| {
+                    PluginError::new(
+                        ErrorKind::InvalidParams,
+                        format!(
+                            "The certificate {} could not be copied ({error}). Give the path of a PEM file you can read.",
+                            from.display()
+                        ),
+                    )
+                })
         })
         .await
     }
@@ -200,20 +234,25 @@ fn copy_files(from: &Path, to: &Path) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut target = options.open(to.join(name))?;
-        let copied = io::copy(&mut source.take(MAX_LOGIN_FILE_BYTES + 1), &mut target)?;
-        if copied > MAX_LOGIN_FILE_BYTES {
-            return Err(io::Error::other(format!(
-                "{name} is larger than {MAX_LOGIN_FILE_BYTES} bytes"
-            )));
-        }
-        target.flush()?;
+        copy_private(source, &to.join(name), MAX_LOGIN_FILE_BYTES)
+            .map_err(|error| io::Error::other(format!("{name}: {error}")))?;
     }
     Ok(())
+}
+
+/// Copies `source` to a new file at `target` that only its owner can read
+/// (0600 on Unix), refusing more than `max` bytes.
+fn copy_private(source: File, target: &Path, max: u64) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(target)?;
+    let copied = io::copy(&mut source.take(max + 1), &mut file)?;
+    if copied > max {
+        return Err(io::Error::other(format!("it is larger than {max} bytes")));
+    }
+    file.flush()
 }
 
 #[cfg(test)]
@@ -260,6 +299,35 @@ mod tests {
         let state = StateDir::new(state.path().to_owned());
         assert_eq!(state.copy_login(home.path()).await?, None);
         assert_eq!(fs::read_dir(state.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_certificate_is_copied_into_the_sign_in_for_its_owner_only() -> TestResult {
+        let (source, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let pem = source.path().join("sp.pem");
+        fs::write(&pem, "-----BEGIN PRIVATE KEY-----")?;
+        let state = StateDir::new(state.path().to_owned());
+        let dir = state.create().await?;
+
+        let copy = state.copy_certificate(&pem, &dir).await?;
+        assert!(copy.starts_with(&dir));
+        assert_eq!(fs::read_to_string(&copy)?, "-----BEGIN PRIVATE KEY-----");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&copy)?.permissions().mode() & 0o777, 0o600);
+        }
+        let missing = state
+            .copy_certificate(&source.path().join("gone.pem"), &dir)
+            .await
+            .err()
+            .ok_or("a missing certificate was copied")?;
+        assert_eq!(
+            missing.kind(),
+            runbooks_plugin_protocol::credential::ErrorKind::InvalidParams
+        );
+        assert!(missing.message().contains("gone.pem"), "{missing}");
         Ok(())
     }
 

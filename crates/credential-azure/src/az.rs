@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsString;
+use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -13,12 +14,13 @@ use runbooks_plugin_protocol::credential::ErrorKind;
 use runbooks_plugin_transport::PluginError;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::oneshot;
 
 use crate::claims::{Principal, principal_of_token};
 use crate::ids::{ObjectId, SubscriptionId, TenantId, TenantRef};
+use crate::service_principal::{Credential, Secret, ServicePrincipal};
 
 /// Where the error for a missing `az` sends the person to install it.
 pub const AZ_INSTALL_URL: &str = "https://learn.microsoft.com/cli/azure/install-azure-cli";
@@ -119,6 +121,13 @@ pub trait Az: Send + Sync + 'static {
         device_code: oneshot::Sender<DeviceCode>,
     ) -> impl Future<Output = Result<(), PluginError>> + Send;
 
+    /// Signs `principal` in to `dir`, with no person involved.
+    fn login_service_principal(
+        &self,
+        dir: &AzDir,
+        principal: &ServicePrincipal,
+    ) -> impl Future<Output = Result<(), PluginError>> + Send;
+
     /// Who `dir` is signed in as, in `tenant` or in its default tenant.
     fn principal(
         &self,
@@ -151,11 +160,24 @@ pub trait Az: Send + Sync + 'static {
 }
 
 /// [`Az`] by running the Azure CLI.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AzCli {
     /// `None` when `main` found no `az` on `PATH`.
     program: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
+}
+
+/// The environment's names only: its values may hold the person's secrets.
+impl fmt::Debug for AzCli {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzCli")
+            .field("program", &self.program)
+            .field(
+                "env",
+                &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl AzCli {
@@ -172,6 +194,7 @@ impl AzCli {
         command: &str,
         args: &[&str],
         timeout: Duration,
+        input: Option<&Secret>,
         mut on_stderr_line: impl FnMut(&str) + Send,
     ) -> Result<Vec<u8>, PluginError> {
         let Some(program) = &self.program else {
@@ -185,7 +208,11 @@ impl AzCli {
             .envs(self.env.iter().map(|(key, value)| (key, value)))
             .envs(QUIET)
             .env("AZURE_CONFIG_DIR", &dir.config)
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -202,9 +229,18 @@ impl AzCli {
                 )
             }
         })?;
-        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let (stdin, stdout, stderr) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take());
+        let write = async {
+            if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                // An az that exits without reading it says why on stderr.
+                let _unread = stdin.write_all(input.expose().as_bytes()).await;
+                // Dropping stdin closes it: az reads to the end.
+            }
+        };
         let finished = tokio::time::timeout(timeout, async {
             tokio::join!(
+                write,
                 read_capped(stdout),
                 read_stderr(stderr, &mut on_stderr_line),
                 child.wait()
@@ -226,13 +262,17 @@ impl AzCli {
                 format!("reading the output of {command}: {error}"),
             )
         };
-        let (stdout, stderr, status) = finished;
+        let ((), stdout, stderr, status) = finished;
         let (stdout, stderr, status) = (
             stdout.map_err(read_failed)?,
             stderr.map_err(read_failed)?,
             status.map_err(read_failed)?,
         );
         if !status.success() {
+            let stderr: Vec<String> = match input {
+                Some(secret) => stderr.iter().map(|line| secret.redact(line)).collect(),
+                None => stderr,
+            };
             return Err(failure(command, &stderr));
         }
         stdout.ok_or_else(|| {
@@ -251,7 +291,9 @@ impl AzCli {
     ) -> Result<T, PluginError> {
         let mut args = args.to_vec();
         args.extend(["-o", "json"]);
-        let stdout = self.run(dir, command, &args, AZ_TIMEOUT, |_| ()).await?;
+        let stdout = self
+            .run(dir, command, &args, AZ_TIMEOUT, None, |_| ())
+            .await?;
         // serde's message can quote what it refused, which may be a token.
         serde_json::from_slice(&stdout).map_err(|_refused| {
             PluginError::new(
@@ -278,7 +320,7 @@ impl Az for AzCli {
             args.extend(["--tenant", tenant.as_str()]);
         }
         let mut device_code = Some(device_code);
-        self.run(dir, "az login", &args, LOGIN_TIMEOUT, |line| {
+        self.run(dir, "az login", &args, LOGIN_TIMEOUT, None, |line| {
             if let Some(code) = parse_device_code(line)
                 && let Some(sender) = device_code.take()
             {
@@ -287,6 +329,46 @@ impl Az for AzCli {
             }
         })
         .await
+        .map(drop)
+    }
+
+    /// The secret goes on standard input (`--password=@-`), never in the
+    /// arguments, where other processes can read it.
+    async fn login_service_principal(
+        &self,
+        dir: &AzDir,
+        principal: &ServicePrincipal,
+    ) -> Result<(), PluginError> {
+        let mut args = vec![
+            "login",
+            "--service-principal",
+            "--username",
+            principal.client_id.as_str(),
+            "--tenant",
+            principal.tenant.as_str(),
+            "--allow-no-subscriptions",
+            "-o",
+            "none",
+        ];
+        let command = "az login --service-principal";
+        match &principal.credential {
+            Credential::Secret(secret) => {
+                args.push("--password=@-");
+                self.run(dir, command, &args, AZ_TIMEOUT, Some(secret), |_| ())
+                    .await
+            }
+            Credential::Certificate(path) => {
+                let path = path.to_str().ok_or_else(|| {
+                    PluginError::new(
+                        ErrorKind::InvalidParams,
+                        "the certificate's path is not valid Unicode",
+                    )
+                })?;
+                args.extend(["--certificate", path]);
+                self.run(dir, command, &args, AZ_TIMEOUT, None, |_| ())
+                    .await
+            }
+        }
         .map(drop)
     }
 
@@ -382,7 +464,7 @@ impl Az for AzCli {
             "-o",
             "none",
         ];
-        self.run(dir, "az account set", &args, AZ_TIMEOUT, |_| ())
+        self.run(dir, "az account set", &args, AZ_TIMEOUT, None, |_| ())
             .await
             .map(drop)
     }
@@ -519,6 +601,11 @@ fn failure(command: &str, stderr: &[String]) -> PluginError {
             ErrorKind::Network,
             " Azure could not be reached: check the network connection and any proxy, then try again.",
         )
+    } else if has(&["aadsts7000222"]) {
+        (
+            ErrorKind::Expired,
+            " The service principal's client secret has expired: create a new one.",
+        )
     } else if has(&["aadsts700082", "aadsts70043", "refresh token has expired"]) {
         (
             ErrorKind::Expired,
@@ -529,6 +616,11 @@ fn failure(command: &str, stderr: &[String]) -> PluginError {
         "aadsts50079",
         "aadsts50158",
         "aadsts53003",
+        // A wrong secret or certificate, an app or tenant that isn't there.
+        "aadsts7000215",
+        "aadsts700027",
+        "aadsts700016",
+        "aadsts90002",
         "authorizationfailed",
         "does not have authorization",
     ]) {
@@ -716,6 +808,18 @@ mod tests {
                     "ERROR: HTTPSConnectionPool: Max retries exceeded (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED]')))",
                 ],
                 ErrorKind::TlsError,
+            ),
+            (
+                vec![
+                    "ERROR: AADSTS7000215: Invalid client secret provided. Ensure the secret being sent in the request is the client secret value.",
+                ],
+                ErrorKind::AccessDenied,
+            ),
+            (
+                vec![
+                    "ERROR: AADSTS7000222: The provided client secret keys for app 'x' are expired.",
+                ],
+                ErrorKind::Expired,
             ),
             (
                 vec!["ERROR: The subscription of 'x' doesn't exist in cloud 'AzureCloud'."],

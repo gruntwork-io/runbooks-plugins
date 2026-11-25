@@ -8,7 +8,7 @@ use std::iter;
 use std::path::Path;
 use std::process::Stdio;
 
-use runbooks_credential_azure::host::LocalLogin;
+use runbooks_credential_azure::host::Host;
 use runbooks_credential_azure::{AzurePlugin, InstalledAz};
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use serde_json::{Value, json};
@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::time::timeout;
 
-use crate::fake_az::{CONTOSO, PROD};
+use crate::fake_az::{CLIENT, CONTOSO, PROD};
 use crate::scripted_az::{DEVICE_LINE, ScriptedAz, token};
 use crate::support::{
     App, TestResult, WAIT, assert_valid, at, env_value, error_kind, error_message, sign_in_dirs,
@@ -28,7 +28,7 @@ fn installed(scripted: &ScriptedAz) -> InstalledAz {
 }
 
 async fn start(az: InstalledAz, state: &Path) -> Result<App, Box<dyn Error>> {
-    let mut app = App::start(AzurePlugin::new(LocalLogin::default(), az))?;
+    let mut app = App::start(AzurePlugin::new(Host::new([], cfg!(windows)), az))?;
     app.configure(state).await?;
     Ok(app)
 }
@@ -270,5 +270,50 @@ async fn a_failing_az_answers_with_its_error_line_and_kind() -> TestResult {
         "{message}"
     );
     assert_eq!(sign_in_dirs(state.path())?, Vec::<String>::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_service_principal_secret_goes_to_az_on_stdin_and_back_only_in_env() -> TestResult {
+    // Letters and digits only, so the Windows script can echo it.
+    const SECRET: &str = "Sp7SecretValue9";
+    let (scripted, state) = (ScriptedAz::new()?, tempfile::tempdir()?);
+    scripted.respond(
+        "account-get-access-token.out",
+        &json!({"accessToken": token()}).to_string(),
+    )?;
+    scripted.respond(
+        "account-list.out",
+        &json!([{"id": PROD, "name": "Prod", "tenantId": CONTOSO, "state": "Enabled"}]).to_string(),
+    )?;
+    let mut app = start(installed(&scripted), state.path()).await?;
+    let fields = json!({"clientId": CLIENT, "tenantId": CONTOSO, "clientSecret": SECRET});
+    let identity = app
+        .result(
+            "signIn",
+            sign_in_params("service_principal", &fields, &json!({})),
+        )
+        .await?;
+    assert_eq!(
+        identity["targets"]["subscription"]["id"], PROD,
+        "{identity}"
+    );
+    assert_eq!(scripted.stdin()?, SECRET);
+    for call in scripted.calls()? {
+        assert!(!call.args.contains(SECRET), "{call:?}");
+    }
+    let env = app.result("env", json!({})).await?;
+    assert_eq!(env_value(&env, "ARM_CLIENT_SECRET"), Some(SECRET));
+
+    let written = app.close().await?;
+    let carrying: Vec<&String> = written
+        .iter()
+        .filter(|line| line.contains(SECRET))
+        .collect();
+    assert_eq!(carrying.len(), 1, "only env's result: {carrying:?}");
+    assert!(
+        carrying.iter().all(|line| line.contains("\"values\"")),
+        "{carrying:?}"
+    );
     Ok(())
 }

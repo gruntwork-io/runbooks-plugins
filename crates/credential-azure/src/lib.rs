@@ -1,5 +1,6 @@
 //! `runbooks-credential-azure`: the credential plugin for Runbooks'
-//! `AzureAuth` block. It signs in through the Azure CLI, lets the person
+//! `AzureAuth` block. It signs in through the Azure CLI (a person, or a
+//! service principal with a secret or a certificate), lets the person
 //! choose a tenant and subscription, checks required roles, and hands a run
 //! the variables that `az`, `azurerm`, `azuread` and `azapi` read.
 //!
@@ -16,20 +17,35 @@ pub mod ids;
 mod params;
 mod plugin;
 mod roles;
+pub mod service_principal;
 mod session;
 mod state_dir;
 
 use std::ffi::OsString;
+use std::fmt;
 use std::path::PathBuf;
 
 pub use plugin::{AzurePlugin, Connect, Network};
 use runbooks_plugin_transport::PluginError;
 
 /// The `az` `main` found on `PATH`, if any, run with the host's environment.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct InstalledAz {
     program: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
+}
+
+/// The environment's names only: its values may hold the person's secrets.
+impl fmt::Debug for InstalledAz {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InstalledAz")
+            .field("program", &self.program)
+            .field(
+                "env",
+                &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl InstalledAz {
