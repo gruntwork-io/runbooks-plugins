@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+#MISE description="Write SHA256SUMS for the release assets in a directory, and print it"
+#USAGE arg "[dir]" default="target/dist" help="Directory holding only release assets"
+set -euo pipefail
+# Sorts the glob, so the file is the same on every machine.
+export LC_ALL=C
+
+dir=${usage_dir:?}
+shopt -s nullglob
+assets=()
+for path in "${dir}"/*; do
+  if [[ ${path##*/} == SHA256SUMS ]]; then
+    continue
+  fi
+  if [[ ! -f ${path} ]]; then
+    echo "checksums: ${path} is not a file; ${dir} must hold only release assets." >&2
+    exit 1
+  fi
+  assets+=("${path}")
+done
+if ((${#assets[@]} == 0)); then
+  echo "checksums: ${dir} holds no release assets." >&2
+  exit 1
+fi
+
+sums=$(mktemp "${dir}/.SHA256SUMS.XXXXXX")
+trap 'rm -f "${sums}"' EXIT
+for path in "${assets[@]}"; do
+  hash=$(sha256sum <"${path}")
+  printf '%s  %s\n' "${hash%% *}" "${path##*/}" >>"${sums}"
+done
+mv "${sums}" "${dir}/SHA256SUMS"
+cat "${dir}/SHA256SUMS"
