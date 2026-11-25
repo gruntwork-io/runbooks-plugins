@@ -1,2 +1,6 @@
 [registry]
 global-min-publish-age = "7 days"
+
+# Windows has no vcruntime140.dll unless the Visual C++ Redistributable is installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
