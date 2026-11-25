@@ -20,16 +20,16 @@ pub(crate) const NAMES: [&str; 4] = [
     AWS_REGION,
 ];
 
-pub const ACCESS_KEY_ID: &str = "accessKeyId";
-pub const SECRET_ACCESS_KEY: &str = "secretAccessKey";
-pub const SESSION_TOKEN: &str = "sessionToken";
+pub(crate) const ACCESS_KEY_ID: &str = "accessKeyId";
+pub(crate) const SECRET_ACCESS_KEY: &str = "secretAccessKey";
+pub(crate) const SESSION_TOKEN: &str = "sessionToken";
 /// The region a run gets as `AWS_REGION`, and that keys which name none are
 /// checked in. The block's `defaultRegion` fills it in.
-pub const DEFAULT_REGION: &str = "defaultRegion";
+pub(crate) const DEFAULT_REGION: &str = "defaultRegion";
 
 /// The sign-in methods: the block's tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignInMethod {
+pub(crate) enum SignInMethod {
     Credentials,
 }
 
@@ -49,25 +49,25 @@ const DEFAULT_REGION_FIELD: FieldSpec = FieldSpec {
 };
 
 impl SignInMethod {
-    pub const ALL: [Self; 1] = [Self::Credentials];
+    pub(crate) const ALL: [Self; 1] = [Self::Credentials];
 
-    pub fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|method| method.name() == name)
     }
 
-    pub fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Credentials => "credentials",
         }
     }
 
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Credentials => "Static Credentials",
         }
     }
 
-    fn fields(self) -> &'static [FieldSpec] {
+    const fn fields(self) -> &'static [FieldSpec] {
         match self {
             Self::Credentials => &[
                 FieldSpec {
@@ -132,14 +132,14 @@ pub(crate) fn describe() -> ConfigureResult {
 /// A sign-in's fields, checked against its method's. An empty value counts as
 /// unset: the form sends one for an input left blank.
 #[derive(Clone, Copy)]
-pub struct Fields<'a> {
+pub(crate) struct Fields<'a> {
     values: &'a HashMap<String, String>,
 }
 
 /// What is wrong with a sign-in's fields: every problem at once. Holds field
 /// names only, never a value.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum InvalidFields {
+pub(crate) enum InvalidFields {
     #[error("{}", describe_fields(*method, missing, unknown))]
     Names {
         method: SignInMethod,
@@ -180,7 +180,7 @@ impl<'a> Fields<'a> {
     ///
     /// [`InvalidFields::Names`] listing every required field left unset and
     /// every name the method does not have.
-    pub fn parse(
+    pub(crate) fn parse(
         method: SignInMethod,
         values: &'a HashMap<String, String>,
     ) -> Result<Self, InvalidFields> {
@@ -208,7 +208,7 @@ impl<'a> Fields<'a> {
         }
     }
 
-    pub fn get(self, name: &str) -> Option<&'a str> {
+    pub(crate) fn get(self, name: &str) -> Option<&'a str> {
         self.values
             .get(name)
             .map(String::as_str)
@@ -216,7 +216,7 @@ impl<'a> Fields<'a> {
     }
 
     /// A field `parse` checked is set.
-    pub fn required(self, name: &str) -> &'a str {
+    pub(crate) fn required(self, name: &str) -> &'a str {
         self.get(name).unwrap_or_default()
     }
 
@@ -225,7 +225,7 @@ impl<'a> Fields<'a> {
     /// # Errors
     ///
     /// [`InvalidFields::Region`] when it is set to something else.
-    pub fn region(self, field: &'static str) -> Result<Option<Region>, InvalidFields> {
+    pub(crate) fn region(self, field: &'static str) -> Result<Option<Region>, InvalidFields> {
         self.get(field)
             .map(|value| {
                 Region::parse(value).map_err(|source| InvalidFields::Region { field, source })
