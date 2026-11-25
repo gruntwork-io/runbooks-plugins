@@ -1,8 +1,12 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Tag of the draft release to build, such as v0.1.0
+        required: true
+        type: string
   pull_request:
     paths:
       - .github/workflows/release.yml
@@ -12,12 +16,44 @@ on:
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.version }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  draft:
+    name: Find the draft release's commit
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # Only push access lists draft releases.
+    env:
+      MISE_AUTO_INSTALL: "false"
+    outputs:
+      sha: ${{ steps.draft.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          version: 2026.11.8 # mise.toml's min_version.
+          install_args: gh
+          cache: false
+      - id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.version }}
+        run: |
+          sha=$(mise run draft "${TAG}")
+          echo "sha=${sha}" >>"${GITHUB_OUTPUT}"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: draft
+    # A pull request skips the draft job and builds its own commit.
+    if: ${{ !cancelled() && (needs.draft.result == 'success' || github.event_name == 'pull_request') }}
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +79,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.draft.outputs.sha }}
           persist-credentials: false
       - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
@@ -57,8 +94,8 @@ jobs:
           TARGET: ${{ matrix.target }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # On a tag, the macOS binaries go through the sign job first.
-          name: ${{ github.ref_type == 'tag' && endsWith(matrix.target, '-apple-darwin') && 'unsigned' || 'assets' }}-${{ matrix.target }}
+          # On a release, the macOS binaries go through the sign job first.
+          name: ${{ github.event_name == 'workflow_dispatch' && endsWith(matrix.target, '-apple-darwin') && 'unsigned' || 'assets' }}-${{ matrix.target }}
           path: target/dist/
           if-no-files-found: error
           retention-days: 7
@@ -67,7 +104,7 @@ jobs:
   sign:
     name: Sign and notarize the macOS binaries
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-26
     timeout-minutes: 45
     environment: release
@@ -91,7 +128,7 @@ jobs:
             fi
           done
           if ((${#missing[@]} > 0)); then
-            echo "::error::A tag's macOS binaries are signed, but these repository secrets are not set: ${missing[*]}"
+            echo "::error::A release's macOS binaries are signed, but these repository secrets are not set: ${missing[*]}"
             exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -203,16 +240,16 @@ jobs:
           overwrite: true
 
   release:
-    name: Create the draft release
-    needs: checksums
-    if: github.ref_type == 'tag'
+    name: Attach the assets to the draft release
+    needs: [draft, checksums]
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: write # Creates the draft release and uploads its assets.
+      contents: write # Uploads the draft release's assets.
     env:
       MISE_AUTO_INSTALL: "false"
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -226,34 +263,28 @@ jobs:
         with:
           name: release
           path: target/dist
-      - name: Check the tag names the binaries' version
+      - name: Check the draft's tag names the binaries' version
         run: |
           while read -r _ name; do
             stem=${name%_*_*}
             version=${stem##*_}
             if [[ ${version} != "${TAG#v}" ]]; then
-              echo "::error::The binaries are version ${version}, but the tag is ${TAG}. Tag v${version}, or set the workspace version in Cargo.toml to ${TAG#v}."
+              echo "::error::The binaries are version ${version}, but the draft's tag is ${TAG}. Draft v${version}, or set the workspace version in Cargo.toml to ${TAG#v}."
               exit 1
             fi
           done <target/dist/SHA256SUMS
-      - name: Create the draft, or replace the assets of the tag's draft
+      - name: Replace the draft's assets, if it still targets the commit built
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.draft.outputs.sha }}
         run: |
-          drafts=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[] | select(.tag_name == env.TAG) | .draft')
-          case "${drafts}" in
-          "")
-            gh release create "${TAG}" target/dist/* --repo "${GITHUB_REPOSITORY}" --draft --verify-tag \
-              --title "${TAG}" --generate-notes
-            ;;
-          true)
-            gh release upload "${TAG}" target/dist/* --repo "${GITHUB_REPOSITORY}" --clobber
-            ;;
-          *)
-            echo "::error::${TAG} already has a published release, or more than one release. A run changes only the tag's one draft."
+          target=$(mise run draft "${TAG}")
+          if [[ ${target} != "${SHA}" ]]; then
+            echo "::error::${TAG}'s draft now targets ${target}, but this run built ${SHA}. Run the workflow again."
             exit 1
-            ;;
-          esac
+          fi
+          gh release upload "${TAG}" target/dist/* --repo "${GITHUB_REPOSITORY}" --clobber
       - name: Check the draft holds exactly the assets SHA256SUMS lists
         env:
           GH_TOKEN: ${{ github.token }}
