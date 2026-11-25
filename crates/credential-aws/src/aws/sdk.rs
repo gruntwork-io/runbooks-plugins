@@ -200,3 +200,132 @@ fn chain(error: &(dyn StdError + 'static)) -> String {
     }
     text
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::io;
+
+    use aws_sdk_sts::config::http::HttpResponse;
+    use aws_sdk_sts::error::{ConnectorError, ErrorMetadata, SdkError};
+    use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
+
+    use super::classify;
+    use crate::aws::{AwsError, AwsErrorKind, Service};
+
+    type TestResult = Result<(), Box<dyn Error>>;
+    type StsError = SdkError<GetCallerIdentityError>;
+
+    /// What STS answering `status` with `code` and `message` reads as.
+    fn answered(
+        status: u16,
+        code: &str,
+        message: Option<&str>,
+    ) -> Result<AwsError, Box<dyn Error>> {
+        let mut metadata = ErrorMetadata::builder().code(code);
+        if let Some(message) = message {
+            metadata = metadata.message(message);
+        }
+        let error = StsError::service_error(
+            GetCallerIdentityError::generic(metadata.build()),
+            HttpResponse::new(status.try_into()?, "".into()),
+        );
+        Ok(classify(Service::Sts, &error))
+    }
+
+    fn dispatch(error: ConnectorError) -> AwsError {
+        classify(Service::Sts, &StsError::dispatch_failure(error))
+    }
+
+    #[test]
+    fn aws_error_codes_are_read_into_kinds() -> TestResult {
+        for (status, code, kind) in [
+            (403, "InvalidClientTokenId", AwsErrorKind::Refused),
+            (403, "SignatureDoesNotMatch", AwsErrorKind::Refused),
+            (403, "AccessDenied", AwsErrorKind::Refused),
+            (400, "ExpiredToken", AwsErrorKind::Expired),
+            (400, "RequestExpired", AwsErrorKind::Expired),
+            (400, "Throttling", AwsErrorKind::Unavailable),
+            (503, "ServiceUnavailable", AwsErrorKind::Unavailable),
+            (400, "SomeNewError", AwsErrorKind::Unexpected),
+        ] {
+            assert_eq!(answered(status, code, None)?.kind, kind, "{status} {code}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_answered_error_shows_its_code_and_a_message_it_has() -> TestResult {
+        let error = answered(
+            403,
+            "InvalidClientTokenId",
+            Some("The security token included in the request is invalid."),
+        )?;
+        assert_eq!(
+            error.to_string(),
+            "STS: InvalidClientTokenId: The security token included in the request is invalid."
+        );
+        assert_eq!(
+            answered(403, "AccessDenied", Some(""))?.detail,
+            "AccessDenied"
+        );
+        assert_eq!(answered(403, "AccessDenied", None)?.detail, "AccessDenied");
+        Ok(())
+    }
+
+    #[test]
+    fn a_call_that_ran_out_of_time_timed_out() {
+        let error = classify(Service::Iam, &StsError::timeout_error("operation timeout"));
+        assert_eq!(
+            (error.service, error.kind, error.detail.as_str()),
+            (
+                Service::Iam,
+                AwsErrorKind::TimedOut,
+                "no answer within 30 seconds"
+            )
+        );
+        let error = dispatch(ConnectorError::timeout("connect timeout".into()));
+        assert_eq!(error.kind, AwsErrorKind::TimedOut, "{error}");
+    }
+
+    /// The request never reached AWS: a TLS handshake that failed, or a
+    /// connection that did. The detail names every cause.
+    #[test]
+    fn a_request_that_never_reached_aws_says_why() {
+        let untrusted = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        );
+        let error = dispatch(ConnectorError::io(Box::new(untrusted)));
+        assert_eq!(error.kind, AwsErrorKind::Tls, "{error}");
+        assert!(
+            error
+                .detail
+                .ends_with(": invalid peer certificate: UnknownIssuer"),
+            "{error}"
+        );
+
+        let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused");
+        let error = dispatch(ConnectorError::io(Box::new(refused)));
+        assert_eq!(error.kind, AwsErrorKind::Network, "{error}");
+        assert!(error.detail.starts_with("dispatch failure: "), "{error}");
+        assert!(error.detail.ends_with(": connection refused"), "{error}");
+    }
+
+    #[test]
+    fn an_answer_or_a_request_the_sdk_could_not_handle_is_unexpected() -> TestResult {
+        let error = classify(
+            Service::Sts,
+            &StsError::response_error(
+                "the answer is not XML",
+                HttpResponse::new(200.try_into()?, "".into()),
+            ),
+        );
+        assert_eq!(error.kind, AwsErrorKind::Unexpected);
+        assert!(error.detail.ends_with(": the answer is not XML"), "{error}");
+        let error = classify(Service::Sts, &StsError::construction_failure("no region"));
+        assert_eq!(error.kind, AwsErrorKind::Unexpected);
+        assert!(error.detail.ends_with(": no region"), "{error}");
+        Ok(())
+    }
+}

@@ -113,3 +113,17 @@ impl AwsError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AwsError, AwsErrorKind, Service};
+
+    #[test]
+    fn an_error_names_its_service() {
+        assert_eq!(
+            AwsError::new(Service::Iam, AwsErrorKind::Refused, "AccessDenied").to_string(),
+            "IAM: AccessDenied"
+        );
+        assert_eq!(Service::Sts.to_string(), "STS");
+    }
+}
