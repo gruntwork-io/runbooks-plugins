@@ -476,11 +476,32 @@ impl App {
         self.ok("configure", "configureResult", params).await
     }
 
+    /// Configures the plugin with the block's `settings`.
+    pub(crate) async fn configure_with(
+        &mut self,
+        state_dir: &Path,
+        settings: &Value,
+    ) -> TestResult {
+        let params = configure_params(state_dir, settings)?;
+        self.ok("configure", "configureResult", params).await?;
+        Ok(())
+    }
+
     pub(crate) async fn close(mut self) -> TestResult<Vec<(String, String)>> {
         self.stdin = None;
         timeout(WAIT, self.serve).await???;
         Ok(self.transcript)
     }
+}
+
+/// `configure`'s params, with the block's `settings`.
+pub(crate) fn configure_params(state_dir: &Path, settings: &Value) -> TestResult<Value> {
+    Ok(json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "caller": "runbooks/0.31.0",
+        "stateDir": state_dir.to_str().ok_or("a temp dir is UTF-8")?,
+        "settings": settings,
+    }))
 }
 
 /// The value of `name` in an env result, and whether it is sensitive.

@@ -23,6 +23,7 @@ use crate::oauth::{self, ClientFields, DEFAULT_SCOPES};
 use crate::session::{
     self, Candidate, Constraints, PROJECT, Prover, Session, invalid_params, shown_name,
 };
+use crate::settings::Settings;
 use crate::sources::{self, FoundVars, Prefix, VarCredential};
 
 /// The most projects `targets` lists, as the app did.
@@ -113,6 +114,18 @@ impl<A> State<A> {
 struct Configured<A> {
     api: Arc<A>,
     state_dir: PathBuf,
+    settings: Settings,
+}
+
+// A derive would need `A: Clone`.
+impl<A> Clone for Configured<A> {
+    fn clone(&self) -> Self {
+        Self {
+            api: Arc::clone(&self.api),
+            state_dir: self.state_dir.clone(),
+            settings: self.settings.clone(),
+        }
+    }
 }
 
 // The host's environment and the session hold secrets.
@@ -144,14 +157,10 @@ impl<A: GoogleApi> GooglePlugin<A> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn configured(&self) -> Result<(Arc<A>, PathBuf), PluginError> {
-        self.state()
-            .configured
-            .as_ref()
-            .map(|configured| (Arc::clone(&configured.api), configured.state_dir.clone()))
-            .ok_or_else(|| {
-                PluginError::new(ErrorKind::NotConfigured, "configure has not succeeded")
-            })
+    fn configured(&self) -> Result<Configured<A>, PluginError> {
+        self.state().configured.clone().ok_or_else(|| {
+            PluginError::new(ErrorKind::NotConfigured, "configure has not succeeded")
+        })
     }
 
     fn session(&self) -> Result<Session, PluginError> {
@@ -174,8 +183,11 @@ impl<A: GoogleApi> GooglePlugin<A> {
         candidate: Candidate,
         constraints: &Constraints,
     ) -> Result<Session, PluginError> {
-        let (api, _) = self.configured()?;
-        let session = self.prover(&api).prove(candidate, constraints).await?;
+        let Configured { api, settings, .. } = self.configured()?;
+        let session = self
+            .prover(&api)
+            .prove(settings.apply(candidate), constraints)
+            .await?;
         self.state().session = Some(session.clone());
         Ok(session)
     }
@@ -239,7 +251,7 @@ impl<A: GoogleApi> GooglePlugin<A> {
             file: fields.take("clientFile"),
         };
         let client = oauth::resolve_client(client, &self.host.env).await?;
-        let (api, _) = self.configured()?;
+        let api = self.configured()?.api;
         let scopes = if constraints.scopes.is_empty() {
             DEFAULT_SCOPES.map(str::to_owned).to_vec()
         } else {
@@ -552,6 +564,7 @@ impl<A: GoogleApi> CredentialPlugin for GooglePlugin<A> {
                 params.state_dir
             )));
         }
+        let settings = Settings::parse(params.settings)?;
         files::create_private_dir(&state_dir)
             .await
             .map_err(|error| {
@@ -587,6 +600,7 @@ impl<A: GoogleApi> CredentialPlugin for GooglePlugin<A> {
         self.state().configured = Some(Configured {
             api: Arc::new(api),
             state_dir,
+            settings,
         });
         Ok(ConfigureResult {
             cloud: Some(ConfigureResultCloud::Gcp),
@@ -713,7 +727,7 @@ impl<A: GoogleApi> CredentialPlugin for GooglePlugin<A> {
                 params.level
             )));
         }
-        let (api, _) = self.configured()?;
+        let api = self.configured()?.api;
         let session = self.session()?;
         let origin = Origin::of(&session.credential);
         let token = self.prover(&api).token(&session.credential).await?;
@@ -751,7 +765,7 @@ impl<A: GoogleApi> CredentialPlugin for GooglePlugin<A> {
     }
 
     async fn env(&self) -> Result<EnvResult, PluginError> {
-        let (_, state_dir) = self.configured()?;
+        let state_dir = self.configured()?.state_dir;
         let session = self.session()?;
         let file = match &session.credential {
             Credential::AccessToken(_) => None,
