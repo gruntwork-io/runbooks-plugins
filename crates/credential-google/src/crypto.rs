@@ -1,31 +1,37 @@
-//! The cryptography the plugin needs and the approved crates don't provide:
-//! RS256 signing, SHA-256, base64url, a secure random source and a
-//! constant-time comparison. Every use
-//! goes through [`Crypto`], so filling it in later touches this module and
-//! `main` only. Until then the binary runs with [`NoCrypto`], and the sign-ins
-//! that need it fail with kind `internal`.
+//! The cryptography the plugin needs: RS256 signing, SHA-256 and a secure
+//! random source from rustls' aws-lc-rs provider, base64url from base64, and
+//! a constant-time comparison from subtle.
 
-use serde::Serialize;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rustls::SignatureScheme;
+use rustls::SupportedCipherSuite;
+use rustls::crypto::hash::{Hash, HashAlgorithm};
+use rustls::crypto::{CryptoProvider, aws_lc_rs};
+use rustls::pki_types::PrivatePkcs8KeyDer;
+use rustls::pki_types::pem::PemObject as _;
+use serde_json::json;
+use subtle::ConstantTimeEq as _;
 
 use crate::Secret;
 
+/// Random bytes in a `state` or a PKCE verifier: 43 characters of base64url.
+const RANDOM_BYTES: usize = 32;
+const JWT_HEADER: &str = r#"{"alg":"RS256","typ":"JWT"}"#;
+
 /// The claims of a service account's JWT assertion, which Google's token
 /// endpoint exchanges for an access token.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct JwtClaims {
     /// The service account's email.
-    #[serde(rename = "iss")]
     pub issuer: String,
     /// The scopes asked for, separated by spaces.
     pub scope: String,
     /// The token endpoint.
-    #[serde(rename = "aud")]
     pub audience: String,
     /// Seconds since the Unix epoch.
-    #[serde(rename = "iat")]
     pub issued_at: i64,
     /// Seconds since the Unix epoch.
-    #[serde(rename = "exp")]
     pub expires_at: i64,
 }
 
@@ -47,7 +53,7 @@ pub trait Crypto: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// [`CryptoError::Unavailable`] if there is no secure random source.
+    /// [`CryptoError::Failed`] if the random source fails.
     fn flow_secrets(&self) -> Result<FlowSecrets, CryptoError>;
 
     /// Whether `left` and `right` are equal, taking time that depends on
@@ -70,44 +76,162 @@ pub struct FlowSecrets {
 /// Why a [`Crypto`] call failed.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
-    /// This build cannot do the named operation.
-    #[error("this build cannot {0} yet: it needs a cryptography crate that has not been approved")]
-    Unavailable(&'static str),
+    /// The system's cryptography failed at the named step.
+    #[error("the system's cryptography could not {0}")]
+    Failed(&'static str),
     /// The private key is not a PKCS #8 RSA key in PEM.
     #[error("the private key is not a PKCS #8 RSA key in PEM")]
     InvalidKey,
 }
 
-/// The binary's [`Crypto`] until a cryptography crate is approved.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoCrypto;
+/// [`Crypto`] over rustls' aws-lc-rs provider.
+#[derive(Clone, Copy, Debug)]
+pub struct RustlsCrypto;
 
-impl Crypto for NoCrypto {
-    fn sign_jwt(&self, _claims: &JwtClaims, _private_key: &Secret) -> Result<Secret, CryptoError> {
-        Err(CryptoError::Unavailable(
-            "sign a service account key's token request",
-        ))
+impl Crypto for RustlsCrypto {
+    fn sign_jwt(&self, claims: &JwtClaims, private_key: &Secret) -> Result<Secret, CryptoError> {
+        // The parse error is dropped: it can quote a line of the key.
+        let key = PrivatePkcs8KeyDer::from_pem_slice(private_key.expose().as_bytes())
+            .map_err(|_quotes_the_key| CryptoError::InvalidKey)?;
+        let signer = aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(key.into())
+            .map_err(|_not_a_key| CryptoError::InvalidKey)?
+            .choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
+            .ok_or(CryptoError::InvalidKey)?;
+        let claims = json!({
+            "iss": claims.issuer,
+            "scope": claims.scope,
+            "aud": claims.audience,
+            "iat": claims.issued_at,
+            "exp": claims.expires_at,
+        });
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(JWT_HEADER),
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        );
+        let signature = signer
+            .sign(signing_input.as_bytes())
+            .map_err(|_sign_failed| CryptoError::Failed("sign the token request"))?;
+        Ok(Secret::new(format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature)
+        )))
     }
 
     fn flow_secrets(&self) -> Result<FlowSecrets, CryptoError> {
-        Err(CryptoError::Unavailable("start a browser sign-in"))
+        let provider = aws_lc_rs::default_provider();
+        let verifier = random_text(&provider)?;
+        Ok(FlowSecrets {
+            state: random_text(&provider)?,
+            challenge: challenge(&provider, &verifier)?,
+            verifier: Secret::new(verifier),
+        })
     }
 
-    /// Never reached: without `flow_secrets` no sign-in starts.
-    fn same(&self, _left: &[u8], _right: &[u8]) -> bool {
-        false
+    fn same(&self, left: &[u8], right: &[u8]) -> bool {
+        left.ct_eq(right).into()
     }
+}
+
+/// [`RANDOM_BYTES`] from `provider`'s secure random source, in base64url.
+fn random_text(provider: &CryptoProvider) -> Result<String, CryptoError> {
+    let mut bytes = [0; RANDOM_BYTES];
+    provider
+        .secure_random
+        .fill(&mut bytes)
+        .map_err(|_no_randomness| CryptoError::Failed("read a secure random source"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// The S256 challenge of a PKCE `verifier`.
+fn challenge(provider: &CryptoProvider, verifier: &str) -> Result<String, CryptoError> {
+    let sha256 = provider
+        .cipher_suites
+        .iter()
+        .filter_map(SupportedCipherSuite::tls13)
+        .map(|suite| suite.common.hash_provider)
+        .find(|hash| hash.algorithm() == HashAlgorithm::SHA256)
+        .ok_or(CryptoError::Failed("hash with SHA-256"))?;
+    Ok(URL_SAFE_NO_PAD.encode(Hash::hash(sha256, verifier.as_bytes())))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Crypto, NoCrypto};
+    use rustls::crypto::aws_lc_rs;
 
-    /// Without a random source no two values match, so no state or
-    /// verifier check can pass by default.
+    use super::{Crypto, CryptoError, JwtClaims, RustlsCrypto, challenge};
+    use crate::Secret;
+
     #[test]
-    fn no_crypto_matches_nothing() {
-        assert!(!NoCrypto.same(b"state", b"state"));
-        assert!(!NoCrypto.same(b"", b""));
+    fn the_rfc_7636_verifier_gives_its_challenge() -> Result<(), CryptoError> {
+        // RFC 7636, Appendix B.
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(
+            challenge(&aws_lc_rs::default_provider(), verifier)?,
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn each_sign_in_gets_new_unreserved_secrets() -> Result<(), CryptoError> {
+        let first = RustlsCrypto.flow_secrets()?;
+        let second = RustlsCrypto.flow_secrets()?;
+        for secrets in [&first, &second] {
+            let verifier = secrets.verifier.expose();
+            assert!((43..=128).contains(&verifier.len()), "{verifier}");
+            assert!(
+                verifier
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)),
+                "{verifier}"
+            );
+            assert_eq!(
+                secrets.challenge,
+                challenge(&aws_lc_rs::default_provider(), verifier)?
+            );
+            assert_eq!(secrets.state.len(), 43);
+        }
+        assert_ne!(first.state, second.state);
+        assert_ne!(first.verifier, second.verifier);
+        assert_ne!(first.state, first.verifier.expose());
+        Ok(())
+    }
+
+    #[test]
+    fn same_compares_whole_values() {
+        assert!(RustlsCrypto.same(b"state", b"state"));
+        assert!(RustlsCrypto.same(b"", b""));
+        assert!(!RustlsCrypto.same(b"state", b"statf"));
+        assert!(!RustlsCrypto.same(b"state", b"stat"));
+        assert!(!RustlsCrypto.same(b"stat", b"state"));
+    }
+
+    #[test]
+    fn a_key_that_is_not_pkcs8_rsa_is_invalid_and_never_shown() -> Result<(), String> {
+        let claims = JwtClaims {
+            issuer: "a@b".to_owned(),
+            scope: "s".to_owned(),
+            audience: "a".to_owned(),
+            issued_at: 0,
+            expires_at: 1,
+        };
+        for key in [
+            "SENTINEL-PRIVATE-KEY",
+            "-----BEGIN PRIVATE KEY-----\nSENTINEL-PRIVATE-KEY\n-----END PRIVATE KEY-----\n",
+            "-----BEGIN PRIVATE KEY-----\nU0VOVElORUwtUFJJVkFURS1LRVk=\n-----END PRIVATE KEY-----\n",
+            "-----BEGIN RSA PRIVATE KEY-----\nU0VOVElORUwtUFJJVkFURS1LRVk=\n-----END RSA PRIVATE KEY-----\n",
+        ] {
+            let Err(error) = RustlsCrypto.sign_jwt(&claims, &Secret::new(key)) else {
+                return Err(format!("{key} signed"));
+            };
+            assert!(matches!(error, CryptoError::InvalidKey), "{key}");
+            let shown = format!("{error:?} {error}");
+            assert!(!shown.contains("SENTINEL"), "{shown}");
+            assert!(!shown.contains("U0VOVElORUw"), "{shown}");
+        }
+        Ok(())
     }
 }

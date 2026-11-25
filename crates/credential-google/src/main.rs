@@ -5,7 +5,7 @@ use std::fmt::Display;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use runbooks_credential_google::{GooglePlugin, Host, HttpApi, NoCrypto};
+use runbooks_credential_google::{GooglePlugin, Host, HttpApi, RustlsCrypto};
 use runbooks_plugin_transport::serve_stdio;
 use time::OffsetDateTime;
 
@@ -20,7 +20,7 @@ fn main() -> io::Result<ExitCode> {
         env,
         now: OffsetDateTime::now_utc,
     };
-    let plugin = GooglePlugin::new(host, Box::new(HttpApi::new), NoCrypto);
+    let plugin = GooglePlugin::new(host, Box::new(HttpApi::new), RustlsCrypto);
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

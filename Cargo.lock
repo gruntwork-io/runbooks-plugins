@@ -1854,12 +1854,15 @@ dependencies = [
 name = "runbooks-credential-google"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "jsonschema",
  "reqwest",
  "runbooks-plugin-protocol",
  "runbooks-plugin-transport",
+ "rustls",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "thiserror",
  "time",

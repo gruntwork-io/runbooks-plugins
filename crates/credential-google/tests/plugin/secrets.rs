@@ -1,23 +1,51 @@
 use std::collections::HashMap;
 
-use runbooks_credential_google::{GooglePlugin, Host, OAuthError};
+use runbooks_credential_google::{GooglePlugin, Host, OAuthError, RustlsCrypto, TokenRequest};
 use serde_json::json;
 
 use crate::support::{
-    App, BARE_TOKEN, FakeCrypto, OAUTH_CLIENT_ID, SA_KEY, SA_PRIVATE_KEY, STATE, TestResult,
-    USER_ADC, USER_CLIENT_SECRET, USER_REFRESH_TOKEN, VERIFIER, WAIT, detect, gcloud_root, google,
-    now, redirect, sign_in, start_oauth,
+    App, BARE_TOKEN, OAUTH_CLIENT_ID, TestResult, USER_ADC, USER_CLIENT_SECRET, USER_REFRESH_TOKEN,
+    WAIT, detect, gcloud_root, google, now, query, redirect, rsa_key, sa_key, sign_in, start_oauth,
 };
 
 const CODE: &str = "SENTINEL-CODE";
-const SECRETS: [&str; 6] = [
-    SA_PRIVATE_KEY,
-    USER_REFRESH_TOKEN,
-    USER_CLIENT_SECRET,
-    BARE_TOKEN,
-    VERIFIER,
-    CODE,
-];
+/// Typed where key material goes: in a field's name, a type, a document.
+const TYPED_KEY: &str = "SENTINEL-PRIVATE-KEY";
+
+/// Sends malformed material, typed and detected, around service account
+/// `key`.
+async fn refuse_malformed_material(app: &mut App, key: &str) -> TestResult {
+    let half_key = key.get(..key.len() / 2).ok_or("the key is ASCII")?;
+    app.error(
+        "signIn",
+        sign_in("service_account", &json!({"key": half_key})),
+        "invalidParams",
+    )
+    .await?;
+    let typo = json!({"key": key, format!("x{TYPED_KEY}"): "1"});
+    app.error("signIn", sign_in("service_account", &typo), "invalidParams")
+        .await?;
+    let unsupported = json!({"key": format!("{{\"type\":\"{TYPED_KEY}\"}}")});
+    app.error(
+        "signIn",
+        sign_in("service_account", &unsupported),
+        "invalidParams",
+    )
+    .await?;
+    let values = json!([{"kind": "values", "from": "creds", "values": {"GOOGLE_CREDENTIALS": format!("{{{TYPED_KEY}")}}]);
+    app.error("detect", detect(&values), "invalidParams")
+        .await?;
+    let typed = json!({"configuration": TYPED_KEY});
+    app.error("signIn", sign_in("gcloud", &typed), "invalidParams")
+        .await?;
+    let typed = json!({"configuration": "dev", TYPED_KEY: "1"});
+    app.error("signIn", sign_in("gcloud", &typed), "invalidParams")
+        .await?;
+    let half_client = json!({"clientSecret": USER_CLIENT_SECRET});
+    app.error("signIn", sign_in("oauth", &half_client), "invalidParams")
+        .await?;
+    Ok(())
+}
 
 /// Every call, on its success and failure paths, with secrets in sign-in
 /// fields, detection sources and gcloud's files. Only `env`'s result may
@@ -33,53 +61,42 @@ async fn no_line_but_envs_result_carries_a_secret() -> TestResult {
         ("CI_GOOGLE_CREDENTIALS", USER_ADC),
         ("CLOUDSDK_CONFIG", root.as_str()),
     ];
-    let mut app = App::start(&env, &google, FakeCrypto::default())?;
+    let mut app = App::start(&env, &google)?;
     app.configure(&dir.path().join("state")).await?;
-
-    // Malformed material, typed and detected.
-    let half_key = SA_KEY.get(..SA_KEY.len() / 2).ok_or("SA_KEY is ASCII")?;
-    app.error(
-        "signIn",
-        sign_in("service_account", &json!({"key": half_key})),
-        "invalidParams",
-    )
-    .await?;
-    let typo = json!({"key": SA_KEY, format!("x{SA_PRIVATE_KEY}"): "1"});
-    app.error("signIn", sign_in("service_account", &typo), "invalidParams")
-        .await?;
-    let unsupported = json!({"key": format!("{{\"type\":\"{SA_PRIVATE_KEY}\"}}")});
-    app.error(
-        "signIn",
-        sign_in("service_account", &unsupported),
-        "invalidParams",
-    )
-    .await?;
-    let values = json!([{"kind": "values", "from": "creds", "values": {"GOOGLE_CREDENTIALS": format!("{{{SA_PRIVATE_KEY}")}}]);
-    app.error("detect", detect(&values), "invalidParams")
-        .await?;
-    let typed = json!({"configuration": SA_PRIVATE_KEY});
-    app.error("signIn", sign_in("gcloud", &typed), "invalidParams")
-        .await?;
-    let typed = json!({"configuration": "dev", SA_PRIVATE_KEY: "1"});
-    app.error("signIn", sign_in("gcloud", &typed), "invalidParams")
-        .await?;
-
-    let half_client = json!({"clientSecret": USER_CLIENT_SECRET});
-    app.error("signIn", sign_in("oauth", &half_client), "invalidParams")
-        .await?;
+    let private_key = rsa_key()?;
+    let key = sa_key(&private_key);
+    refuse_malformed_material(&mut app, &key).await?;
 
     // The happy paths, ending in env.
     let fields = json!({"clientId": OAUTH_CLIENT_ID, "clientSecret": USER_CLIENT_SECRET});
     let (id, url) = start_oauth(&mut app, sign_in("oauth", &fields)).await?;
-    let page = redirect(&url, &format!("state={STATE}&code={CODE}")).await?;
-    for secret in SECRETS {
+    let state = query(&url, "state").ok_or("no state")?;
+    let page = redirect(&url, &format!("state={state}&code={CODE}")).await?;
+    let response = app.response("signIn", id, WAIT).await?;
+    assert!(response.get("result").is_some(), "{response}");
+    let requests = google.token_requests();
+    let Some(TokenRequest::AuthorizationCode { code_verifier, .. }) = requests.first() else {
+        return Err(format!("{requests:?}").into());
+    };
+    let mut secrets = vec![
+        TYPED_KEY,
+        USER_REFRESH_TOKEN,
+        USER_CLIENT_SECRET,
+        BARE_TOKEN,
+        CODE,
+        code_verifier.expose(),
+    ];
+    secrets.extend(
+        private_key
+            .lines()
+            .filter(|line| !line.starts_with("-----")),
+    );
+    for secret in &secrets {
         assert!(
             !page.contains(secret),
             "the browser was shown {secret}: {page}"
         );
     }
-    let response = app.response("signIn", id, WAIT).await?;
-    assert!(response.get("result").is_some(), "{response}");
     app.ok("detect", "detectResult", detect(&json!([{"kind": "env"}])))
         .await?;
     let gcloud = json!([{"kind": "named", "name": "adc"}, {"kind": "named", "name": "gcloud"}]);
@@ -89,7 +106,7 @@ async fn no_line_but_envs_result_carries_a_secret() -> TestResult {
     app.ok(
         "signIn",
         "signInResult",
-        sign_in("service_account", &json!({"key": SA_KEY})),
+        sign_in("service_account", &json!({"key": key})),
     )
     .await?;
     app.ok("targets", "targetsResult", json!({"level": "project"}))
@@ -120,7 +137,7 @@ async fn no_line_but_envs_result_carries_a_secret() -> TestResult {
         if method == "env" {
             continue;
         }
-        for secret in SECRETS {
+        for secret in &secrets {
             assert!(!line.contains(secret), "{method} wrote {secret}: {line}");
         }
     }
@@ -158,7 +175,7 @@ fn the_plugins_debug_names_it_and_shows_nothing_it_holds() {
     let plugin = GooglePlugin::new(
         host,
         Box::new(move |_network| Ok(google.clone())),
-        FakeCrypto::default(),
+        RustlsCrypto,
     );
     assert_eq!(format!("{plugin:?}"), "GooglePlugin { .. }");
 }

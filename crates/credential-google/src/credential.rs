@@ -252,7 +252,7 @@ pub(crate) async fn access_token<A: GoogleApi, C: Crypto>(
 
 pub(crate) fn crypto_error(error: &CryptoError) -> PluginError {
     match error {
-        CryptoError::Unavailable(_) => PluginError::new(ErrorKind::Internal, error.to_string()),
+        CryptoError::Failed(_) => PluginError::new(ErrorKind::Internal, error.to_string()),
         CryptoError::InvalidKey => PluginError::new(
             ErrorKind::InvalidParams,
             format!("The service account key's private_key {error}. Download a new JSON key."),

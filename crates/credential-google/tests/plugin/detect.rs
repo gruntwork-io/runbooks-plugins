@@ -2,8 +2,8 @@ use runbooks_credential_google::{OAuthError, TokenRequest};
 use serde_json::{Value, json};
 
 use crate::support::{
-    App, BARE_TOKEN, CLOUD_PLATFORM, FakeCrypto, SA_EMAIL, SA_KEY, TestResult, USER_ADC,
-    USER_CLIENT_SECRET, USER_EMAIL, USER_REFRESH_TOKEN, at, detect, env_value, google,
+    App, BARE_TOKEN, CLOUD_PLATFORM, SA_EMAIL, TestResult, USER_ADC, USER_CLIENT_SECRET,
+    USER_EMAIL, USER_REFRESH_TOKEN, at, detect, env_value, google, rsa_key, sa_key,
 };
 
 #[tokio::test]
@@ -14,7 +14,7 @@ async fn an_access_token_in_the_environment_is_found_with_its_expiry() -> TestRe
         ("GOOGLE_CLOUD_PROJECT", "sandbox-1234"),
         ("CLOUDSDK_COMPUTE_REGION", "europe-west1"),
     ];
-    let mut app = App::start(&env, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&env, &google())?;
     app.configure(dir.path()).await?;
 
     let found = app
@@ -61,11 +61,7 @@ async fn an_access_token_in_the_environment_is_found_with_its_expiry() -> TestRe
 #[tokio::test]
 async fn nothing_set_is_not_found_and_a_project_alone_is_nothing() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let mut app = App::start(
-        &[("GOOGLE_CLOUD_PROJECT", "p")],
-        &google(),
-        FakeCrypto::default(),
-    )?;
+    let mut app = App::start(&[("GOOGLE_CLOUD_PROJECT", "p")], &google())?;
     app.configure(dir.path()).await?;
     let result = app
         .ok("detect", "detectResult", detect(&json!([{"kind": "env"}])))
@@ -82,11 +78,7 @@ async fn a_file_in_the_environment_is_copied_into_the_state_dir() -> TestResult 
     std::fs::write(&adc, USER_ADC)?;
     let adc_path = adc.to_str().ok_or("utf-8")?;
     let google = google();
-    let mut app = App::start(
-        &[("GOOGLE_APPLICATION_CREDENTIALS", adc_path)],
-        &google,
-        FakeCrypto::default(),
-    )?;
+    let mut app = App::start(&[("GOOGLE_APPLICATION_CREDENTIALS", adc_path)], &google)?;
     let state = dir.path().join("state");
     app.configure(&state).await?;
 
@@ -123,9 +115,9 @@ async fn a_file_in_the_environment_is_copied_into_the_state_dir() -> TestResult 
 #[tokio::test]
 async fn an_earlier_blocks_values_are_a_source() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let mut app = App::start(&[], &google(), FakeCrypto::default())?;
+    let mut app = App::start(&[], &google())?;
     app.configure(dir.path()).await?;
-    let values = json!({"GOOGLE_CREDENTIALS": SA_KEY, "GOOGLE_PROJECT": "quota-5678"});
+    let values = json!({"GOOGLE_CREDENTIALS": sa_key(&rsa_key()?), "GOOGLE_PROJECT": "quota-5678"});
     let found = app
         .ok(
             "detect",
@@ -143,11 +135,12 @@ async fn an_earlier_blocks_values_are_a_source() -> TestResult {
 #[tokio::test]
 async fn a_prefix_reads_its_own_names_and_a_bad_one_is_refused_before_any_read() -> TestResult {
     let dir = tempfile::tempdir()?;
+    let key = sa_key(&rsa_key()?);
     let env = [
         ("GOOGLE_OAUTH_ACCESS_TOKEN", BARE_TOKEN),
-        ("CI_GOOGLE_CREDENTIALS", SA_KEY),
+        ("CI_GOOGLE_CREDENTIALS", key.as_str()),
     ];
-    let mut app = App::start(&env, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&env, &google())?;
     app.configure(dir.path()).await?;
     let found = app
         .ok(
@@ -182,7 +175,7 @@ async fn a_credential_that_fails_is_skipped_for_the_next_source() -> TestResult 
         ("GOOGLE_CREDENTIALS", USER_ADC),
         ("CI_GOOGLE_OAUTH_ACCESS_TOKEN", BARE_TOKEN),
     ];
-    let mut app = App::start(&env, &google, FakeCrypto::default())?;
+    let mut app = App::start(&env, &google)?;
     app.configure(dir.path()).await?;
 
     let sources = json!([{"kind": "env"}, {"kind": "env", "prefix": "CI_"}]);
@@ -209,11 +202,12 @@ async fn a_credential_that_fails_is_skipped_for_the_next_source() -> TestResult 
 async fn a_user_credential_missing_a_required_scope_stops_detection() -> TestResult {
     let dir = tempfile::tempdir()?;
     let admin = "https://www.googleapis.com/auth/admin.directory.user";
+    let key = sa_key(&rsa_key()?);
     let env = [
         ("GOOGLE_CREDENTIALS", USER_ADC),
-        ("CI_GOOGLE_CREDENTIALS", SA_KEY),
+        ("CI_GOOGLE_CREDENTIALS", key.as_str()),
     ];
-    let mut app = App::start(&env, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&env, &google())?;
     app.configure(dir.path()).await?;
 
     let params = json!({
@@ -248,7 +242,7 @@ async fn the_pinned_project_wins_and_one_the_identity_cannot_read_does_not_match
         ("GOOGLE_CREDENTIALS", USER_ADC),
         ("GOOGLE_CLOUD_PROJECT", "quota-5678"),
     ];
-    let mut app = App::start(&env, &google, FakeCrypto::default())?;
+    let mut app = App::start(&env, &google)?;
     app.configure(dir.path()).await?;
 
     let pinned = |project: &str| json!({"sources": [{"kind": "env"}], "pins": {"project": project}, "requirements": []});

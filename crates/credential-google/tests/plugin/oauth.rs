@@ -1,13 +1,19 @@
 use std::time::Duration;
 
-use runbooks_credential_google::{NoCrypto, OAuthError, TokenRequest};
+use reqwest::Url;
+use runbooks_credential_google::{OAuthError, TokenRequest};
 use serde_json::{Value, json};
 
 use crate::support::{
-    App, CHALLENGE, CLOUD_PLATFORM, FakeCrypto, OAUTH_CLIENT_ID, STATE, TestResult,
-    USER_CLIENT_SECRET, USER_EMAIL, USER_REFRESH_TOKEN, VERIFIER, at, env_value, google, query,
-    redirect, request, sign_in, start_oauth,
+    App, CLOUD_PLATFORM, OAUTH_CLIENT_ID, TestResult, USER_CLIENT_SECRET, USER_EMAIL,
+    USER_REFRESH_TOKEN, at, env_value, google, query, redirect, request, s256, sign_in,
+    start_oauth,
 };
+
+/// The `state` a sign-in URL carries.
+fn state(url: &Url) -> TestResult<String> {
+    Ok(query(url, "state").ok_or("no state")?)
+}
 
 fn client_fields() -> Value {
     json!({"clientId": OAUTH_CLIENT_ID, "clientSecret": USER_CLIENT_SECRET})
@@ -18,7 +24,7 @@ async fn a_browser_sign_in_ends_in_a_credential_that_refreshes_itself() -> TestR
     let dir = tempfile::tempdir()?;
     let google = google();
     google.code("4/0-code", Ok(Some(USER_REFRESH_TOKEN)));
-    let mut app = App::start(&[], &google, FakeCrypto::default())?;
+    let mut app = App::start(&[], &google)?;
     let state_dir = dir.path().join("state");
     app.configure(&state_dir).await?;
 
@@ -32,9 +38,7 @@ async fn a_browser_sign_in_ends_in_a_credential_that_refreshes_itself() -> TestR
         ("response_type", "code"),
         ("access_type", "offline"),
         ("prompt", "consent"),
-        ("code_challenge", CHALLENGE),
         ("code_challenge_method", "S256"),
-        ("state", STATE),
         (
             "scope",
             "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email openid",
@@ -49,19 +53,23 @@ async fn a_browser_sign_in_ends_in_a_credential_that_refreshes_itself() -> TestR
     );
 
     // Neither a stray request nor a wrong state ends the sign-in.
-    let wrong = redirect(&url, "state=guess&code=4%2F0-code").await?;
-    assert!(wrong.starts_with("HTTP/1.1 400"), "{wrong}");
+    let state = state(&url)?;
+    let guess = state.get(..42).ok_or("state is short")?;
+    for wrong in ["guess", guess] {
+        let shown = redirect(&url, &format!("state={wrong}&code=4%2F0-code")).await?;
+        assert!(shown.starts_with("HTTP/1.1 400"), "{shown}");
+    }
     let host = redirect_uri
         .trim_start_matches("http://")
         .trim_end_matches("/oauth2callback");
     let probe = format!(
-        "GET /oauth2callback?state={STATE}&code=x HTTP/1.1\r\nHost: {host}\r\nSec-Fetch-Dest: image\r\nSec-Fetch-Mode: no-cors\r\n\r\n"
+        "GET /oauth2callback?state={state}&code=x HTTP/1.1\r\nHost: {host}\r\nSec-Fetch-Dest: image\r\nSec-Fetch-Mode: no-cors\r\n\r\n"
     );
     assert!(request(host, &probe).await?.starts_with("HTTP/1.1 404"));
     let favicon = format!("GET /favicon.ico HTTP/1.1\r\nHost: {host}\r\n\r\n");
     assert!(request(host, &favicon).await?.starts_with("HTTP/1.1 404"));
 
-    let page = redirect(&url, &format!("state={STATE}&code=4%2F0-code&scope=openid")).await?;
+    let page = redirect(&url, &format!("state={state}&code=4%2F0-code&scope=openid")).await?;
     assert!(
         page.starts_with("HTTP/1.1 200") && page.contains("signed in"),
         "{page}"
@@ -80,18 +88,25 @@ async fn a_browser_sign_in_ends_in_a_credential_that_refreshes_itself() -> TestR
         "the project is chosen after sign-in"
     );
 
+    // Google gets the verifier whose S256 challenge the sign-in URL carried.
     let requests = google.token_requests();
-    assert!(
-        matches!(
-            requests.first(),
-            Some(TokenRequest::AuthorizationCode { client_id, client_secret, code, code_verifier, redirect_uri: sent })
-                if client_id == OAUTH_CLIENT_ID
-                    && client_secret.expose() == USER_CLIENT_SECRET
-                    && code.expose() == "4/0-code"
-                    && code_verifier.expose() == VERIFIER
-                    && *sent == redirect_uri
-        ),
-        "{requests:?}"
+    let Some(TokenRequest::AuthorizationCode {
+        client_id,
+        client_secret,
+        code,
+        code_verifier,
+        redirect_uri: sent,
+    }) = requests.first()
+    else {
+        return Err(format!("{requests:?}").into());
+    };
+    assert_eq!(client_id, OAUTH_CLIENT_ID);
+    assert_eq!(client_secret.expose(), USER_CLIENT_SECRET);
+    assert_eq!(code.expose(), "4/0-code");
+    assert_eq!(*sent, redirect_uri);
+    assert_eq!(
+        query(&url, "code_challenge"),
+        Some(s256(code_verifier.expose())?)
     );
 
     let env = app.ok("env", "envResult", json!({})).await?;
@@ -113,7 +128,7 @@ async fn a_browser_sign_in_ends_in_a_credential_that_refreshes_itself() -> TestR
 /// Starts a sign-in, checks the client it uses, and declines it.
 async fn client_used(app: &mut App, fields: Value) -> TestResult<Option<String>> {
     let (id, url) = start_oauth(app, sign_in("oauth", &fields)).await?;
-    redirect(&url, &format!("state={STATE}&error=access_denied")).await?;
+    redirect(&url, &format!("state={}&error=access_denied", state(&url)?)).await?;
     let response = app.response("signIn", id, crate::support::WAIT).await?;
     assert_eq!(at(&response, "/error/data/kind"), "cancelled", "{response}");
     Ok(query(&url, "client_id"))
@@ -135,7 +150,7 @@ async fn the_client_comes_from_the_fields_a_file_or_the_environment() -> TestRes
         ("GOOGLE_OAUTH_CLIENT_ID", "from-env-id"),
         ("GOOGLE_OAUTH_CLIENT_SECRET", "s"),
     ];
-    let mut app = App::start(&env, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&env, &google())?;
     app.configure(&dir.path().join("state")).await?;
 
     let fields = json!({"clientId": "from-fields", "clientSecret": "s"});
@@ -157,7 +172,7 @@ async fn the_client_comes_from_the_fields_a_file_or_the_environment() -> TestRes
         ("GOOGLE_OAUTH_CLIENT_ID", "from-env-id"),
         ("GOOGLE_OAUTH_CLIENT_SECRET", "s"),
     ];
-    let mut app = App::start(&env, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&env, &google())?;
     app.configure(&dir.path().join("state")).await?;
     assert_eq!(
         client_used(&mut app, json!({})).await?.as_deref(),
@@ -172,7 +187,7 @@ async fn without_a_whole_client_sign_in_says_how_to_give_one() -> TestResult {
     let web = dir.path().join("web.json");
     std::fs::write(&web, r#"{"web": {"client_id": "a", "client_secret": "b"}}"#)?;
     let web = web.to_str().ok_or("utf-8")?;
-    let mut app = App::start(&[], &google(), FakeCrypto::default())?;
+    let mut app = App::start(&[], &google())?;
     app.configure(&dir.path().join("state")).await?;
     for (fields, expect) in [
         (json!({}), "GOOGLE_OAUTH_CLIENT_CREDENTIALS"),
@@ -193,11 +208,7 @@ async fn without_a_whole_client_sign_in_says_how_to_give_one() -> TestResult {
         assert!(message.contains(expect), "{fields}: {message}");
     }
 
-    let mut app = App::start(
-        &[("GOOGLE_OAUTH_CLIENT_ID", "a")],
-        &google(),
-        FakeCrypto::default(),
-    )?;
+    let mut app = App::start(&[("GOOGLE_OAUTH_CLIENT_ID", "a")], &google())?;
     app.configure(&dir.path().join("state")).await?;
     let error = app
         .error("signIn", sign_in("oauth", &json!({})), "invalidParams")
@@ -216,7 +227,7 @@ async fn the_blocks_required_scopes_are_asked_for_and_checked() -> TestResult {
     let admin = "https://www.googleapis.com/auth/admin.directory.user";
     let google = google();
     google.code("4/0-code", Ok(Some(USER_REFRESH_TOKEN)));
-    let mut app = App::start(&[], &google, FakeCrypto::default())?;
+    let mut app = App::start(&[], &google)?;
     app.configure(&dir.path().join("state")).await?;
 
     let params = json!({
@@ -231,7 +242,7 @@ async fn the_blocks_required_scopes_are_asked_for_and_checked() -> TestResult {
         Some(format!("{CLOUD_PLATFORM} {admin}"))
     );
     // The person unticks the admin scope on Google's consent screen.
-    redirect(&url, &format!("state={STATE}&code=4%2F0-code")).await?;
+    redirect(&url, &format!("state={}&code=4%2F0-code", state(&url)?)).await?;
     let response = app.response("signIn", id, crate::support::WAIT).await?;
     assert_eq!(
         at(&response, "/error/data/kind"),
@@ -252,7 +263,7 @@ async fn a_declined_or_refused_sign_in_says_what_happened() -> TestResult {
     google
         .code("no-refresh", Ok(None))
         .code("bad-client", Err(OAuthError::InvalidClient));
-    let mut app = App::start(&[], &google, FakeCrypto::default())?;
+    let mut app = App::start(&[], &google)?;
     app.configure(&dir.path().join("state")).await?;
 
     for (callback, kind, expect, page) in [
@@ -285,7 +296,7 @@ async fn a_declined_or_refused_sign_in_says_what_happened() -> TestResult {
         ("code=bad-client", "accessDenied", "OAuth client", "200"),
     ] {
         let (id, url) = start_oauth(&mut app, sign_in("oauth", &client_fields())).await?;
-        let shown = redirect(&url, &format!("state={STATE}&{callback}")).await?;
+        let shown = redirect(&url, &format!("state={}&{callback}", state(&url)?)).await?;
         assert!(
             shown.starts_with(&format!("HTTP/1.1 {page}")),
             "{callback}: {shown}"
@@ -309,7 +320,7 @@ async fn a_declined_or_refused_sign_in_says_what_happened() -> TestResult {
 #[tokio::test(start_paused = true)]
 async fn the_sign_in_window_closes_after_five_minutes() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let mut app = App::start(&[], &google(), FakeCrypto::default())?;
+    let mut app = App::start(&[], &google())?;
     app.configure(&dir.path().join("state")).await?;
     let (id, url) = start_oauth(&mut app, sign_in("oauth", &client_fields())).await?;
     let response = app.response("signIn", id, Duration::from_mins(6)).await?;
@@ -328,24 +339,5 @@ async fn the_sign_in_window_closes_after_five_minutes() -> TestResult {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(closed, "still listening");
-    Ok(())
-}
-
-#[tokio::test]
-async fn without_a_random_source_browser_sign_in_says_what_is_missing() -> TestResult {
-    let dir = tempfile::tempdir()?;
-    let mut app = App::start(&[], &google(), NoCrypto)?;
-    app.configure(&dir.path().join("state")).await?;
-    let error = app
-        .error("signIn", sign_in("oauth", &client_fields()), "internal")
-        .await?;
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    assert!(
-        message.contains("cannot start a browser sign-in"),
-        "{message}"
-    );
     Ok(())
 }

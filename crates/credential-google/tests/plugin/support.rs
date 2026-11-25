@@ -4,15 +4,19 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::future::{self, Future};
+use std::io::Write as _;
 use std::path::Path;
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonschema::{Draft, Registry, Validator};
 use reqwest::Url;
 use runbooks_credential_google::{
-    ApiError, Crypto, CryptoError, FlowSecrets, GoogleApi, GooglePlugin, Host, JwtClaims,
-    OAuthError, Project, ProjectPage, Secret, Token, TokenInfo, TokenRequest,
+    ApiError, GoogleApi, GooglePlugin, Host, OAuthError, Project, ProjectPage, RustlsCrypto,
+    Secret, Token, TokenInfo, TokenRequest,
 };
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_transport::{ServeError, serve};
@@ -270,41 +274,88 @@ impl GoogleApi for Google {
     }
 }
 
-/// Signs nothing: an assertion names its issuer, and a key named
-/// `not-a-key` is refused.
-#[derive(Clone, Default)]
-pub(crate) struct FakeCrypto {
-    pub claims: Arc<Mutex<Vec<JwtClaims>>>,
+/// Runs `openssl` with `args` and `input` on standard input. Its seed file,
+/// if it keeps one, goes in `dir`.
+fn openssl(dir: &Path, args: &[&str], input: &[u8]) -> TestResult<Output> {
+    let mut child = Command::new("openssl")
+        .args(args)
+        .env("HOME", dir)
+        .env("RANDFILE", dir.join("rnd"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("openssl has no stdin")?
+        .write_all(input)?;
+    Ok(child.wait_with_output()?)
 }
 
-impl Crypto for FakeCrypto {
-    fn sign_jwt(&self, claims: &JwtClaims, private_key: &Secret) -> Result<Secret, CryptoError> {
-        if private_key.expose() == "not-a-key" {
-            return Err(CryptoError::InvalidKey);
-        }
-        self.claims
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(claims.clone());
-        Ok(Secret::new(format!("header.{}.signature", claims.issuer)))
+/// What `openssl` writes to standard output, if it succeeds.
+fn openssl_output(dir: &Path, args: &[&str], input: &[u8]) -> TestResult<Vec<u8>> {
+    let output = openssl(dir, args, input)?;
+    if !output.status.success() {
+        return Err(format!(
+            "openssl {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
     }
-
-    fn flow_secrets(&self) -> Result<FlowSecrets, CryptoError> {
-        Ok(FlowSecrets {
-            state: STATE.to_owned(),
-            verifier: Secret::new(VERIFIER),
-            challenge: CHALLENGE.to_owned(),
-        })
-    }
-
-    fn same(&self, left: &[u8], right: &[u8]) -> bool {
-        left == right
-    }
+    Ok(output.stdout)
 }
 
-pub(crate) const STATE: &str = "state-4b1d";
-pub(crate) const VERIFIER: &str = "SENTINEL-VERIFIER";
-pub(crate) const CHALLENGE: &str = "challenge-of-the-verifier";
+/// A new key from `openssl genpkey`, in PKCS #8 PEM.
+fn new_key(algorithm: &[&str]) -> TestResult<String> {
+    let dir = tempfile::tempdir()?;
+    let pem = openssl_output(dir.path(), &[&["genpkey"], algorithm].concat(), b"")?;
+    Ok(String::from_utf8(pem)?)
+}
+
+/// A new 2048-bit RSA key, as Google issues.
+pub(crate) fn rsa_key() -> TestResult<String> {
+    new_key(&["-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"])
+}
+
+/// A new P-256 key.
+pub(crate) fn ec_key() -> TestResult<String> {
+    new_key(&["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"])
+}
+
+/// Whether openssl finds `signature` an RS256 signature of `message` by the
+/// public half of `private_key`.
+pub(crate) fn verifies(private_key: &str, message: &[u8], signature: &[u8]) -> TestResult<bool> {
+    let dir = tempfile::tempdir()?;
+    let public_key = dir.path().join("public.pem");
+    let signature_file = dir.path().join("signature");
+    fs::write(
+        &public_key,
+        openssl_output(dir.path(), &["pkey", "-pubout"], private_key.as_bytes())?,
+    )?;
+    fs::write(&signature_file, signature)?;
+    let verify = [
+        "dgst",
+        "-sha256",
+        "-verify",
+        public_key.to_str().ok_or("a temp dir is UTF-8")?,
+        "-signature",
+        signature_file.to_str().ok_or("a temp dir is UTF-8")?,
+    ];
+    Ok(openssl(dir.path(), &verify, message)?.status.success())
+}
+
+/// The S256 PKCE challenge of `verifier`, by openssl.
+pub(crate) fn s256(verifier: &str) -> TestResult<String> {
+    let dir = tempfile::tempdir()?;
+    let digest = openssl_output(
+        dir.path(),
+        &["dgst", "-sha256", "-binary"],
+        verifier.as_bytes(),
+    )?;
+    Ok(URL_SAFE_NO_PAD.encode(digest))
+}
 
 /// The app: it writes the plugin's input and reads every line it writes.
 pub(crate) struct App {
@@ -318,11 +369,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn start<C: Crypto>(
-        env: &[(&str, &str)],
-        google: &Google,
-        crypto: C,
-    ) -> TestResult<Self> {
+    pub(crate) fn start(env: &[(&str, &str)], google: &Google) -> TestResult<Self> {
         let host = Host {
             env: env
                 .iter()
@@ -331,7 +378,11 @@ impl App {
             now,
         };
         let google = google.clone();
-        let plugin = GooglePlugin::new(host, Box::new(move |_network| Ok(google.clone())), crypto);
+        let plugin = GooglePlugin::new(
+            host,
+            Box::new(move |_network| Ok(google.clone())),
+            RustlsCrypto,
+        );
         let (stdin, plugin_stdin) = duplex(1024 * 1024);
         let (plugin_stdout, stdout) = duplex(1024 * 1024);
         let message = json!({ "oneOf": [
@@ -454,10 +505,21 @@ pub(crate) fn env_value<'a>(result: &'a Value, name: &str) -> Option<(&'a str, b
 // Fixtures. No value here is a real credential.
 
 pub(crate) const SA_EMAIL: &str = "deployer@sandbox-1234.iam.gserviceaccount.com";
-/// A service account key. Its `token_uri` points elsewhere; the plugin must
-/// ignore it.
-pub(crate) const SA_KEY: &str = r#"{"type":"service_account","project_id":"sandbox-1234","private_key_id":"0","private_key":"-----BEGIN PRIVATE KEY-----\nSENTINEL-PRIVATE-KEY\n-----END PRIVATE KEY-----\n","client_email":"deployer@sandbox-1234.iam.gserviceaccount.com","client_id":"1","token_uri":"https://token.example.invalid/"}"#;
-pub(crate) const SA_PRIVATE_KEY: &str = "SENTINEL-PRIVATE-KEY";
+
+/// A service account key holding `private_key`, from [`rsa_key`]. Its
+/// `token_uri` points elsewhere; the plugin must ignore it.
+pub(crate) fn sa_key(private_key: &str) -> String {
+    json!({
+        "type": "service_account",
+        "project_id": "sandbox-1234",
+        "private_key_id": "0",
+        "private_key": private_key,
+        "client_email": SA_EMAIL,
+        "client_id": "1",
+        "token_uri": "https://token.example.invalid/",
+    })
+    .to_string()
+}
 
 pub(crate) const USER_EMAIL: &str = "someone@example.com";
 pub(crate) const USER_REFRESH_TOKEN: &str = "SENTINEL-REFRESH-TOKEN";

@@ -1,14 +1,14 @@
 use serde_json::{Value, json};
 
 use crate::support::{
-    App, BARE_TOKEN, FakeCrypto, TestResult, USER_ADC, USER_EMAIL, at, detect, env_value,
-    gcloud_root, google, sign_in,
+    App, BARE_TOKEN, TestResult, USER_ADC, USER_EMAIL, at, detect, env_value, gcloud_root, google,
+    sign_in,
 };
 
 #[tokio::test]
 async fn configure_offers_the_gcloud_method_and_named_sources() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let mut app = App::start(&[], &google(), FakeCrypto::default())?;
+    let mut app = App::start(&[], &google())?;
     let offered = app.configure(dir.path()).await?;
     assert_eq!(at(&offered, "/sources"), json!(["adc", "gcloud"]));
     assert_eq!(
@@ -26,11 +26,7 @@ async fn configure_offers_the_gcloud_method_and_named_sources() -> TestResult {
 async fn the_adc_source_reads_gclouds_file_and_env_hands_a_run_a_copy() -> TestResult {
     let dir = tempfile::tempdir()?;
     let root = gcloud_root(dir.path(), Some(USER_ADC))?;
-    let mut app = App::start(
-        &[("CLOUDSDK_CONFIG", &root)],
-        &google(),
-        FakeCrypto::default(),
-    )?;
+    let mut app = App::start(&[("CLOUDSDK_CONFIG", &root)], &google())?;
     let state = dir.path().join("state");
     app.configure(&state).await?;
 
@@ -74,11 +70,7 @@ async fn the_gcloud_source_uses_the_active_configurations_settings() -> TestResu
     let dir = tempfile::tempdir()?;
     let root = gcloud_root(dir.path(), Some(USER_ADC))?;
     let gcloud = json!([{"kind": "named", "name": "gcloud"}]);
-    let mut app = App::start(
-        &[("CLOUDSDK_CONFIG", &root)],
-        &google(),
-        FakeCrypto::default(),
-    )?;
+    let mut app = App::start(&[("CLOUDSDK_CONFIG", &root)], &google())?;
     app.configure(&dir.path().join("state")).await?;
 
     let found = app.ok("detect", "detectResult", detect(&gcloud)).await?;
@@ -102,7 +94,7 @@ async fn the_gcloud_source_uses_the_active_configurations_settings() -> TestResu
         ("CLOUDSDK_CONFIG", root.as_str()),
         ("CLOUDSDK_ACTIVE_CONFIG_NAME", "default"),
     ];
-    let mut app = App::start(&env, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&env, &google())?;
     app.configure(&dir.path().join("state2")).await?;
     let found = app.ok("detect", "detectResult", detect(&gcloud)).await?;
     assert_eq!(at(&found, "/identity/targets/project/id"), "quota-5678");
@@ -121,11 +113,7 @@ async fn gcloud_without_application_default_credentials_finds_nothing() -> TestR
     let both = json!([{"kind": "named", "name": "adc"}, {"kind": "named", "name": "gcloud"}]);
 
     let bare = gcloud_root(&dir.path().join("bare"), None)?;
-    let mut app = App::start(
-        &[("CLOUDSDK_CONFIG", &bare)],
-        &google(),
-        FakeCrypto::default(),
-    )?;
+    let mut app = App::start(&[("CLOUDSDK_CONFIG", &bare)], &google())?;
     app.configure(&dir.path().join("state")).await?;
     let result = app.ok("detect", "detectResult", detect(&both)).await?;
     assert_eq!(result, json!({"found": false}));
@@ -137,7 +125,7 @@ async fn gcloud_without_application_default_credentials_finds_nothing() -> TestR
     let home = home.to_str().ok_or("utf-8")?;
     let app_data = format!("{home}{}.config", std::path::MAIN_SEPARATOR);
     let defaults = [("HOME", home), ("APPDATA", app_data.as_str())];
-    let mut app = App::start(&defaults, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&defaults, &google())?;
     app.configure(&dir.path().join("state")).await?;
     let found = app.ok("detect", "detectResult", detect(&both)).await?;
     assert_eq!(at(&found, "/source"), "adc");
@@ -148,7 +136,7 @@ async fn gcloud_without_application_default_credentials_finds_nothing() -> TestR
         ("APPDATA", app_data.as_str()),
         ("CLOUDSDK_CONFIG", ""),
     ];
-    let mut app = App::start(&off, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&off, &google())?;
     app.configure(&dir.path().join("state")).await?;
     let result = app.ok("detect", "detectResult", detect(&both)).await?;
     assert_eq!(result, json!({"found": false}));
@@ -163,7 +151,7 @@ async fn a_broken_adc_file_is_skipped_for_the_next_source() -> TestResult {
         ("CLOUDSDK_CONFIG", root.as_str()),
         ("GOOGLE_OAUTH_ACCESS_TOKEN", BARE_TOKEN),
     ];
-    let mut app = App::start(&env, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&env, &google())?;
     app.configure(&dir.path().join("state")).await?;
 
     let sources = json!([{"kind": "named", "name": "adc"}, {"kind": "env"}]);
@@ -192,7 +180,7 @@ async fn a_broken_adc_file_is_skipped_for_the_next_source() -> TestResult {
         ("CLOUDSDK_CONFIG", root.as_str()),
         ("CLOUDSDK_ACTIVE_CONFIG_NAME", "../dev"),
     ];
-    let mut app = App::start(&env, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&env, &google())?;
     app.configure(&dir.path().join("state")).await?;
     let error = app
         .error(
@@ -215,11 +203,7 @@ async fn a_broken_adc_file_is_skipped_for_the_next_source() -> TestResult {
 async fn the_gcloud_method_signs_in_with_the_active_or_a_named_configuration() -> TestResult {
     let dir = tempfile::tempdir()?;
     let root = gcloud_root(dir.path(), Some(USER_ADC))?;
-    let mut app = App::start(
-        &[("CLOUDSDK_CONFIG", &root)],
-        &google(),
-        FakeCrypto::default(),
-    )?;
+    let mut app = App::start(&[("CLOUDSDK_CONFIG", &root)], &google())?;
     app.configure(&dir.path().join("state")).await?;
 
     let identity = app
@@ -278,7 +262,7 @@ async fn the_gcloud_method_says_what_to_run_when_gcloud_has_nothing() -> TestRes
     let dir = tempfile::tempdir()?;
     let state = dir.path().join("state");
 
-    let mut app = App::start(&[], &google(), FakeCrypto::default())?;
+    let mut app = App::start(&[], &google())?;
     app.configure(&state).await?;
     let error = app
         .error("signIn", sign_in("gcloud", &json!({})), "notSignedIn")
@@ -291,11 +275,7 @@ async fn the_gcloud_method_says_what_to_run_when_gcloud_has_nothing() -> TestRes
     );
 
     let bare = gcloud_root(dir.path(), None)?;
-    let mut app = App::start(
-        &[("CLOUDSDK_CONFIG", &bare)],
-        &google(),
-        FakeCrypto::default(),
-    )?;
+    let mut app = App::start(&[("CLOUDSDK_CONFIG", &bare)], &google())?;
     app.configure(&state).await?;
     let error = app
         .error("signIn", sign_in("gcloud", &json!({})), "notSignedIn")
@@ -313,7 +293,7 @@ async fn the_gcloud_method_says_what_to_run_when_gcloud_has_nothing() -> TestRes
         ("CLOUDSDK_CONFIG", bare.as_str()),
         ("CLOUDSDK_ACTIVE_CONFIG_NAME", "staging"),
     ];
-    let mut app = App::start(&env, &google(), FakeCrypto::default())?;
+    let mut app = App::start(&env, &google())?;
     app.configure(&state).await?;
     let error = app
         .error("signIn", sign_in("gcloud", &json!({})), "notSignedIn")
