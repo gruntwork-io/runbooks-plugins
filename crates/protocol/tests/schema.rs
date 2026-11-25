@@ -295,3 +295,36 @@ fn constructed_detect_results_are_valid() -> TestResult {
     }
     Ok(())
 }
+
+// Runbooks 1808ae07 (draft PR #547): a provider gets its block's settings.
+
+fn configure_params(settings: Option<Value>) -> Value {
+    let mut params =
+        json!({"protocolVersion":"1","caller":"runbooks/0.31.0","stateDir":"/tmp/state"});
+    if let (Some(settings), Some(object)) = (settings, params.as_object_mut()) {
+        object.insert("settings".to_owned(), settings);
+    }
+    params
+}
+
+#[test]
+fn configure_params_carry_the_blocks_settings_or_none() -> TestResult {
+    let def = "credential.schema.json#/$defs/configureParams";
+    round_trip::<credential::ConfigureParams>(def, &configure_params(None))?;
+    let params = configure_params(Some(json!({"defaultRegion": "us-west-2"})));
+    round_trip::<credential::ConfigureParams>(def, &params)?;
+    let typed: credential::ConfigureParams = serde_json::from_value(params)?;
+    assert_eq!(
+        typed.settings.get("defaultRegion").map(String::as_str),
+        Some("us-west-2")
+    );
+    Ok(())
+}
+
+#[test]
+fn a_setting_that_is_not_a_string_is_refused() -> TestResult {
+    assert_refused::<credential::ConfigureParams>(
+        "credential.schema.json#/$defs/configureParams",
+        &configure_params(Some(json!({"defaultRegion": 7}))),
+    )
+}
