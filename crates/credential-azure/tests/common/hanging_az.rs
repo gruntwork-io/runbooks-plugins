@@ -187,10 +187,16 @@ fn system32(program: &str) -> PathBuf {
 #[cfg(windows)]
 fn alive(pid: u32) -> bool {
     Command::new(system32("tasklist.exe"))
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .stderr(Stdio::null())
         .output()
-        .is_ok_and(|listed| String::from_utf8_lossy(&listed.stdout).contains(&format!("\"{pid}\"")))
+        .is_ok_and(|listed| {
+            let pid = pid.to_string();
+            listed
+                .stdout
+                .split(u8::is_ascii_whitespace)
+                .any(|word| word == pid.as_bytes())
+        })
 }
 
 #[cfg(windows)]
