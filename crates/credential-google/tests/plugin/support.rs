@@ -1,0 +1,416 @@
+//! The app's side of the pipe, and a fake Google, for the plugin's tests.
+
+use std::collections::HashMap;
+use std::error::Error;
+use std::fs;
+use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use jsonschema::{Draft, Registry, Validator};
+use runbooks_credential_google::{
+    ApiError, Crypto, CryptoError, GoogleApi, GooglePlugin, Host, JwtClaims, OAuthError, Project,
+    ProjectPage, Secret, Token, TokenInfo, TokenRequest,
+};
+use runbooks_plugin_protocol::PROTOCOL_VERSION;
+use runbooks_plugin_transport::{ServeError, serve};
+use serde_json::{Value, json};
+use time::OffsetDateTime;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, duplex};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+const WAIT: Duration = Duration::from_secs(10);
+const SCHEMAS: [&str; 2] = ["base.schema.json", "credential.schema.json"];
+const ROOT: &str = "json-schema:///";
+
+/// The fixed clock every test runs at: 2027-01-15T08:00:00Z.
+pub const NOW: i64 = 1_800_000_000;
+
+pub fn now() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(NOW).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn validator(schema: &Value) -> TestResult<Validator> {
+    let mut registry = Registry::new();
+    for file in SCHEMAS {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schema")
+            .join(file);
+        let contents: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        registry = registry.add(format!("{ROOT}{file}"), contents)?;
+    }
+    let registry = registry.prepare()?;
+    Ok(jsonschema::options()
+        .with_draft(Draft::Draft202012)
+        .with_registry(&registry)
+        .should_validate_formats(true)
+        .build(schema)?)
+}
+
+pub fn assert_valid(def: &str, value: &Value) -> TestResult {
+    validator(&json!({ "$ref": format!("{ROOT}credential.schema.json#/$defs/{def}") }))?
+        .validate(value)
+        .map_err(|e| format!("{def}: {e} in {value}"))?;
+    Ok(())
+}
+
+/// A token for the fake to hand out, and what tokeninfo says about it.
+#[derive(Clone)]
+pub struct Grant {
+    pub access_token: &'static str,
+    pub email: Option<&'static str>,
+    pub scopes: &'static [&'static str],
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Default)]
+struct GoogleState {
+    /// What the token endpoint answers, by refresh token, or `"jwt"` for any
+    /// service account assertion.
+    tokens: HashMap<String, Result<Grant, OAuthError>>,
+    projects: Vec<Project>,
+    /// What `projects.get` answers when it isn't one of `projects`.
+    denied: Vec<String>,
+    token_requests: Vec<TokenRequest>,
+    page_sizes: Vec<u32>,
+}
+
+/// Google, in memory.
+#[derive(Clone, Default)]
+pub struct Google(Arc<Mutex<GoogleState>>);
+
+impl Google {
+    fn with<T>(&self, f: impl FnOnce(&mut GoogleState) -> T) -> T {
+        f(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    pub fn grant(&self, refresh_token: &str, grant: Result<Grant, OAuthError>) -> &Self {
+        self.with(|state| state.tokens.insert(refresh_token.to_owned(), grant));
+        self
+    }
+
+    pub fn project(&self, id: &str, name: &str, state: Option<&str>) -> &Self {
+        self.with(|google| {
+            google.projects.push(Project {
+                id: id.to_owned(),
+                display_name: Some(name.to_owned()),
+                state: state.map(str::to_owned),
+            });
+        });
+        self
+    }
+
+    pub fn deny(&self, project: &str) -> &Self {
+        self.with(|state| state.denied.push(project.to_owned()));
+        self
+    }
+
+    pub fn token_requests(&self) -> Vec<TokenRequest> {
+        self.with(|state| state.token_requests.clone())
+    }
+
+    pub fn page_sizes(&self) -> Vec<u32> {
+        self.with(|state| state.page_sizes.clone())
+    }
+
+    fn grant_for(&self, access_token: &Secret) -> Option<Grant> {
+        self.with(|state| {
+            state
+                .tokens
+                .values()
+                .filter_map(|grant| grant.as_ref().ok())
+                .find(|grant| grant.access_token == access_token.expose())
+                .cloned()
+        })
+    }
+}
+
+impl GoogleApi for Google {
+    async fn token(&self, request: TokenRequest) -> Result<Token, ApiError> {
+        let key = match &request {
+            TokenRequest::Refresh { refresh_token, .. } => refresh_token.expose().to_owned(),
+            TokenRequest::JwtBearer { .. } => "jwt".to_owned(),
+        };
+        let answer = self.with(|state| {
+            state.token_requests.push(request);
+            state.tokens.get(&key).cloned()
+        });
+        match answer {
+            Some(Ok(grant)) => Ok(Token {
+                access_token: Secret::new(grant.access_token),
+            }),
+            Some(Err(error)) => Err(ApiError::Refused(error)),
+            None => Err(ApiError::Refused(OAuthError::InvalidGrant)),
+        }
+    }
+
+    async fn token_info(&self, access_token: &Secret) -> Result<TokenInfo, ApiError> {
+        let grant = self
+            .grant_for(access_token)
+            .ok_or(ApiError::Refused(OAuthError::InvalidToken))?;
+        Ok(TokenInfo {
+            email: grant.email.map(str::to_owned),
+            subject: Some("1234567890".to_owned()),
+            scopes: grant
+                .scopes
+                .iter()
+                .map(|scope| (*scope).to_owned())
+                .collect(),
+            expires_at: grant.expires_at,
+        })
+    }
+
+    async fn search_projects(
+        &self,
+        access_token: &Secret,
+        page_token: Option<&str>,
+        page_size: u32,
+    ) -> Result<ProjectPage, ApiError> {
+        self.grant_for(access_token)
+            .ok_or(ApiError::Refused(OAuthError::InvalidToken))?;
+        let start: usize = page_token
+            .map_or(Ok(0), str::parse)
+            .map_err(|_| ApiError::Malformed)?;
+        self.with(|state| {
+            state.page_sizes.push(page_size);
+            let end = (start + page_size as usize).min(state.projects.len());
+            Ok(ProjectPage {
+                projects: state.projects.get(start..end).unwrap_or_default().to_vec(),
+                next_page_token: (end < state.projects.len()).then(|| end.to_string()),
+            })
+        })
+    }
+
+    async fn get_project(
+        &self,
+        access_token: &Secret,
+        project_id: &str,
+    ) -> Result<Project, ApiError> {
+        self.grant_for(access_token)
+            .ok_or(ApiError::Refused(OAuthError::InvalidToken))?;
+        self.with(|state| {
+            if let Some(project) = state
+                .projects
+                .iter()
+                .find(|project| project.id == project_id)
+            {
+                return Ok(project.clone());
+            }
+            let denied = state.denied.iter().any(|id| id == project_id);
+            Err(ApiError::Status {
+                status: if denied { 403 } else { 503 },
+                rpc_status: Some(
+                    if denied {
+                        "PERMISSION_DENIED"
+                    } else {
+                        "UNAVAILABLE"
+                    }
+                    .to_owned(),
+                ),
+                reasons: Vec::new(),
+            })
+        })
+    }
+}
+
+/// Signs nothing: an assertion names its issuer, and a key named
+/// `not-a-key` is refused.
+#[derive(Clone, Default)]
+pub struct FakeCrypto {
+    pub claims: Arc<Mutex<Vec<JwtClaims>>>,
+}
+
+impl Crypto for FakeCrypto {
+    fn sign_jwt(&self, claims: &JwtClaims, private_key: &Secret) -> Result<Secret, CryptoError> {
+        if private_key.expose() == "not-a-key" {
+            return Err(CryptoError::InvalidKey);
+        }
+        self.claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(claims.clone());
+        Ok(Secret::new(format!("header.{}.signature", claims.issuer)))
+    }
+}
+
+/// The app: it writes the plugin's input and reads every line it writes.
+pub struct App {
+    stdin: Option<DuplexStream>,
+    stdout: Lines<BufReader<DuplexStream>>,
+    serve: JoinHandle<Result<(), ServeError>>,
+    message: Validator,
+    next_id: u64,
+    /// Every line the plugin wrote, with the method of the request it answered.
+    pub transcript: Vec<(String, String)>,
+}
+
+impl App {
+    pub fn start<C: Crypto>(env: &[(&str, &str)], google: &Google, crypto: C) -> TestResult<Self> {
+        let host = Host {
+            env: env
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            now,
+        };
+        let google = google.clone();
+        let plugin = GooglePlugin::new(host, Box::new(move |_network| Ok(google.clone())), crypto);
+        let (stdin, plugin_stdin) = duplex(1024 * 1024);
+        let (plugin_stdout, stdout) = duplex(1024 * 1024);
+        let message = json!({ "oneOf": [
+            { "$ref": format!("{ROOT}base.schema.json#/$defs/resultResponse") },
+            { "$ref": format!("{ROOT}base.schema.json#/$defs/errorResponse") },
+            { "$ref": format!("{ROOT}base.schema.json#/$defs/notification") },
+        ]});
+        Ok(Self {
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout).lines(),
+            serve: tokio::spawn(serve(plugin, plugin_stdin, plugin_stdout)),
+            message: validator(&message)?,
+            next_id: 0,
+            transcript: Vec::new(),
+        })
+    }
+
+    /// Sends one request and returns its response, after any notifications.
+    pub async fn call(&mut self, method: &str, params: Value) -> TestResult<Value> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let stdin = self.stdin.as_mut().ok_or("the plugin's input is closed")?;
+        stdin.write_all(format!("{request}\n").as_bytes()).await?;
+        loop {
+            let line = timeout(WAIT, self.stdout.next_line())
+                .await??
+                .ok_or("the plugin's output ended")?;
+            let message: Value = serde_json::from_str(&line)?;
+            self.message
+                .validate(&message)
+                .map_err(|e| format!("{line}: {e}"))?;
+            self.transcript.push((method.to_owned(), line));
+            if message["id"] == id {
+                return Ok(message);
+            }
+        }
+    }
+
+    /// Calls `method` and returns its result, valid for `def`.
+    pub async fn ok(&mut self, method: &str, def: &str, params: Value) -> TestResult<Value> {
+        let response = self.call(method, params).await?;
+        let result = response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| format!("{method} failed: {response}"))?;
+        assert_valid(def, &result)?;
+        Ok(result)
+    }
+
+    /// Calls `method` and returns its error, asserting its kind.
+    pub async fn error(&mut self, method: &str, params: Value, kind: &str) -> TestResult<Value> {
+        let response = self.call(method, params).await?;
+        let error = response
+            .get("error")
+            .cloned()
+            .ok_or_else(|| format!("{method} succeeded: {response}"))?;
+        assert_eq!(error["data"]["kind"], kind, "{response}");
+        Ok(error)
+    }
+
+    pub async fn configure(&mut self, state_dir: &Path) -> TestResult<Value> {
+        let params = json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "caller": "runbooks/0.31.0",
+            "stateDir": state_dir.to_str().ok_or("a temp dir is UTF-8")?,
+        });
+        self.ok("configure", "configureResult", params).await
+    }
+
+    pub async fn close(mut self) -> TestResult<Vec<(String, String)>> {
+        self.stdin = None;
+        timeout(WAIT, self.serve).await???;
+        Ok(self.transcript)
+    }
+}
+
+/// The value of `name` in an env result, and whether it is sensitive.
+pub fn env_value<'a>(result: &'a Value, name: &str) -> Option<(&'a str, bool, &'a Value)> {
+    result["values"]
+        .as_array()?
+        .iter()
+        .find(|value| value["name"] == name)
+        .and_then(|value| {
+            Some((
+                value["value"].as_str()?,
+                value["sensitive"].as_bool()?,
+                &value["to"],
+            ))
+        })
+}
+
+// Fixtures. No value here is a real credential.
+
+pub const SA_EMAIL: &str = "deployer@sandbox-1234.iam.gserviceaccount.com";
+/// A service account key. Its `token_uri` points elsewhere; the plugin must
+/// ignore it.
+pub const SA_KEY: &str = r#"{"type":"service_account","project_id":"sandbox-1234","private_key_id":"0","private_key":"-----BEGIN PRIVATE KEY-----\nSENTINEL-PRIVATE-KEY\n-----END PRIVATE KEY-----\n","client_email":"deployer@sandbox-1234.iam.gserviceaccount.com","client_id":"1","token_uri":"https://token.example.invalid/"}"#;
+pub const SA_PRIVATE_KEY: &str = "SENTINEL-PRIVATE-KEY";
+
+pub const USER_EMAIL: &str = "someone@example.com";
+pub const USER_REFRESH_TOKEN: &str = "SENTINEL-REFRESH-TOKEN";
+pub const USER_CLIENT_SECRET: &str = "SENTINEL-CLIENT-SECRET";
+/// What `gcloud auth application-default login` writes.
+pub const USER_ADC: &str = r#"{"type":"authorized_user","client_id":"client.apps.googleusercontent.com","client_secret":"SENTINEL-CLIENT-SECRET","refresh_token":"SENTINEL-REFRESH-TOKEN","quota_project_id":"quota-5678"}"#;
+
+pub const CLOUD_PLATFORM: &str = "https://www.googleapis.com/auth/cloud-platform";
+pub const BARE_TOKEN: &str = "ya29.SENTINEL-BARE-TOKEN";
+
+/// A Google that knows the fixtures' credentials and two projects.
+pub fn google() -> Google {
+    let google = Google::default();
+    google
+        .grant(
+            "jwt",
+            Ok(Grant {
+                access_token: "ya29.service-account",
+                email: Some(SA_EMAIL),
+                scopes: &[CLOUD_PLATFORM],
+                expires_at: Some(NOW + 3600),
+            }),
+        )
+        .grant(
+            USER_REFRESH_TOKEN,
+            Ok(Grant {
+                access_token: "ya29.user",
+                email: Some(USER_EMAIL),
+                scopes: &[
+                    CLOUD_PLATFORM,
+                    "https://www.googleapis.com/auth/userinfo.email",
+                    "openid",
+                ],
+                expires_at: Some(NOW + 3600),
+            }),
+        )
+        .grant(
+            "bare",
+            Ok(Grant {
+                access_token: BARE_TOKEN,
+                email: Some(USER_EMAIL),
+                scopes: &[CLOUD_PLATFORM],
+                expires_at: Some(NOW + 1800),
+            }),
+        )
+        .project("sandbox-1234", "Sandbox", Some("ACTIVE"))
+        .project("quota-5678", "Quota", None);
+    google
+}
+
+pub fn sign_in(method: &str, fields: Value) -> Value {
+    json!({"method": method, "fields": fields, "pins": {}, "requirements": []})
+}
+
+pub fn detect(sources: Value) -> Value {
+    json!({"sources": sources, "pins": {}, "requirements": []})
+}
