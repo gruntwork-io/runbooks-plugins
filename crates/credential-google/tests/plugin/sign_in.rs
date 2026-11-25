@@ -230,7 +230,10 @@ async fn service_account_fields_are_checked_before_anything_is_read() -> TestRes
             json!({"key": "{\"type\":\"service_account\",\"client_email\":\"a@b\",\"private_key\":\"not-a-key\"}"}),
             "PKCS #8",
         ),
-        (json!({"key": sa_key(&ec_key()?)}), "PKCS #8 RSA"),
+        (
+            json!({"key": sa_key(&ec_key()?)}),
+            "private_key is not a PKCS #8 RSA key",
+        ),
     ] {
         let error = app
             .error(
