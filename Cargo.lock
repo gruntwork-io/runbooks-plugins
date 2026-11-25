@@ -1285,6 +1285,7 @@ name = "runbooks-credential-azure"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "jsonschema",
  "runbooks-plugin-protocol",
  "runbooks-plugin-transport",
  "serde",

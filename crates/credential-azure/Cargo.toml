@@ -14,9 +14,10 @@ runbooks-plugin-protocol.workspace = true
 runbooks-plugin-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 
 [dev-dependencies]
+jsonschema.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
