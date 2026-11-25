@@ -427,7 +427,7 @@ async fn candidate_from_vars(found: FoundVars, source: &str) -> Result<Candidate
         project: found.project,
         region: found.region,
         zone: found.zone,
-        configuration: None,
+        configuration: found.configuration,
     })
 }
 

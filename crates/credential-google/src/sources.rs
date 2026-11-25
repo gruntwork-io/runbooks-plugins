@@ -21,6 +21,7 @@ const PROJECT_VARS: [&str; 4] = [
 ];
 const REGION_VARS: [&str; 2] = ["CLOUDSDK_COMPUTE_REGION", "GOOGLE_CLOUD_REGION"];
 const ZONE_VARS: [&str; 1] = ["CLOUDSDK_COMPUTE_ZONE"];
+const CONFIGURATION_VARS: [&str; 1] = ["CLOUDSDK_ACTIVE_CONFIG_NAME"];
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -38,6 +39,8 @@ pub(crate) struct FoundVars {
     pub(crate) project: Option<String>,
     pub(crate) region: Option<String>,
     pub(crate) zone: Option<String>,
+    /// The gcloud configuration a run's gcloud uses.
+    pub(crate) configuration: Option<String>,
 }
 
 #[derive(Debug)]
@@ -94,6 +97,7 @@ pub(crate) fn find(vars: &HashMap<String, String>, prefix: &Prefix) -> Option<Fo
         project: first(&PROJECT_VARS),
         region: first(&REGION_VARS),
         zone: first(&ZONE_VARS),
+        configuration: first(&CONFIGURATION_VARS),
     })
 }
 
