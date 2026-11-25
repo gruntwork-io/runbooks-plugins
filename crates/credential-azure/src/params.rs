@@ -215,9 +215,10 @@ pub(crate) fn service_principal(
 /// # Errors
 ///
 /// `invalidParams` for a level the plugin does not declare, a missing
-/// tenant, or an id that is not a GUID.
+/// tenant, a null at either level (neither is optional), or an id that is
+/// not a GUID.
 pub(crate) fn choice(
-    targets: &HashMap<String, String>,
+    targets: &HashMap<String, Option<String>>,
 ) -> Result<(TenantId, Option<SubscriptionId>), PluginError> {
     let mut problems = Problems::default();
     let mut levels: Vec<&String> = targets.keys().collect();
@@ -232,6 +233,7 @@ pub(crate) fn choice(
     let tenant = targets.get(TENANT_LEVEL).map_or_else(
         || Err(format!("targets.{TENANT_LEVEL} is required")),
         |id| {
+            let id = id.as_deref().ok_or_else(|| not_optional(TENANT_LEVEL))?;
             TenantId::parse(id).ok_or_else(|| {
                 format!("targets.{TENANT_LEVEL} must be a tenant id from targets, not {id:?}")
             })
@@ -241,6 +243,10 @@ pub(crate) fn choice(
         problems.add(problem.clone());
     }
     let subscription = targets.get(SUBSCRIPTION_LEVEL).and_then(|id| {
+        let Some(id) = id else {
+            problems.add(not_optional(SUBSCRIPTION_LEVEL));
+            return None;
+        };
         let parsed = SubscriptionId::parse(id);
         if parsed.is_none() {
             problems.add(format!(
@@ -252,6 +258,11 @@ pub(crate) fn choice(
     problems.check("select")?;
     let tenant = tenant.map_err(|problem| PluginError::new(ErrorKind::InvalidParams, problem))?;
     Ok((tenant, subscription))
+}
+
+/// The refusal of a null target at `level`, which is not optional.
+fn not_optional(level: &str) -> String {
+    format!("targets.{level} is null, but the {level} level is not optional")
 }
 
 #[cfg(test)]
@@ -439,11 +450,22 @@ mod tests {
         Ok(())
     }
 
+    /// A select's targets: `None` is a null.
+    fn targets(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.map(str::to_owned)))
+            .collect()
+    }
+
     #[test]
     fn a_choice_needs_a_tenant_and_declared_levels() -> Result<(), Box<dyn std::error::Error>> {
-        let error = choice(&map(&[("subscription", "x"), ("role", "y")]))
-            .err()
-            .ok_or("the choice was accepted")?;
+        let error = choice(&targets(&[
+            ("subscription", Some("x")),
+            ("role", Some("y")),
+        ]))
+        .err()
+        .ok_or("the choice was accepted")?;
         let message = error.message();
         for part in [
             "targets.role",
@@ -452,7 +474,38 @@ mod tests {
         ] {
             assert!(message.contains(part), "{part} in {message}");
         }
-        choice(&map(&[("tenant", "72f988bf-86f1-41af-91ab-2d7cd011db47")]))?;
+        choice(&targets(&[(
+            "tenant",
+            Some("72f988bf-86f1-41af-91ab-2d7cd011db47"),
+        )]))?;
+        Ok(())
+    }
+
+    /// Neither level is optional, so a null at either is refused, not taken
+    /// as no target.
+    #[test]
+    fn a_null_tenant_or_subscription_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let error = choice(&targets(&[("tenant", None), ("subscription", None)]))
+            .err()
+            .ok_or("the choice was accepted")?;
+        assert_eq!(error.kind(), ErrorKind::InvalidParams);
+        for part in [
+            "targets.tenant is null, but the tenant level is not optional",
+            "targets.subscription is null, but the subscription level is not optional",
+        ] {
+            assert!(
+                error.message().contains(part),
+                "{part} in {}",
+                error.message()
+            );
+        }
+        let error = choice(&targets(&[
+            ("tenant", Some("72f988bf-86f1-41af-91ab-2d7cd011db47")),
+            ("subscription", None),
+        ]))
+        .err()
+        .ok_or("a null subscription was taken as none")?;
+        assert_eq!(error.kind(), ErrorKind::InvalidParams);
         Ok(())
     }
 }

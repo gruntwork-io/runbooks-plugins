@@ -76,18 +76,18 @@ impl Session {
         let mut targets = HashMap::new();
         let principal = match &self.stage {
             Stage::Ready(chosen) => {
-                targets.insert(TENANT_LEVEL.to_owned(), tenant_target(&chosen.tenant));
+                targets.insert(TENANT_LEVEL.to_owned(), Some(tenant_target(&chosen.tenant)));
                 if let Some(subscription) = &chosen.subscription {
                     targets.insert(
                         SUBSCRIPTION_LEVEL.to_owned(),
-                        subscription_target(subscription),
+                        Some(subscription_target(subscription)),
                     );
                 }
                 &chosen.principal
             }
             Stage::Choosing { tenant } => {
                 if let Some(tenant) = tenant.as_ref().and_then(|id| self.tenant(id)) {
-                    targets.insert(TENANT_LEVEL.to_owned(), tenant_target(tenant));
+                    targets.insert(TENANT_LEVEL.to_owned(), Some(tenant_target(tenant)));
                 }
                 &self.home
             }

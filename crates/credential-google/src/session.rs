@@ -283,7 +283,7 @@ impl Session {
     pub(crate) fn identity(&self) -> Identity {
         let mut targets = HashMap::new();
         if let Some(project) = &self.project {
-            targets.insert(PROJECT.to_owned(), project.clone());
+            targets.insert(PROJECT.to_owned(), Some(project.clone()));
         }
         Identity {
             expires_at: self.expires_at.map(Timestamp::from),

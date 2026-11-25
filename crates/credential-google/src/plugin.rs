@@ -84,7 +84,7 @@ impl<A> State<A> {
                 "targets has level {level:?}; this plugin's only level is \"project\""
             )));
         }
-        let Some(project) = project.filter(|project| !project.is_empty()) else {
+        let Some(project) = project.flatten().filter(|project| !project.is_empty()) else {
             return Err(invalid_params("select needs targets.project"));
         };
         let names = self.project_names.get(&project).cloned();
@@ -602,6 +602,7 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                 chosen: LevelChosen::AfterSignIn,
                 label: "Project".to_owned(),
                 name: PROJECT.to_owned(),
+                optional: None,
             }],
             methods: methods(),
             names: session::names(),

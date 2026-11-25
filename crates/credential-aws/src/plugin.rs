@@ -569,14 +569,23 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
     /// An account alone is kept for choosing its role; an account with a
     /// role signs in to it.
     async fn select(&self, params: SelectParams) -> Result<SelectResult, PluginError> {
-        for level in params.targets.keys() {
+        for (level, id) in &params.targets {
             known_level(level)?;
+            if id.is_none() {
+                return Err(invalid_params(&format!(
+                    "targets.{level} is null, but AWS's {level} level is not optional"
+                )));
+            }
         }
-        let role = params.targets.get(ROLE);
+        let role = params.targets.get(ROLE).and_then(Option::as_ref);
         let mut login = self.sso_login(if role.is_some() { ROLE } else { ACCOUNT })?;
-        let account = params.targets.get(ACCOUNT).ok_or_else(|| {
-            invalid_params(&"select needs the account: a role is chosen within one")
-        })?;
+        let account = params
+            .targets
+            .get(ACCOUNT)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                invalid_params(&"select needs the account: a role is chosen within one")
+            })?;
         let account = AccountId::parse(account).map_err(|error| invalid_params(&error))?;
         let Some(role) = role else {
             sso::check_choice(&login.pins, &account, None)?;

@@ -477,3 +477,41 @@ fn an_unavailable_method_without_a_known_kind_or_a_message_is_refused() -> TestR
     }
     Ok(())
 }
+
+// Runbooks cd5ebe6b (draft PR #547): a target level can be optional.
+
+#[test]
+fn a_level_may_be_optional() -> TestResult {
+    let def = "credential.schema.json#/$defs/level";
+    let level = json!({"name":"subscription","label":"Subscription","chosen":"afterSignIn","optional":true});
+    round_trip::<credential::Level>(def, &level)?;
+    let typed: credential::Level = serde_json::from_value(level)?;
+    assert_eq!(typed.optional, Some(true));
+    assert_refused::<credential::Level>(
+        def,
+        &json!({"name":"subscription","label":"Subscription","chosen":"afterSignIn","optional":"yes"}),
+    )
+}
+
+#[test]
+fn an_identity_and_a_select_may_hold_a_null_target() -> TestResult {
+    let identity = json!({"principal":"ana@contoso.com","kind":"user","method":"cli","targets":{"tenant":{"id":"11111111-1111-4111-8111-111111111111","name":"Contoso"},"subscription":null}});
+    round_trip::<credential::Identity>("credential.schema.json#/$defs/identity", &identity)?;
+    let typed: credential::Identity = serde_json::from_value(identity)?;
+    assert!(matches!(typed.targets.get("subscription"), Some(None)));
+
+    let select =
+        json!({"targets":{"tenant":"11111111-1111-4111-8111-111111111111","subscription":null}});
+    round_trip::<credential::SelectParams>("credential.schema.json#/$defs/selectParams", &select)?;
+    let typed: credential::SelectParams = serde_json::from_value(select)?;
+    assert!(matches!(typed.targets.get("subscription"), Some(None)));
+    Ok(())
+}
+
+#[test]
+fn a_pin_always_names_a_target() -> TestResult {
+    assert_refused::<credential::Pins>(
+        "credential.schema.json#/$defs/pins",
+        &json!({"subscription": null}),
+    )
+}

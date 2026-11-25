@@ -137,6 +137,7 @@ pub(crate) fn describe() -> ConfigureResult {
         chosen: LevelChosen::AfterSignIn,
         label: label.to_owned(),
         name: name.to_owned(),
+        optional: None,
     };
     ConfigureResult {
         cloud: Some(ConfigureResultCloud::Aws),

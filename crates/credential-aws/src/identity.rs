@@ -173,21 +173,21 @@ impl Principal {
     pub(crate) fn identity(&self, method: &str, expires_at: Option<OffsetDateTime>) -> Identity {
         let mut targets = HashMap::from([(
             ACCOUNT.to_owned(),
-            Target {
+            Some(Target {
                 id: self.account.to_string(),
                 name: self
                     .account_name
                     .clone()
                     .unwrap_or_else(|| self.account.to_string()),
-            },
+            }),
         )]);
         if let Some(role) = &self.role {
             targets.insert(
                 ROLE.to_owned(),
-                Target {
+                Some(Target {
                     id: role.clone(),
                     name: role.clone(),
-                },
+                }),
             );
         }
         Identity {

@@ -157,5 +157,12 @@ async fn targets_and_select_check_their_level_and_the_sign_in() -> TestResult {
     .await?;
     app.error("select", json!({"targets": {}}), "invalidParams")
         .await?;
+    // The project level is not optional, so a null is no project.
+    app.error(
+        "select",
+        json!({"targets": {"project": null}}),
+        "invalidParams",
+    )
+    .await?;
     Ok(())
 }

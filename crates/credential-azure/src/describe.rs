@@ -96,6 +96,7 @@ fn level(name: &str, label: &str) -> Level {
         chosen: LevelChosen::AfterSignIn,
         label: label.to_owned(),
         name: name.to_owned(),
+        optional: None,
     }
 }
 

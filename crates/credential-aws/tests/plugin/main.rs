@@ -1137,6 +1137,29 @@ async fn targets_and_select_have_nothing_to_choose_for_static_keys() -> TestResu
     Ok(())
 }
 
+/// No AWS level is optional, so a null is refused, before the plugin looks
+/// for a sign-in to choose in.
+#[tokio::test]
+async fn select_refuses_a_null_at_either_level() -> TestResult {
+    let mut app = App::start(FakeAws::default(), Environment::default()).await?;
+    for targets in [
+        json!({"account": null}),
+        json!({"account": ACCOUNT, "role": null}),
+    ] {
+        let error = app
+            .fails("select", json!({"targets": targets}), "invalidParams")
+            .await?;
+        assert!(
+            at(&error, "/message")
+                .as_str()
+                .ok_or("message")?
+                .contains("is null, but AWS's"),
+            "{error}"
+        );
+    }
+    Ok(())
+}
+
 // Secrets.
 
 #[tokio::test]

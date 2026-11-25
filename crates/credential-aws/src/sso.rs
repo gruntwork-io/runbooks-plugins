@@ -50,7 +50,7 @@ impl SsoLogin {
                     id: id.to_string(),
                     name: self.account_name(id),
                 };
-                (ACCOUNT.to_owned(), target)
+                (ACCOUNT.to_owned(), Some(target))
             })
             .collect();
         Identity {
