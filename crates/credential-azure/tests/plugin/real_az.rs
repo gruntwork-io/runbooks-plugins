@@ -325,6 +325,10 @@ async fn signs_in_through_the_az_on_path_with_the_blocks_own_config_dir() -> Tes
         "{args:?}"
     );
     assert!(
+        args.contains(&"account list --all -o json --only-show-errors"),
+        "{args:?}"
+    );
+    assert!(
         args.iter()
             .any(|a| a.starts_with("account set --subscription") && a.contains(PROD)),
         "{args:?}"
@@ -336,6 +340,54 @@ async fn signs_in_through_the_az_on_path_with_the_blocks_own_config_dir() -> Tes
             .iter()
             .all(|line| !line.contains("SECRET-SIGNATURE")),
         "the token reached the app: {written:?}"
+    );
+    Ok(())
+}
+
+/// The copy lists the subscriptions az saw at the person's last az login,
+/// so detect fetches them again, as the app does. A sign-in's own list is
+/// fresh.
+#[tokio::test]
+async fn detect_fetches_the_subscriptions_of_the_persons_login_again() -> TestResult {
+    let (scripted, state, local) = (
+        ScriptedAz::new()?,
+        tempfile::tempdir()?,
+        tempfile::tempdir()?,
+    );
+    fs::write(local.path().join("azureProfile.json"), "{}")?;
+    scripted.respond(
+        "account-get-access-token.out",
+        &json!({"accessToken": token()}).to_string(),
+    )?;
+    scripted.respond(
+        "account-list.out",
+        &json!([{"id": PROD, "name": "Prod", "tenantId": CONTOSO, "state": "Enabled"}]).to_string(),
+    )?;
+    let host = Host::new(
+        [(
+            "AZURE_CONFIG_DIR".into(),
+            local.path().as_os_str().to_owned(),
+        )],
+        cfg!(windows),
+    );
+    let mut app = App::start(AzurePlugin::new(host, installed(&scripted)))?;
+    app.configure(state.path()).await?;
+    let cli = detect_params(
+        &json!([{"kind": "named", "name": "cli"}]),
+        &json!({}),
+        &json!([]),
+    );
+    let detected = app.result("detect", cli).await?;
+    assert_eq!(at(&detected, "/found"), true, "{detected}");
+    let listed: Vec<String> = scripted
+        .calls()?
+        .into_iter()
+        .map(|call| call.args)
+        .filter(|args| args.starts_with("account list"))
+        .collect();
+    assert_eq!(
+        listed,
+        ["account list --all --refresh -o json --only-show-errors"]
     );
     Ok(())
 }

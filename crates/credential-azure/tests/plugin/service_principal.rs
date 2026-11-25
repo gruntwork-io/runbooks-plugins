@@ -57,9 +57,20 @@ impl Fixture {
                     tenant.clone(),
                     credential.clone(),
                 )),
-                Call::Login { .. } | Call::SetSubscription { .. } => None,
+                Call::Login { .. }
+                | Call::SetSubscription { .. }
+                | Call::RefreshAccounts { .. } => None,
             })
             .collect()
+    }
+
+    /// Whether `az` was asked to fetch a login's subscriptions again.
+    fn refreshed(&self) -> bool {
+        self.az
+            .world()
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::RefreshAccounts { .. }))
     }
 
     async fn env(&mut self) -> Result<Value, Box<dyn Error>> {
@@ -148,6 +159,7 @@ async fn a_typed_secret_reaches_az_and_env_and_no_other_line() -> TestResult {
         credential,
         &Credential::Secret(Secret::new(SECRET.to_owned()))
     );
+    assert!(!fixture.refreshed(), "a sign-in's own list is fresh");
 
     let env = fixture.env().await?;
     for name in ["ARM_CLIENT_SECRET", "AZURE_CLIENT_SECRET"] {
@@ -310,6 +322,10 @@ async fn detect_reuses_an_earlier_blocks_sign_in_and_its_choice() -> TestResult 
         "earlier tokens"
     );
     assert_eq!(fixture.logins(), Vec::new());
+    assert!(
+        !fixture.refreshed(),
+        "an earlier block's list is as it signed in"
+    );
 
     // Outputs that hold a service principal sign it in afresh.
     let values = json!([{"kind": "values", "from": "earlier", "values": {

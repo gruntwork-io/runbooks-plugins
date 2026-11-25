@@ -71,6 +71,16 @@ pub enum Interactive {
     DeviceCode,
 }
 
+/// Which subscription list [`Az::accounts`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listing {
+    /// The one `az` saved when it signed in.
+    Saved,
+    /// Fetched again from Azure first (`--refresh`). `az` keeps an
+    /// account's saved list when fetching it fails.
+    Refreshed,
+}
+
 /// Where the person enters a device code, and the code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceCode {
@@ -142,8 +152,12 @@ pub trait Az: Send + Sync + 'static {
         tenant: Option<&TenantRef>,
     ) -> impl Future<Output = Result<Principal, PluginError>> + Send;
 
-    /// The subscriptions and tenants `dir`'s login can use.
-    fn accounts(&self, dir: &AzDir) -> impl Future<Output = Result<Accounts, PluginError>> + Send;
+    /// The subscriptions and tenants `dir`'s login can use, from `listing`.
+    fn accounts(
+        &self,
+        dir: &AzDir,
+        listing: Listing,
+    ) -> impl Future<Output = Result<Accounts, PluginError>> + Send;
 
     /// Every tenant the login can see, including those it is a guest in.
     fn tenants(&self, dir: &AzDir)
@@ -431,10 +445,12 @@ impl Az for AzCli {
         })
     }
 
-    async fn accounts(&self, dir: &AzDir) -> Result<Accounts, PluginError> {
-        let raw: Vec<RawAccount> = self
-            .run_json(dir, "az account list", &["account", "list", "--all"])
-            .await?;
+    async fn accounts(&self, dir: &AzDir, listing: Listing) -> Result<Accounts, PluginError> {
+        let args: &[&str] = match listing {
+            Listing::Saved => &["account", "list", "--all"],
+            Listing::Refreshed => &["account", "list", "--all", "--refresh"],
+        };
+        let raw: Vec<RawAccount> = self.run_json(dir, "az account list", args).await?;
         Ok(accounts_of(raw))
     }
 

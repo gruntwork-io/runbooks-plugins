@@ -232,11 +232,16 @@ async fn detect_uses_a_copy_of_the_local_login_and_its_only_subscription() -> Te
     );
     assert_eq!(
         fixture.calls(),
-        [Call::SetSubscription {
-            config,
-            subscription: PROD.to_owned()
-        }],
-        "only the copy's default subscription changes"
+        [
+            Call::RefreshAccounts {
+                config: config.clone()
+            },
+            Call::SetSubscription {
+                config,
+                subscription: PROD.to_owned()
+            }
+        ],
+        "the copy's subscriptions are fetched again, and only its default changes"
     );
     for (name, value) in [
         ("AZURE_TENANT_ID", CONTOSO),
@@ -402,6 +407,13 @@ async fn a_browser_sign_in_says_it_is_waiting() -> TestResult {
         fixture.calls().first(),
         Some(Call::Login { how: Interactive::Browser, tenant: Some(tenant), .. }) if tenant == CONTOSO
     ));
+    assert!(
+        !fixture
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::RefreshAccounts { .. })),
+        "a sign-in's own list is fresh"
+    );
     Ok(())
 }
 

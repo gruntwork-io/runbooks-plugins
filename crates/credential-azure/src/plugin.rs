@@ -25,7 +25,7 @@ use runbooks_plugin_transport::{CredentialPlugin, PluginError, Prompts};
 use serde_json::Map;
 use tokio::sync::{Mutex, oneshot};
 
-use crate::az::{Az, AzDir, Interactive};
+use crate::az::{Az, AzDir, Interactive, Listing};
 use crate::choose::{self, Pins, Resolution, TenantPin};
 use crate::claims::Principal;
 use crate::describe::{self, CLI_SOURCE, SUBSCRIPTION_LEVEL, TENANT_LEVEL};
@@ -165,13 +165,15 @@ impl<C: Connect> AzurePlugin<C> {
         }
     }
 
-    /// A copy of the `az` login in `from`, if it is one the block can use.
+    /// A copy of the `az` login in `from`, with its subscriptions read by
+    /// `listing`, if it is one the block can use.
     async fn detect_copy(
         &self,
         configured: &Configured<C::Az>,
         method: SignInMethod,
         from: &Path,
         extensions: Option<&Path>,
+        listing: Listing,
         constraints: &Constraints,
     ) -> Result<Option<Session>, PluginError> {
         let Some(config) = configured.state.copy_login(from).await? else {
@@ -182,7 +184,15 @@ impl<C: Connect> AzurePlugin<C> {
             Some(_) | None => None,
         };
         let dir = AzDir { config, extensions };
-        let session = establish(&configured.az, method, dir.clone(), constraints, None).await;
+        let session = establish(
+            &configured.az,
+            method,
+            dir.clone(),
+            listing,
+            constraints,
+            None,
+        )
+        .await;
         let session = keep_or_remove(&configured.state, &dir, session).await;
         unusable_is_none(session, &[ErrorKind::NotSignedIn, ErrorKind::Expired])
     }
@@ -199,8 +209,17 @@ impl<C: Connect> AzurePlugin<C> {
             return Ok(None);
         };
         let extensions = local.extension_dir.as_deref();
-        self.detect_copy(configured, SignInMethod::Cli, from, extensions, constraints)
-            .await
+        // The person's login lists the subscriptions az saw when they last
+        // signed in, without any created since.
+        self.detect_copy(
+            configured,
+            SignInMethod::Cli,
+            from,
+            extensions,
+            Listing::Refreshed,
+            constraints,
+        )
+        .await
     }
 
     /// The `env` source: a service principal in the variables whose names
@@ -293,6 +312,7 @@ impl<C: Connect> AzurePlugin<C> {
             method,
             &from,
             extensions.as_deref(),
+            Listing::Saved,
             &constraints,
         )
         .await
@@ -324,6 +344,7 @@ impl<C: Connect> AzurePlugin<C> {
                 &configured.az,
                 method,
                 dir.clone(),
+                Listing::Saved,
                 constraints,
                 Some(principal),
             )
@@ -380,6 +401,7 @@ async fn establish<A: Az>(
     az: &A,
     method: SignInMethod,
     dir: AzDir,
+    listing: Listing,
     constraints: &Constraints,
     service_principal: Option<ServicePrincipal>,
 ) -> Result<Session, PluginError> {
@@ -395,7 +417,7 @@ async fn establish<A: Az>(
             written: written.clone(),
         }),
     };
-    let accounts = az.accounts(&dir).await?;
+    let accounts = az.accounts(&dir, listing).await?;
     // Azure's tenant list adds only names and tenants with no subscription:
     // the sign-in works without it, as it does today, and logs why.
     let listed = az.tenants(&dir).await.unwrap_or_else(|error| {
@@ -643,7 +665,15 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
         };
         let session = async {
             login(&configured.az, how, &dir, tenant.as_ref(), &prompts).await?;
-            establish(&configured.az, method, dir.clone(), &constraints, None).await
+            establish(
+                &configured.az,
+                method,
+                dir.clone(),
+                Listing::Saved,
+                &constraints,
+                None,
+            )
+            .await
         }
         .await;
         let session = keep_or_remove(&configured.state, &dir, session).await?;

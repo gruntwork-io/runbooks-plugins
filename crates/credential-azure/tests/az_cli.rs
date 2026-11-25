@@ -8,7 +8,7 @@ use std::error::Error;
 use std::path::Path;
 use std::time::Duration;
 
-use runbooks_credential_azure::az::{Az, AzCli, AzDir, DeviceCode, Interactive};
+use runbooks_credential_azure::az::{Az, AzCli, AzDir, DeviceCode, Interactive, Listing};
 use runbooks_credential_azure::ids::{ClientId, ObjectId, SubscriptionId, TenantId, TenantRef};
 use runbooks_credential_azure::process_tree::Killer;
 use runbooks_credential_azure::service_principal::{Credential, Secret, ServicePrincipal};
@@ -80,7 +80,7 @@ async fn without_az_every_call_is_tool_missing() -> TestResult {
                 .err(),
             az.login_service_principal(&dir, &principal).await.err(),
             az.principal(&dir, Some(&tenant)).await.err(),
-            az.accounts(&dir).await.err(),
+            az.accounts(&dir, Listing::Saved).await.err(),
             az.tenants(&dir).await.err(),
             az.set_subscription(&dir, &subscription).await.err(),
             az.role_names(&dir, "/", &object_id).await.err(),
@@ -130,8 +130,10 @@ async fn each_call_runs_az_quietly_in_the_sign_ins_config_dir() -> TestResult {
     );
     let (tenant, subscription, object_id) = ids()?;
 
-    let accounts = bounded(Box::pin(az.accounts(&dir))).await??;
+    let accounts = bounded(Box::pin(az.accounts(&dir, Listing::Saved))).await??;
     assert_eq!(accounts.subscriptions.len(), 1);
+    let refreshed = bounded(Box::pin(az.accounts(&dir, Listing::Refreshed))).await??;
+    assert_eq!(refreshed, accounts);
     let principal = bounded(Box::pin(
         az.principal(&dir, Some(&TenantRef::Id(tenant.clone()))),
     ))
@@ -153,7 +155,7 @@ async fn each_call_runs_az_quietly_in_the_sign_ins_config_dir() -> TestResult {
     assert_eq!(roles.into_iter().collect::<Vec<_>>(), ["owner", "reader"]);
 
     let calls = scripted.calls()?;
-    assert_eq!(calls.len(), 5, "{calls:?}");
+    assert_eq!(calls.len(), 6, "{calls:?}");
     let config_dir = config.path().to_str().ok_or("not UTF-8")?;
     let extension_dir = extensions.path().to_str().ok_or("not UTF-8")?;
     for call in &calls {
@@ -163,6 +165,15 @@ async fn each_call_runs_az_quietly_in_the_sign_ins_config_dir() -> TestResult {
         assert!(call.args.contains("--only-show-errors"), "{call:?}");
     }
     let args: Vec<&str> = calls.iter().map(|call| call.args.as_str()).collect();
+    assert_eq!(
+        args.get(..2),
+        Some(
+            &[
+                "account list --all -o json --only-show-errors",
+                "account list --all --refresh -o json --only-show-errors"
+            ][..]
+        )
+    );
     assert!(
         args.iter()
             .any(|a| a.contains(&format!("get-access-token --tenant {CONTOSO}"))),
@@ -258,7 +269,7 @@ async fn a_failure_is_answered_with_its_error_line_and_kind() -> TestResult {
         "{login}"
     );
 
-    let accounts = bounded(Box::pin(az.accounts(&dir)))
+    let accounts = bounded(Box::pin(az.accounts(&dir, Listing::Saved)))
         .await?
         .err()
         .ok_or("account list succeeded")?;

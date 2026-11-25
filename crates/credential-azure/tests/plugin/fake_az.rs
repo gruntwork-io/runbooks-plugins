@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use runbooks_credential_azure::az::{
-    Accounts, Az, AzDir, DeviceCode, Interactive, Subscription, Tenant,
+    Accounts, Az, AzDir, DeviceCode, Interactive, Listing, Subscription, Tenant,
 };
 use runbooks_credential_azure::claims::{Principal, PrincipalKind};
 use runbooks_credential_azure::ids::{ObjectId, SubscriptionId, TenantId, TenantRef};
@@ -68,6 +68,8 @@ pub(crate) enum Call {
         config: PathBuf,
         subscription: String,
     },
+    /// `az account list --refresh`, which rewrites the login's list.
+    RefreshAccounts { config: PathBuf },
     LoginServicePrincipal {
         config: PathBuf,
         client_id: String,
@@ -307,7 +309,16 @@ impl Az for FakeAz {
         future::ready(signed_in(dir).and_then(|()| self.principal_in(tenant)))
     }
 
-    fn accounts(&self, dir: &AzDir) -> impl Future<Output = Result<Accounts, PluginError>> + Send {
+    fn accounts(
+        &self,
+        dir: &AzDir,
+        listing: Listing,
+    ) -> impl Future<Output = Result<Accounts, PluginError>> + Send {
+        if listing == Listing::Refreshed {
+            self.world().calls.push(Call::RefreshAccounts {
+                config: dir.config.clone(),
+            });
+        }
         future::ready(signed_in(dir).map(|()| self.world().accounts.clone()))
     }
 
