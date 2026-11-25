@@ -25,7 +25,9 @@ const PROVIDER_NAME: &str = "runbooks";
 pub struct SdkAws;
 
 impl SdkAws {
-    pub fn new() -> Self {
+    /// Holds nothing: each call builds its SDK client from its keys and region.
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -139,10 +141,16 @@ where
         }
         SdkError::DispatchFailure(_) if is_tls_failure(error) => (AwsErrorKind::Tls, chain(error)),
         SdkError::DispatchFailure(_) => (AwsErrorKind::Network, chain(error)),
-        SdkError::ResponseError(_) => (AwsErrorKind::Unexpected, chain(error)),
-        SdkError::ConstructionFailure(_) => (AwsErrorKind::Unexpected, chain(error)),
-        // SdkError is #[non_exhaustive]: a variant added after this was written.
-        _ => (AwsErrorKind::Unexpected, chain(error)),
+        SdkError::ResponseError(_) | SdkError::ConstructionFailure(_) => {
+            (AwsErrorKind::Unexpected, chain(error))
+        }
+        // SdkError is #[non_exhaustive]: a variant added after this was
+        // written. What its text holds is unvetted and may be AWS's answer,
+        // so say only that the SDK failed.
+        _ => (
+            AwsErrorKind::Unexpected,
+            "the AWS SDK failed in a way this plugin does not know".to_owned(),
+        ),
     };
     AwsError::new(service, kind, detail)
 }

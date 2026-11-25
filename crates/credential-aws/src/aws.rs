@@ -20,17 +20,21 @@ pub use sdk::SdkAws;
 pub struct AwsCredentials {
     /// Not a secret: AWS shows it in logs and the console.
     pub access_key_id: String,
+    /// The key that signs each request.
     pub secret_access_key: Secret,
+    /// The token temporary keys come with. `None` for long-term keys.
     pub session_token: Option<Secret>,
     /// When temporary keys stop working. `None` for keys that don't expire,
     /// or whose expiry isn't known.
     pub expires_at: Option<OffsetDateTime>,
 }
 
-/// Who a set of keys belongs to, from STS GetCallerIdentity.
+/// Who a set of keys belongs to, from STS `GetCallerIdentity`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallerIdentity {
+    /// The account the keys belong to.
     pub account: AccountId,
+    /// The ARN of the user or role the keys belong to.
     pub arn: String,
     /// The account's IAM alias, when IAM lists one to these keys.
     pub alias: Option<String>,
@@ -39,7 +43,7 @@ pub struct CallerIdentity {
 /// The AWS calls the plugin makes. Every method sends the request to the
 /// region it is given; choosing that region is the caller's decision.
 pub trait Aws: Send + Sync + 'static {
-    /// STS GetCallerIdentity, then IAM ListAccountAliases for the alias. A
+    /// STS `GetCallerIdentity`, then IAM `ListAccountAliases` for the alias. A
     /// failure to read the alias is not an error: most roles may not list it.
     fn caller_identity(
         &self,
@@ -51,7 +55,9 @@ pub trait Aws: Send + Sync + 'static {
 /// The AWS service a call went to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Service {
+    /// AWS Security Token Service.
     Sts,
+    /// AWS Identity and Access Management.
     Iam,
 }
 
@@ -75,6 +81,7 @@ pub enum AwsErrorKind {
     Unavailable,
     /// The request did not reach AWS, or no answer came back.
     Network,
+    /// The call did not finish within its time limit.
     TimedOut,
     /// The TLS handshake failed: often a proxy that inspects TLS, with a CA
     /// the plugin does not trust.
@@ -88,12 +95,16 @@ pub enum AwsErrorKind {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{service}: {detail}")]
 pub struct AwsError {
+    /// The service the call went to.
     pub service: Service,
+    /// Why the call failed.
     pub kind: AwsErrorKind,
+    /// For a person to read.
     pub detail: String,
 }
 
 impl AwsError {
+    /// A failed call to `service`.
     pub fn new(service: Service, kind: AwsErrorKind, detail: impl Into<String>) -> Self {
         Self {
             service,

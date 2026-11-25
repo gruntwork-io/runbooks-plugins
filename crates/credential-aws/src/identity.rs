@@ -10,6 +10,7 @@ pub struct AccountId(String);
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{value:?} is not an AWS account id: it should be 12 digits")]
 pub struct InvalidAccountId {
+    /// The refused value, cut to 32 characters.
     pub value: String,
 }
 
@@ -27,6 +28,8 @@ impl AccountId {
         }
     }
 
+    /// The 12 digits.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }

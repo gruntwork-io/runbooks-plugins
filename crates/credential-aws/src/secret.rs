@@ -7,10 +7,13 @@ use std::fmt;
 pub struct Secret(String);
 
 impl Secret {
+    /// Wraps `value`.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
+    /// The value itself.
+    #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
     }

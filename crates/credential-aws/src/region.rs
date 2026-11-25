@@ -2,7 +2,7 @@ use std::fmt;
 
 /// The region a block works in when nothing names one: `defaultRegion`'s
 /// documented default.
-pub const DEFAULT_REGION: &str = "us-east-1";
+const DEFAULT_REGION: &str = "us-east-1";
 
 /// The longest region name accepted. AWS's longest today is 14 characters.
 const MAX_REGION_LEN: usize = 32;
@@ -22,15 +22,16 @@ const MAX_SHOWN_LEN: usize = 20;
 pub struct InvalidRegion {
     /// The value, when it is short enough to show.
     pub value: Option<String>,
+    /// The value's length in characters.
     pub len: usize,
 }
 
 impl InvalidRegion {
     fn shown(&self) -> String {
-        match &self.value {
-            Some(value) => format!("{value:?}"),
-            None => format!("a {}-character value", self.len),
-        }
+        self.value.as_ref().map_or_else(
+            || format!("a {}-character value", self.len),
+            |value| format!("{value:?}"),
+        )
     }
 }
 
@@ -57,10 +58,14 @@ impl Region {
         }
     }
 
+    /// The region a block works in when nothing names one.
+    #[must_use]
     pub fn default_region() -> Self {
         Self(DEFAULT_REGION.to_owned())
     }
 
+    /// The region name.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -68,13 +73,14 @@ impl Region {
     /// The region that hosts STS, IAM and the Account API for this region's
     /// partition: the partition's implicit global region. Calls go there and
     /// not to the region itself, because an opt-in region the account has
-    /// not enabled refuses every call, GetCallerIdentity included, and a call
+    /// not enabled refuses every call, `GetCallerIdentity` included, and a call
     /// to another partition's endpoint refuses its keys.
     ///
     /// The SDK keeps its partition table private to each service crate, so
     /// this copies `implicitGlobalRegion` from it (aws-sdk-sts 1.127.0,
     /// `endpoint_lib.rs`). A region no partition claims is commercial, as in
     /// the SDK.
+    #[must_use]
     pub fn partition_home(&self) -> Self {
         const HOMES: [(&str, &str); 7] = [
             ("us-gov-", "us-gov-west-1"),

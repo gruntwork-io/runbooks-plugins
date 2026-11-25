@@ -1747,13 +1747,8 @@ version = "0.1.0"
 dependencies = [
  "aws-sdk-iam",
  "aws-sdk-sts",
- "jsonschema",
- "runbooks-plugin-protocol",
- "runbooks-plugin-transport",
- "serde_json",
  "thiserror",
  "time",
- "tokio",
 ]
 
 [[package]]
