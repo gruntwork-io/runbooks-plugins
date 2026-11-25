@@ -133,6 +133,44 @@ async fn sso_shows_the_url_and_code_polls_at_awss_pace_and_takes_the_only_role()
     Ok(())
 }
 
+/// The block's `defaultRegion` is the run's when the field is left empty.
+/// IAM Identity Center stays in the SSO region.
+#[tokio::test(start_paused = true)]
+async fn without_a_default_region_field_a_run_gets_the_blocks() -> TestResult {
+    let aws = FakeAws::default()
+        .polls(vec![Ok(approved())])
+        .account(ACCOUNT, "Production", &["deploy"])?
+        .role_keys(ACCOUNT, "deploy", vec![Ok(keys("ASIASSO", IN_AN_HOUR))])
+        .caller("ASIASSO", ACCOUNT, SSO_ARN)?;
+    let mut app = paused(aws.clone()).await?;
+    app.ok(
+        "configure",
+        configure_params(&json!({"defaultRegion": "ap-southeast-2"})),
+        "configureResult",
+    )
+    .await?;
+    let sign_in = json!({
+        "method": "sso",
+        "fields": {"ssoStartUrl": START_URL, "ssoRegion": "eu-west-1"},
+        "pins": {},
+        "requirements": [],
+    });
+    app.ok("signIn", sign_in, "signInResult").await?;
+    let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
+    assert_eq!(
+        values.get("AWS_REGION").ok_or("no region")?.0,
+        "ap-southeast-2"
+    );
+    assert!(
+        aws.sso_log()
+            .iter()
+            .all(|call| call.ends_with("in eu-west-1")),
+        "{:?}",
+        aws.sso_log()
+    );
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_pinned_account_and_role_are_signed_in_to_directly() -> TestResult {
     let aws = FakeAws::default()

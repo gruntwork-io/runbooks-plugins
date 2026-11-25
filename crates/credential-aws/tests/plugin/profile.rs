@@ -1,6 +1,8 @@
 //! The `profile` method, with the real aws-config parser reading files in a
 //! temporary home directory: never the real `~/.aws`.
 
+use std::fmt::Write as _;
+
 use tempfile::TempDir;
 
 use super::*;
@@ -121,6 +123,163 @@ async fn without_a_region_of_its_own_a_profile_takes_the_default_region() -> Tes
         .await?;
     let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
     assert_eq!(values.get("AWS_REGION").ok_or("no region")?.0, "us-east-1");
+
+    // With the field left empty, the block's.
+    app.ok(
+        "configure",
+        configure_params(&json!({"defaultRegion": "eu-north-1"})),
+        "configureResult",
+    )
+    .await?;
+    app.ok("signIn", profile_sign_in("default", &[])?, "signInResult")
+        .await?;
+    let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
+    assert_eq!(values.get("AWS_REGION").ok_or("no region")?.0, "eu-north-1");
+    Ok(())
+}
+
+/// The `profile` field's choices, as (value, label).
+fn profile_choices(configured: &Value) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+    let choices = configured
+        .pointer("/methods")
+        .and_then(Value::as_array)
+        .and_then(|methods| methods.iter().find(|m| m["name"] == "profile"))
+        .and_then(|method| method["fields"].as_array())
+        .and_then(|fields| fields.iter().find(|f| f["name"] == "profile"))
+        .ok_or("a profile field")?
+        .get("choices")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    choices
+        .iter()
+        .map(|choice| {
+            Ok((
+                choice["value"].as_str().ok_or("value")?.to_owned(),
+                choice["label"].as_str().ok_or("label")?.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// As the block's Local Profile tab lists them: static keys, or a role with
+/// a source profile or credential source, once each, sorted. No other field
+/// lists choices, and never a secret one.
+#[tokio::test]
+async fn configure_lists_the_profiles_with_keys_or_a_role_as_the_profile_fields_choices()
+-> TestResult {
+    let config = "
+[profile dev]
+region = eu-west-2
+
+[profile deploy]
+role_arn = arn:aws-us-gov:iam::123456789012:role/deploy
+source_profile = dev
+
+[profile ci]
+role_arn = arn:aws:iam::123456789012:role/ci
+credential_source = Environment
+
+[profile sso-dev]
+sso_session = corp
+sso_account_id = 123456789012
+sso_role_name = Admin
+
+[sso-session corp]
+sso_start_url = https://my-org.awsapps.com/start
+sso_region = eu-west-1
+
+[profile tool]
+credential_process = /abs/path/tool
+
+[profile no-source]
+role_arn = arn:aws:iam::123456789012:role/x
+";
+    let (_home, env) = home(config, KEYS, &[])?;
+    let mut app = App::start(FakeAws::default(), env).await?;
+    let configured = app
+        .ok("configure", configure_params(&json!({})), "configureResult")
+        .await?;
+    let listed: Vec<(String, String)> = ["ci", "default", "deploy", "dev"]
+        .iter()
+        .map(|name| ((*name).to_owned(), (*name).to_owned()))
+        .collect();
+    assert_eq!(profile_choices(&configured)?, listed);
+
+    let fields = configured
+        .get("methods")
+        .and_then(Value::as_array)
+        .ok_or("methods")?
+        .iter()
+        .filter_map(|method| method["fields"].as_array())
+        .flatten();
+    for field in fields {
+        let lists = field
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| !choices.is_empty());
+        assert_eq!(lists, field["name"] == "profile", "{field}");
+        assert!(!(lists && field["secret"] == true), "{field}");
+    }
+    Ok(())
+}
+
+/// As the contract has it: with choices listed, any other profile is refused
+/// before AWS is called. Configuring again reads the files again. With none
+/// listed, the field takes any profile the files have.
+#[tokio::test]
+async fn a_profile_added_after_configure_is_refused_until_configured_again() -> TestResult {
+    let late = "[late]\naws_access_key_id = AKIALATE\naws_secret_access_key = test-secret-access-key-value\n";
+    let aws = FakeAws::default().caller("AKIALATE", ACCOUNT, ROLE_ARN)?;
+
+    let (dir, env) = home("", KEYS, &[])?;
+    let mut app = App::start(aws.clone(), env).await?;
+    fs::write(
+        dir.path().join(".aws/credentials"),
+        format!("{KEYS}\n{late}"),
+    )?;
+    let error = app
+        .fails("signIn", profile_sign_in("late", &[])?, "invalidParams")
+        .await?;
+    let message = message(&error)?;
+    assert!(
+        message.contains("profile \"late\" is not one of the profiles this block lists"),
+        "{message}"
+    );
+    assert_eq!(aws.calls(), []);
+    app.ok("configure", configure_params(&json!({})), "configureResult")
+        .await?;
+    app.ok("signIn", profile_sign_in("late", &[])?, "signInResult")
+        .await?;
+
+    let (dir, env) = home("", "", &[])?;
+    let mut app = App::start(aws.clone(), env).await?;
+    fs::write(dir.path().join(".aws/credentials"), late)?;
+    app.ok("signIn", profile_sign_in("late", &[])?, "signInResult")
+        .await?;
+    Ok(())
+}
+
+/// The schema's 1,000 are listed; past that none are, so the field takes any
+/// name instead of hiding some.
+#[tokio::test]
+async fn more_profiles_than_the_schema_allows_list_none() -> TestResult {
+    for (count, listed) in [(1000, 1000), (1001, 0)] {
+        let mut credentials = String::new();
+        for i in 0..count {
+            writeln!(credentials, "[p{i:04}]\naws_access_key_id = AKIA{i}")?;
+        }
+        let (_home, env) = home("", &credentials, &[])?;
+        let mut app = App::start(FakeAws::default(), env).await?;
+        let configured = app
+            .ok("configure", configure_params(&json!({})), "configureResult")
+            .await?;
+        let choices = profile_choices(&configured)?;
+        assert_eq!(choices.len(), listed, "{count} profiles");
+        if let (Some(first), Some(last)) = (choices.first(), choices.last()) {
+            assert_eq!((first.0.as_str(), last.0.as_str()), ("p0000", "p0999"));
+        }
+    }
     Ok(())
 }
 
@@ -355,6 +514,11 @@ async fn a_file_that_does_not_parse_names_its_line_and_never_its_values() -> Tes
         &[],
     )?;
     let mut app = App::start(FakeAws::default(), env).await?;
+    // configure lists no profiles, and refuses nothing.
+    let configured = app
+        .ok("configure", configure_params(&json!({})), "configureResult")
+        .await?;
+    assert_eq!(profile_choices(&configured)?, Vec::new());
     let error = app
         .fails("signIn", profile_sign_in("dev", &[])?, "invalidParams")
         .await?;

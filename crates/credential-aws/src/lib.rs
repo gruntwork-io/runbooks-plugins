@@ -1,5 +1,8 @@
 //! The Runbooks credential plugin for AWS, behind the `AwsAuth` block.
 //!
+//! - **Settings**: `defaultRegion`, the run's region when the credential
+//!   and the sign-in's Default Region field name none (us-east-1 when
+//!   unset). Any other setting is refused.
 //! - **Detection** reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 //!   `AWS_SESSION_TOKEN`, `AWS_REGION` (then `AWS_DEFAULT_REGION`) and
 //!   `AWS_CREDENTIAL_EXPIRATION` from the environment, under a prefix when
@@ -10,6 +13,8 @@
 //!   `profile`, a profile from the shared AWS files with static keys or a
 //!   role to assume, found where `AWS_CONFIG_FILE`,
 //!   `AWS_SHARED_CREDENTIALS_FILE` and `HOME` in the plugin's environment say.
+//!   `configure` lists the profiles with keys or a role, sorted, as the
+//!   field's choices; signing in with a profile it did not list is refused.
 //! - Every credential is checked with STS `GetCallerIdentity`, in the home
 //!   region of its region's partition, before it is used.
 //! - **Pins** are keyed by level: `account` (`ssoAccountId`) and `role`
@@ -29,6 +34,7 @@ mod plugin;
 mod profile;
 mod region;
 mod secret;
+mod settings;
 mod sso;
 
 pub use aws::{

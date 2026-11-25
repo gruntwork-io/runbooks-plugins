@@ -20,7 +20,7 @@ use runbooks_credential_aws::{
     TokenPoll,
 };
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
-use runbooks_plugin_protocol::credential::DetectParams;
+use runbooks_plugin_protocol::credential::{DetectParams, ErrorKind};
 use runbooks_plugin_transport::{CredentialPlugin, ServeError, serve};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -541,6 +541,11 @@ impl App {
     }
 }
 
+/// `configure`'s params, with the block's `settings`.
+fn configure_params(settings: &Value) -> Value {
+    json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/state/aws-auth", "settings": settings})
+}
+
 fn keys_sign_in(access_key_id: &str, extra: &[(&str, &str)]) -> Result<Value, Box<dyn Error>> {
     let mut fields = json!({"accessKeyId": access_key_id, "secretAccessKey": SECRET});
     for (name, value) in extra {
@@ -648,6 +653,95 @@ async fn configure_offers_static_keys_the_levels_and_every_name_a_run_gets() -> 
             ("defaultRegion", false)
         ]
     );
+    Ok(())
+}
+
+/// The block's `defaultRegion` is the run's region when the credential and
+/// the sign-in name none, and decides the partition the keys are checked in.
+#[tokio::test]
+async fn the_blocks_default_region_is_the_runs_when_nothing_else_names_one() -> TestResult {
+    let aws = FakeAws::default().caller("AKIAGOV", ACCOUNT, ROLE_ARN)?;
+    let env = environment(&[
+        ("AWS_ACCESS_KEY_ID", "AKIAGOV"),
+        ("AWS_SECRET_ACCESS_KEY", SECRET),
+    ]);
+    let mut app = App::start(aws.clone(), env).await?;
+    app.ok(
+        "configure",
+        configure_params(&json!({"defaultRegion": "us-gov-east-1"})),
+        "configureResult",
+    )
+    .await?;
+    let region = async |app: &mut App| -> Result<String, Box<dyn Error>> {
+        let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
+        Ok(values.get("AWS_REGION").ok_or("no region")?.0.clone())
+    };
+
+    let response = app.detect(json!([{"kind": "env"}]), json!({})).await?;
+    assert_eq!(at(&response, "/result/source"), "env", "{response}");
+    assert_eq!(region(&mut app).await?, "us-gov-east-1");
+
+    app.ok(
+        "signIn",
+        keys_sign_in("AKIAGOV", &[("defaultRegion", "")])?,
+        "signInResult",
+    )
+    .await?;
+    assert_eq!(region(&mut app).await?, "us-gov-east-1");
+
+    // The person's pick is over the block's.
+    app.ok(
+        "signIn",
+        keys_sign_in("AKIAGOV", &[("defaultRegion", "us-gov-west-1")])?,
+        "signInResult",
+    )
+    .await?;
+    assert_eq!(region(&mut app).await?, "us-gov-west-1");
+
+    let checked_in: Vec<String> = aws.calls().into_iter().map(|call| call.region).collect();
+    assert_eq!(checked_in, ["us-gov-west-1"; 3]);
+    Ok(())
+}
+
+/// Every problem with the settings at once, each by name.
+#[tokio::test]
+async fn settings_aws_does_not_have_or_a_bad_region_are_refused_by_name() -> TestResult {
+    let mut app = App::start(FakeAws::default(), Environment::default()).await?;
+    let cut = format!("no setting {}: its", "a".repeat(64));
+    for (settings, says, never) in [
+        (
+            json!({"defaultZone": "us-east-1a", "projectId": "p", "defaultRegion": "Ohio"}),
+            vec![
+                "AWS has no setting defaultZone, projectId",
+                "settings.defaultRegion is invalid: \"Ohio\"",
+            ],
+            None,
+        ),
+        (
+            json!({"defaultRegion": "Ohio"}),
+            vec!["settings.defaultRegion is invalid: \"Ohio\""],
+            Some("no setting"),
+        ),
+        (
+            json!({"region": "us-west-2"}),
+            vec!["AWS has no setting region: its only setting is defaultRegion"],
+            Some("invalid"),
+        ),
+        // A name is cut to 64 characters.
+        (json!({"a".repeat(100): "x"}), vec![cut.as_str()], None),
+    ] {
+        let error = app
+            .fails("configure", configure_params(&settings), "invalidParams")
+            .await?;
+        let message = at(&error, "/message");
+        let message = message.as_str().ok_or("message")?;
+        for part in says {
+            assert!(message.contains(part), "{message} should say {part}");
+        }
+        if let Some(never) = never {
+            assert!(!message.contains(never), "{message}");
+        }
+    }
     Ok(())
 }
 
@@ -1082,11 +1176,34 @@ async fn the_plugins_debug_shows_its_credential_but_never_a_secret() -> TestResu
     let params: DetectParams = serde_json::from_value(
         json!({"sources": [{"kind": "env"}], "pins": {}, "requirements": []}),
     )?;
+    plugin
+        .configure(serde_json::from_value(configure_params(&json!({})))?)
+        .await?;
     plugin.detect(params).await?;
     let shown = format!("{plugin:?}");
     // Only the detected credential's keys show as redacted secrets.
     assert!(shown.contains("Secret(redacted)"), "{shown}");
     assert!(!shown.contains(SECRET) && !shown.contains(TOKEN), "{shown}");
+    Ok(())
+}
+
+/// Called directly, not through the transport, the plugin still needs
+/// `configure` first.
+#[tokio::test]
+async fn an_unconfigured_plugin_refuses_detect() -> TestResult {
+    let plugin = AwsPlugin::new(
+        FakeAws::default(),
+        FixedClock(OffsetDateTime::parse(NOW, &Rfc3339)?),
+        Environment::default(),
+    );
+    let params: DetectParams = serde_json::from_value(
+        json!({"sources": [{"kind": "env"}], "pins": {}, "requirements": []}),
+    )?;
+    let refused = plugin.detect(params).await.err();
+    assert_eq!(
+        refused.map(|error| error.kind()),
+        Some(ErrorKind::NotConfigured)
+    );
     Ok(())
 }
 

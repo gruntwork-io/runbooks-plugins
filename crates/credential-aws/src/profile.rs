@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::num::ParseIntError;
 use std::time::Duration;
 
+use runbooks_plugin_protocol::credential::FieldChoicesItem;
 use time::OffsetDateTime;
 
 use crate::aws::{AssumeRole, AwsCredentials, PROFILE_FILE_VARIABLES, ProfileSettings, Profiles};
@@ -89,6 +90,39 @@ fn listed(profiles: &[String]) -> String {
     } else {
         format!("the profiles are {}", profiles.join(", "))
     }
+}
+
+/// The most profiles the `profile` field lists: the schema's `field.choices`
+/// limit.
+const MAX_CHOICES: usize = 1000;
+
+/// The `profile` field's choices: the profiles the block's Local Profile tab
+/// lists, by name. With more than [`MAX_CHOICES`] it lists none, so the
+/// field takes any name instead of hiding some.
+pub(crate) fn choices(profiles: &Profiles) -> Vec<FieldChoicesItem> {
+    let listed: Vec<FieldChoicesItem> = profiles
+        .names()
+        .filter(|name| profiles.get(name).is_some_and(usable))
+        .take(MAX_CHOICES + 1)
+        .map(|name| FieldChoicesItem {
+            label: name.to_owned(),
+            value: name.to_owned(),
+        })
+        .collect();
+    if listed.len() > MAX_CHOICES {
+        Vec::new()
+    } else {
+        listed
+    }
+}
+
+/// Static keys, or a role with a source for its keys. Never a profile IAM
+/// Identity Center signs in: the AWS SSO method does.
+const fn usable(settings: &ProfileSettings) -> bool {
+    !settings.sso
+        && (settings.access_key_id.is_some()
+            || (settings.role_arn.is_some()
+                && (settings.source_profile.is_some() || settings.credential_source.is_some())))
 }
 
 /// The variables of `env` that say where the files are.
