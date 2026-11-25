@@ -335,6 +335,32 @@ mod tests {
         Ok(())
     }
 
+    /// A certificate may be 1 MiB, copied whole; one byte more is refused.
+    #[tokio::test]
+    async fn a_certificate_may_be_as_large_as_1_mib() -> TestResult {
+        let (source, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let pem = source.path().join("sp.pem");
+        let file = fs::File::create(&pem)?;
+        file.set_len(1024 * 1024)?;
+        let state = StateDir::new(state.path().to_owned());
+        let dir = state.create().await?;
+        let copy = state.copy_certificate(&pem, &dir).await?;
+        assert_eq!(fs::metadata(&copy)?.len(), 1024 * 1024);
+
+        fs::remove_file(&copy)?;
+        file.set_len(1024 * 1024 + 1)?;
+        let refused = state
+            .copy_certificate(&pem, &dir)
+            .await
+            .err()
+            .ok_or("a certificate over 1 MiB was copied")?;
+        assert!(
+            refused.message().contains("larger than 1048576 bytes"),
+            "{refused}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn each_sign_in_gets_its_own_directory_and_remove_all_clears_them() -> TestResult {
         let temp = tempfile::tempdir()?;

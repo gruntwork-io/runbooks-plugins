@@ -335,3 +335,35 @@ async fn detect_reuses_an_earlier_blocks_sign_in_and_its_choice() -> TestResult 
     );
     Ok(())
 }
+
+/// The block's own pin wins over the earlier block's subscription, and an
+/// extension directory the outputs name that isn't there is not used.
+#[tokio::test]
+async fn an_earlier_sign_in_keeps_the_blocks_pin_and_skips_a_missing_extension_dir() -> TestResult {
+    let mut fixture = Fixture::new(World::service_principal()?, &[]).await?;
+    let earlier = tempfile::tempdir()?;
+    fs::write(earlier.path().join("azureProfile.json"), "{}")?;
+    let values = json!([{"kind": "values", "values": {
+        "AZURE_CONFIG_DIR": earlier.path().to_str().ok_or("not UTF-8")?,
+        "AZURE_EXTENSION_DIR": earlier.path().join("gone").to_str().ok_or("not UTF-8")?,
+        "AZURE_TENANT_ID": CONTOSO,
+        "AZURE_SUBSCRIPTION_ID": DEV,
+    }}]);
+    let pins = json!({"subscription": PROD});
+    let detected = fixture
+        .app
+        .result("detect", detect_params(&values, &pins, &json!([])))
+        .await?;
+    assert_eq!(
+        at(&detected, "/identity/targets/subscription/id"),
+        PROD,
+        "{detected}"
+    );
+    let env = fixture.env().await?;
+    let config = PathBuf::from(env_value(&env, "AZURE_CONFIG_DIR").ok_or("no config dir")?);
+    assert_eq!(
+        env_value(&env, "AZURE_EXTENSION_DIR").map(PathBuf::from),
+        Some(config.join("cliextensions"))
+    );
+    Ok(())
+}

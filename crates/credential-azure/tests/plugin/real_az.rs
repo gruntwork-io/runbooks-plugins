@@ -4,6 +4,7 @@
 
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::iter;
 use std::path::Path;
 use std::process::Stdio;
@@ -19,8 +20,8 @@ use tokio::time::timeout;
 use crate::fake_az::{CLIENT, CONTOSO, PROD};
 use crate::scripted_az::{DEVICE_LINE, ScriptedAz, token};
 use crate::support::{
-    App, TestResult, WAIT, assert_valid, at, env_value, error_kind, error_message, sign_in_dirs,
-    sign_in_params,
+    App, TestResult, WAIT, assert_valid, at, detect_params, env_value, error_kind, error_message,
+    sign_in_dirs, sign_in_params,
 };
 
 fn installed(scripted: &ScriptedAz) -> InstalledAz {
@@ -245,6 +246,43 @@ async fn signs_in_through_the_az_on_path_with_the_blocks_own_config_dir() -> Tes
             .all(|line| !line.contains("SECRET-SIGNATURE")),
         "the token reached the app: {written:?}"
     );
+    Ok(())
+}
+
+/// A local login az says is signed out or expired is not found, and its
+/// copy is gone.
+#[tokio::test]
+async fn a_local_login_az_cannot_use_is_not_found() -> TestResult {
+    let (scripted, state, local) = (
+        ScriptedAz::new()?,
+        tempfile::tempdir()?,
+        tempfile::tempdir()?,
+    );
+    fs::write(local.path().join("azureProfile.json"), "{}")?;
+    scripted.respond("account-get-access-token.fail", "")?;
+    let host = Host::new(
+        [(
+            "AZURE_CONFIG_DIR".into(),
+            local.path().as_os_str().to_owned(),
+        )],
+        cfg!(windows),
+    );
+    let mut app = App::start(AzurePlugin::new(host, installed(&scripted)))?;
+    app.configure(state.path()).await?;
+    let cli = detect_params(
+        &json!([{"kind": "named", "name": "cli"}]),
+        &json!({}),
+        &json!([]),
+    );
+    for error in [
+        "ERROR: Please run 'az login' to setup account.",
+        "ERROR: AADSTS700082: The refresh token has expired due to inactivity.",
+    ] {
+        scripted.respond("account-get-access-token.err", &format!("{error}\n"))?;
+        let detected = app.result("detect", cli.clone()).await?;
+        assert_eq!(at(&detected, "/found"), false, "{error}: {detected}");
+        assert_eq!(sign_in_dirs(state.path())?, Vec::<String>::new());
+    }
     Ok(())
 }
 

@@ -73,3 +73,28 @@ impl Connect for InstalledAz {
         Ok(az::AzCli::new(self.program.clone(), env))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::InstalledAz;
+    use crate::az::AzCli;
+
+    /// Both name the environment's variables and never show their values.
+    #[test]
+    fn debug_shows_the_environments_names_but_not_its_values() {
+        let program = Some(PathBuf::from("/usr/bin/az"));
+        let env = vec![("ARM_CLIENT_SECRET".into(), "hunter2".into())];
+        let shown = [
+            format!("{:?}", InstalledAz::new(program.clone(), env.clone())),
+            format!("{:?}", AzCli::new(program, env)),
+        ];
+        for (shown, name) in shown.iter().zip(["InstalledAz", "AzCli"]) {
+            assert_eq!(
+                *shown,
+                format!(r#"{name} {{ program: Some("/usr/bin/az"), env: ["ARM_CLIENT_SECRET"] }}"#)
+            );
+        }
+    }
+}
