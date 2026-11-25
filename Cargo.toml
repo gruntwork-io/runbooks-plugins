@@ -11,6 +11,9 @@ license = "MPL-2.0"
 publish = false
 
 [workspace.dependencies]
+# Only the shared config and credentials file parser: the plugin reads the
+# files itself and makes every AWS call through its own boundary.
+aws-config = { version = "1.13.3", default-features = false }
 # The SDK's own HTTPS client (hyper 1, rustls with aws-lc-rs). Each crate's
 # default `rustls` feature adds the legacy hyper 0.14 client beside it.
 aws-sdk-iam = { version = "1.137.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
