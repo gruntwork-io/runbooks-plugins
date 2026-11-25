@@ -27,7 +27,8 @@
 //!   (`ssoRoleName`). A credential that does not match fails with
 //!   `pinMismatch`.
 //! - **A run gets** `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-//!   `AWS_SESSION_TOKEN` and `AWS_REGION`, as env and as outputs.
+//!   `AWS_SESSION_TOKEN` and `AWS_REGION`, as env and as outputs, and
+//!   `AWS_CREDENTIAL_EXPIRATION` when the keys expire.
 //!
 //! [`AwsPlugin`] answers the protocol; [`Aws`] is everything it asks AWS.
 

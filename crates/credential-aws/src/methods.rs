@@ -8,16 +8,20 @@ use runbooks_plugin_protocol::credential::{
     ConfigureResult, ConfigureResultCloud, Field, FieldChoicesItem, Level, LevelChosen, Method,
 };
 
-use crate::detect::{AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN};
+use crate::detect::{
+    AWS_ACCESS_KEY_ID, AWS_CREDENTIAL_EXPIRATION, AWS_REGION, AWS_SECRET_ACCESS_KEY,
+    AWS_SESSION_TOKEN,
+};
 use crate::identity::{ACCOUNT, ROLE};
 use crate::region::{InvalidRegion, Region};
 
 /// Every name a run may get, as env and as outputs.
-pub(crate) const NAMES: [&str; 4] = [
+pub(crate) const NAMES: [&str; 5] = [
     AWS_ACCESS_KEY_ID,
     AWS_SECRET_ACCESS_KEY,
     AWS_SESSION_TOKEN,
     AWS_REGION,
+    AWS_CREDENTIAL_EXPIRATION,
 ];
 
 pub(crate) const ACCESS_KEY_ID: &str = "accessKeyId";

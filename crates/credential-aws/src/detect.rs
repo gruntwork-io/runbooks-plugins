@@ -19,7 +19,7 @@ pub(crate) const AWS_SESSION_TOKEN: &str = "AWS_SESSION_TOKEN";
 pub(crate) const AWS_REGION: &str = "AWS_REGION";
 const AWS_DEFAULT_REGION: &str = "AWS_DEFAULT_REGION";
 /// When temporary keys expire, as the AWS SDKs read it.
-const AWS_CREDENTIAL_EXPIRATION: &str = "AWS_CREDENTIAL_EXPIRATION";
+pub(crate) const AWS_CREDENTIAL_EXPIRATION: &str = "AWS_CREDENTIAL_EXPIRATION";
 
 /// The process environment `main` read at start. Its values include keys,
 /// so `Debug` shows only how many there are.
