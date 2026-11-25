@@ -1,0 +1,263 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - mise-tasks/checksums
+      - mise-tasks/dist
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-26
+          - target: x86_64-apple-darwin
+            runner: macos-26
+          # Links against glibc 2.35, the oldest a GitHub runner offers, so older distributions run it.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_AUTO_INSTALL: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          version: 2026.11.8 # mise.toml's min_version.
+          install_args: rust jq
+          cache: false
+      - run: mise exec -- rustup target add "${TARGET}"
+        env:
+          TARGET: ${{ matrix.target }}
+      - run: mise run dist "${TARGET}"
+        env:
+          TARGET: ${{ matrix.target }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # On a tag, the macOS binaries go through the sign job first.
+          name: ${{ github.ref_type == 'tag' && endsWith(matrix.target, '-apple-darwin') && 'unsigned' || 'assets' }}-${{ matrix.target }}
+          path: target/dist/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  sign:
+    name: Sign and notarize the macOS binaries
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: macos-26
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: read
+    env:
+      MISE_AUTO_INSTALL: "false"
+    steps:
+      - name: Check the signing secrets are set
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_AC_LOGIN: ${{ secrets.MACOS_AC_LOGIN }}
+          MACOS_AC_PASSWORD: ${{ secrets.MACOS_AC_PASSWORD }}
+          MACOS_AC_PROVIDER: ${{ secrets.MACOS_AC_PROVIDER }}
+        run: |
+          missing=()
+          for name in MACOS_CERTIFICATE MACOS_CERTIFICATE_PASSWORD MACOS_AC_LOGIN MACOS_AC_PASSWORD MACOS_AC_PROVIDER; do
+            if [[ -z ${!name} ]]; then
+              missing+=("${name}")
+            fi
+          done
+          if ((${#missing[@]} > 0)); then
+            echo "::error::A tag's macOS binaries are signed, but these secrets are not set in the release environment: ${missing[*]}"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          version: 2026.11.8 # mise.toml's min_version.
+          install_args: jq
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: unsigned-*
+          path: target/dist
+          merge-multiple: true
+      - name: Sign with the Developer ID certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="${RUNNER_TEMP}/signing.keychain-db"
+          keychain_password=$(uuidgen)
+          security create-keychain -p "${keychain_password}" "${keychain}"
+          security unlock-keychain -p "${keychain_password}" "${keychain}"
+          security set-keychain-settings "${keychain}"
+          # A pipe, not a here-string, which some bash versions write to a temporary file.
+          printf '%s' "${MACOS_CERTIFICATE}" | base64 --decode |
+            security import /dev/stdin -f pkcs12 -k "${keychain}" -P "${MACOS_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "${keychain_password}" "${keychain}" >/dev/null
+          # codesign ignores --keychain for a keychain outside the search list.
+          security list-keychains -d user -s "${keychain}"
+
+          identity=$(security find-identity -v -p codesigning "${keychain}" | awk '/"Developer ID Application: /{print $2}')
+          if [[ -z ${identity} || ${identity} == *$'\n'* ]]; then
+            echo "::error::MACOS_CERTIFICATE must hold exactly one Developer ID Application identity."
+            exit 1
+          fi
+
+          for path in target/dist/*; do
+            name=${path##*/}
+            codesign --sign "${identity}" --keychain "${keychain}" --identifier "io.gruntwork.${name%%_*}" \
+              --options runtime --timestamp --force "${path}"
+            codesign --verify --strict --verbose=2 "${path}"
+          done
+      - name: Notarize
+        env:
+          MACOS_AC_LOGIN: ${{ secrets.MACOS_AC_LOGIN }}
+          MACOS_AC_PASSWORD: ${{ secrets.MACOS_AC_PASSWORD }}
+          MACOS_AC_PROVIDER: ${{ secrets.MACOS_AC_PROVIDER }}
+        run: |
+          # notarytool takes a zip, not a bare Mach-O. A bare Mach-O can't be stapled, so Gatekeeper checks online.
+          ditto -c -k --sequesterRsrc --keepParent target/dist "${RUNNER_TEMP}/notarize.zip"
+          credentials=(--apple-id "${MACOS_AC_LOGIN}" --password "${MACOS_AC_PASSWORD}" --team-id "${MACOS_AC_PROVIDER}")
+          result="${RUNNER_TEMP}/notarize.json"
+          # The status decides, so a rejected submission still prints its log.
+          xcrun notarytool submit "${RUNNER_TEMP}/notarize.zip" "${credentials[@]}" --wait --timeout 30m \
+            --output-format json >"${result}" || true
+          cat "${result}"
+          status=$(jq -r .status "${result}")
+          if [[ ${status} != Accepted ]]; then
+            id=$(jq -r '.id // empty' "${result}")
+            if [[ -n ${id} ]]; then
+              xcrun notarytool log "${id}" "${credentials[@]}"
+            fi
+            echo "::error::Notarization ended with status ${status}."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: assets-apple-darwin
+          path: target/dist/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  checksums:
+    name: Write SHA256SUMS
+    needs: [build, sign]
+    # A pull request skips the sign job, and its macOS binaries stay unsigned.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.sign.result == 'success' || github.event_name == 'pull_request') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      MISE_AUTO_INSTALL: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          version: 2026.11.8 # mise.toml's min_version.
+          install: false
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: assets-*
+          path: target/dist
+          merge-multiple: true
+      - run: mise run checksums target/dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: target/dist/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  release:
+    name: Create the draft release
+    needs: checksums
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # Creates the draft release and uploads its assets.
+    env:
+      MISE_AUTO_INSTALL: "false"
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          version: 2026.11.8 # mise.toml's min_version.
+          install_args: gh
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: target/dist
+      - name: Check the tag names the binaries' version
+        run: |
+          while read -r _ name; do
+            stem=${name%_*_*}
+            version=${stem##*_}
+            if [[ ${version} != "${TAG#v}" ]]; then
+              echo "::error::The binaries are version ${version}, but the tag is ${TAG}. Tag v${version}, or set the workspace version in Cargo.toml to ${TAG#v}."
+              exit 1
+            fi
+          done <target/dist/SHA256SUMS
+      - name: Create the draft, or replace the assets of the tag's draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          drafts=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[] | select(.tag_name == env.TAG) | .draft')
+          case "${drafts}" in
+          "")
+            gh release create "${TAG}" target/dist/* --repo "${GITHUB_REPOSITORY}" --draft --verify-tag \
+              --title "${TAG}" --generate-notes
+            ;;
+          true)
+            gh release upload "${TAG}" target/dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+            ;;
+          *)
+            echo "::error::${TAG} already has a published release, or more than one release. A run changes only the tag's one draft."
+            exit 1
+            ;;
+          esac
+      - name: Check the draft holds exactly the assets SHA256SUMS lists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir target/draft
+          cmp target/dist/SHA256SUMS target/draft/SHA256SUMS
+          mise run checksums target/draft >/dev/null
+          diff target/dist/SHA256SUMS target/draft/SHA256SUMS
