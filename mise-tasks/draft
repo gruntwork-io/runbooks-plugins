@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+#MISE description="Print the commit a draft release targets, after checking a run may build it"
+#USAGE arg "<tag>" help="The draft's tag, such as v0.1.0"
+set -euo pipefail
+
+export TAG=${usage_tag:?}
+fail() {
+  echo "draft: $*" >&2
+  exit 1
+}
+
+releases=$(gh api --paginate 'repos/{owner}/{repo}/releases' \
+  --jq '.[] | select(.tag_name == env.TAG) | "\(.draft) \(.target_commitish)"')
+case "${releases}" in
+"") fail "no release has tag ${TAG}. Create one: gh release create ${TAG} --draft --target <commit SHA> --generate-notes" ;;
+*$'\n'*) fail "more than one release has tag ${TAG}." ;;
+*) ;;
+esac
+read -r draft target <<<"${releases}"
+if [[ ${draft} != true ]]; then
+  fail "${TAG} is published. A run changes only a draft."
+fi
+if [[ ! ${target} =~ ^[0-9a-f]{40}$ ]]; then
+  fail "${TAG}'s draft targets '${target}', not a full commit SHA."
+fi
+# GitHub ignores a draft's target when its tag exists.
+tagged=$(gh api "repos/{owner}/{repo}/git/matching-refs/tags/${TAG}" \
+  --jq '.[] | select(.ref == "refs/tags/" + env.TAG) | .ref')
+if [[ -n ${tagged} ]]; then
+  fail "tag ${TAG} exists, so publishing the draft would ignore its target."
+fi
+echo "${target}"
