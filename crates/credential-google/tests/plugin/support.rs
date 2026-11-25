@@ -274,11 +274,12 @@ impl GoogleApi for Google {
     }
 }
 
-/// Runs `openssl` with `args` and `input` on standard input. Its seed file,
-/// if it keeps one, goes in `dir`.
+/// Runs `openssl` in `dir` with `args` and `input` on standard input. Its
+/// seed file, if it keeps one, goes in `dir` too.
 fn openssl(dir: &Path, args: &[&str], input: &[u8]) -> TestResult<Output> {
     let mut child = Command::new("openssl")
         .args(args)
+        .current_dir(dir)
         .env("HOME", dir)
         .env("RANDFILE", dir.join("rnd"))
         .stdin(Stdio::piped())
@@ -294,7 +295,7 @@ fn openssl(dir: &Path, args: &[&str], input: &[u8]) -> TestResult<Output> {
 }
 
 /// What `openssl` writes to standard output, if it succeeds.
-fn openssl_output(dir: &Path, args: &[&str], input: &[u8]) -> TestResult<Vec<u8>> {
+pub(crate) fn openssl_output(dir: &Path, args: &[&str], input: &[u8]) -> TestResult<Vec<u8>> {
     let output = openssl(dir, args, input)?;
     if !output.status.success() {
         return Err(format!(
@@ -357,6 +358,17 @@ pub(crate) fn s256(verifier: &str) -> TestResult<String> {
     Ok(URL_SAFE_NO_PAD.encode(digest))
 }
 
+/// The plugin's host: the process environment `env`, and the fixed clock.
+pub(crate) fn host(env: &[(&str, &str)]) -> Host {
+    Host {
+        env: env
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect(),
+        now,
+    }
+}
+
 /// The app: it writes the plugin's input and reads every line it writes.
 pub(crate) struct App {
     stdin: Option<DuplexStream>,
@@ -370,15 +382,15 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn start(env: &[(&str, &str)], google: &Google) -> TestResult<Self> {
-        let host = Host {
-            env: env
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                .collect(),
-            now,
-        };
         let google = google.clone();
-        let plugin = GooglePlugin::new(host, Box::new(move |_network| Ok(google.clone())));
+        Self::serving(GooglePlugin::new(
+            host(env),
+            Box::new(move |_network| Ok(google.clone())),
+        ))
+    }
+
+    /// Serves `plugin`, whichever Google it reaches.
+    pub(crate) fn serving<A: GoogleApi>(plugin: GooglePlugin<A>) -> TestResult<Self> {
         let (stdin, plugin_stdin) = duplex(1024 * 1024);
         let (plugin_stdout, stdout) = duplex(1024 * 1024);
         let message = json!({ "oneOf": [
