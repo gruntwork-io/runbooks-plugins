@@ -931,3 +931,72 @@ async fn targets_says_whether_aws_has_the_level() -> TestResult {
     }
     Ok(())
 }
+
+/// What the form shows for static keys: the method's label, and each field's
+/// name, label and whether it is required.
+#[tokio::test]
+async fn the_static_keys_method_is_labelled_for_the_form() -> TestResult {
+    let mut app = App::start(FakeAws::default(), Environment::default()).await?;
+    let result = app
+        .ok(
+            "configure",
+            json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/s"}),
+            "configureResult",
+        )
+        .await?;
+    let credentials = result
+        .get("methods")
+        .and_then(Value::as_array)
+        .ok_or("methods")?
+        .iter()
+        .find(|m| m["name"] == "credentials")
+        .ok_or("a credentials method")?;
+    assert_eq!(credentials["label"], "Static Credentials");
+    let fields: Vec<(&str, &str, bool)> = credentials["fields"]
+        .as_array()
+        .ok_or("fields")?
+        .iter()
+        .filter_map(|f| {
+            Some((
+                f["name"].as_str()?,
+                f["label"].as_str()?,
+                f["required"].as_bool()?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            ("accessKeyId", "Access Key ID", true),
+            ("secretAccessKey", "Secret Access Key", true),
+            ("sessionToken", "Session Token", false),
+            ("defaultRegion", "Default Region", false),
+        ]
+    );
+    Ok(())
+}
+
+/// A field the method doesn't have refuses a sign-in even when every field
+/// it needs is set, and each refusal says only what is wrong.
+#[tokio::test]
+async fn an_unknown_field_alone_refuses_a_sign_in() -> TestResult {
+    let mut app = App::start(FakeAws::default(), Environment::default()).await?;
+    let error = app
+        .fails(
+            "signIn",
+            keys_sign_in("AKIA", &[("nope", "x")])?,
+            "invalidParams",
+        )
+        .await?;
+    assert_eq!(
+        at(&error, "/message"),
+        "the credentials method has no field nope: its fields are accessKeyId, secretAccessKey, sessionToken, defaultRegion"
+    );
+    let missing = json!({"method": "credentials", "fields": {"accessKeyId": "AKIA"}, "pins": {}, "requirements": []});
+    let error = app.fails("signIn", missing, "invalidParams").await?;
+    assert_eq!(
+        at(&error, "/message"),
+        "the credentials method needs secretAccessKey"
+    );
+    Ok(())
+}
