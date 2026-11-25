@@ -1,18 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::future::{self, Future};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::io;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use runbooks_plugin_protocol::credential::{
     ConfigureParams, ConfigureResult, DetectParams, DetectResult, EnvResult, EnvValue,
-    EnvValueToItem, ErrorKind, Identity, Requirement, SelectParams, SelectResult, SignInParams,
-    SignInResult, SignOutResult, Target, TargetsParams, TargetsResult,
+    EnvValueToItem, ErrorKind, Identity, IdentityWarningsItem, Requirement, SelectParams,
+    SelectResult, SignInParams, SignInResult, SignOutResult, Target, TargetsParams, TargetsResult,
 };
 use runbooks_plugin_transport::{CredentialPlugin, PluginError, Prompts};
 use serde_json::Map;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::fs;
+use tokio::io::AsyncReadExt;
 
-use crate::aws::{Aws, AwsCredentials, SsoAccount, read_profiles};
+use crate::aws::{Aws, AwsCredentials, Network, NetworkError, SsoAccount, read_profiles};
 use crate::detect::{
     AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, Environment,
     parse_sources,
@@ -26,6 +30,7 @@ use crate::methods::{
 use crate::profile;
 use crate::region::Region;
 use crate::secret::Secret;
+use crate::settings;
 use crate::sso::{self, SsoLogin};
 
 /// How long before a role's keys expire `env` gets fresh ones.
@@ -47,22 +52,60 @@ impl Clock for SystemClock {
     }
 }
 
+/// Makes the [`Aws`] the plugin calls once `configure` says how to reach AWS.
+pub type Connect<A> = Box<dyn Fn(&Network) -> Result<A, NetworkError> + Send + Sync>;
+
+/// The largest `caBundleFile` read.
+const MAX_CA_BUNDLE_BYTES: usize = 1024 * 1024;
+
 /// The AWS credential plugin for one block. It holds at most one credential:
 /// the last one `detect` found or a sign-in produced.
-#[derive(Debug)]
 pub struct AwsPlugin<A, C> {
-    aws: A,
+    connect: Connect<A>,
     clock: C,
     env: Environment,
-    state: Mutex<State>,
+    state: Mutex<State<A>>,
+}
+
+impl<A: fmt::Debug, C: fmt::Debug> fmt::Debug for AwsPlugin<A, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AwsPlugin")
+            .field("clock", &self.clock)
+            .field("env", &self.env)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
-struct State {
+struct State<A> {
+    /// Set by each `configure`. The transport refuses every other call until
+    /// one has succeeded.
+    configured: Option<Arc<Configured<A>>>,
     /// Counts every change of session, so a call that read the session
     /// before an await can tell whether it is still the same one.
     generation: u64,
     session: Session,
+}
+
+/// What `configure` set up.
+#[derive(Debug)]
+struct Configured<A> {
+    /// AWS, reached through the network `configure` gave.
+    aws: A,
+    /// The run's region when neither the credential nor the sign-in names
+    /// one: the block's `defaultRegion` setting, else us-east-1.
+    default_region: Region,
+    /// The `profile` field's choices. When there are any, signing in with
+    /// another profile is refused, as the contract has it.
+    profiles: BTreeSet<String>,
+}
+
+impl<A> Configured<A> {
+    /// Whether the `profile` field lets the person give `name`.
+    fn lists(&self, name: &str) -> bool {
+        self.profiles.is_empty() || self.profiles.contains(name)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +122,9 @@ struct Ready {
     credentials: AwsCredentials,
     /// The run's `AWS_REGION`.
     region: Region,
+    /// AWS said the account has not enabled `region`. False when the check
+    /// failed: that says nothing about the region.
+    region_not_enabled: bool,
     principal: Principal,
     /// The sign-in method or detection source it came from.
     method: String,
@@ -93,7 +139,8 @@ struct Ready {
 #[derive(Clone, Debug)]
 struct ProfileSignIn {
     name: String,
-    default_region: Option<Region>,
+    /// The run's region if the profile names none.
+    default_region: Region,
     pins: Pins,
 }
 
@@ -105,9 +152,17 @@ struct SsoRole {
 }
 
 impl Ready {
+    /// With today's block's warning when the run's region is not enabled.
     fn identity(&self) -> Identity {
-        self.principal
-            .identity(&self.method, self.credentials.expires_at)
+        let mut identity = self
+            .principal
+            .identity(&self.method, self.credentials.expires_at);
+        if self.region_not_enabled {
+            identity.warnings.push(IdentityWarningsItem {
+                message: format!("Region {} is not enabled for this AWS account", self.region),
+            });
+        }
+        identity
     }
 }
 
@@ -118,13 +173,16 @@ fn ready(ready: Ready) -> (Session, Identity) {
 }
 
 impl<A: Aws, C: Clock> AwsPlugin<A, C> {
-    /// `env` is the environment the `env` detection source reads.
-    pub const fn new(aws: A, clock: C, env: Environment) -> Self {
+    /// `connect` makes the [`Aws`] the plugin calls from what `configure`
+    /// says of the network. `env` is the environment the `env` detection
+    /// source reads.
+    pub fn new(connect: Connect<A>, clock: C, env: Environment) -> Self {
         Self {
-            aws,
+            connect,
             clock,
             env,
             state: Mutex::new(State {
+                configured: None,
                 generation: 0,
                 session: Session::SignedOut,
             }),
@@ -132,8 +190,25 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
     }
 
     // No guard is held across an await or a call that can panic.
-    fn lock(&self) -> MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, State<A>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn configured(&self) -> Result<Arc<Configured<A>>, PluginError> {
+        self.lock().configured.clone().ok_or_else(|| {
+            PluginError::new(ErrorKind::NotConfigured, "configure the AWS plugin first")
+        })
+    }
+
+    /// The region a sign-in's Default Region field names, else the block's.
+    fn run_region(&self, fields: Fields<'_>) -> Result<Region, PluginError> {
+        match fields
+            .region(DEFAULT_REGION)
+            .map_err(|error| invalid_params(&error))?
+        {
+            Some(region) => Ok(region),
+            None => Ok(self.configured()?.default_region.clone()),
+        }
     }
 
     fn set(&self, session: Session) {
@@ -185,7 +260,8 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
     }
 
     /// Asks STS who `credentials` belong to, in the partition of
-    /// `sts_region`, and checks that against the pins.
+    /// `sts_region`, and checks that against the pins. Then asks whether the
+    /// account has enabled the run's region.
     async fn check(
         &self,
         credentials: AwsCredentials,
@@ -194,8 +270,9 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
         method: String,
         pins: &Pins,
     ) -> Result<Ready, PluginError> {
+        let configured = self.configured()?;
         let home = sts_region.partition_home();
-        let caller = self
+        let caller = configured
             .aws
             .caller_identity(&credentials, &home)
             .await
@@ -203,9 +280,20 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
         let principal = Principal::from_caller(caller);
         pins.check(&principal)
             .map_err(|mismatch| PluginError::new(ErrorKind::PinMismatch, mismatch.to_string()))?;
+        // As in today's block, a check that fails (keys that may not call
+        // account:GetRegionOptStatus, an SCP, the network) warns of nothing.
+        let region_not_enabled = match configured
+            .aws
+            .region_enabled(&credentials, &region, &region.partition_home())
+            .await
+        {
+            Ok(enabled) => !enabled,
+            Err(_unchecked) => false,
+        };
         Ok(Ready {
             credentials,
             region,
+            region_not_enabled,
             principal,
             method,
             sso: None,
@@ -218,10 +306,7 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
         fields: Fields<'_>,
         pins: &Pins,
     ) -> Result<Ready, PluginError> {
-        let region = fields
-            .region(DEFAULT_REGION)
-            .map_err(|error| invalid_params(&error))?
-            .unwrap_or_else(Region::default_region);
+        let region = self.run_region(fields)?;
         let credentials = AwsCredentials {
             access_key_id: fields.required(ACCESS_KEY_ID).to_owned(),
             secret_access_key: Secret::new(fields.required(SECRET_ACCESS_KEY)),
@@ -233,11 +318,13 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
             .await
     }
 
-    /// Reads the profile files where the environment says they are, gets the
-    /// profile's keys, assuming each role in its chain in the partition of
-    /// the run's region, and checks them. The run's region is the profile's,
-    /// else the default region.
-    async fn sign_in_with_profile(&self, sign_in: ProfileSignIn) -> Result<Ready, PluginError> {
+    /// Reads the profile files where the environment says they are, for how
+    /// to get the profile's keys and the run's region: the profile's, else
+    /// the sign-in's default region.
+    async fn profile_plan(
+        &self,
+        sign_in: &ProfileSignIn,
+    ) -> Result<(profile::Plan, Region), PluginError> {
         let profiles = read_profiles(profile::file_env(&self.env))
             .await
             .map_err(|e| invalid_params(&format!("{e}: fix the line it names")))?;
@@ -250,15 +337,31 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
                     sign_in.name
                 ))
             })?,
-            None => sign_in
-                .default_region
-                .clone()
-                .unwrap_or_else(Region::default_region),
+            None => sign_in.default_region.clone(),
         };
+        Ok((plan, region))
+    }
+
+    /// Signs in with the profile as the files are now, for fresh keys.
+    async fn profile_sign_in_again(&self, sign_in: &ProfileSignIn) -> Result<Ready, PluginError> {
+        let (plan, region) = self.profile_plan(sign_in).await?;
+        self.sign_in_with_profile(sign_in.clone(), plan, region)
+            .await
+    }
+
+    /// Gets the profile's keys, assuming each role in its chain in the
+    /// partition of the run's region, and checks them.
+    async fn sign_in_with_profile(
+        &self,
+        sign_in: ProfileSignIn,
+        plan: profile::Plan,
+        region: Region,
+    ) -> Result<Ready, PluginError> {
+        let configured = self.configured()?;
         let home = region.partition_home();
         let mut credentials = plan.base;
         for role in &plan.roles {
-            credentials = self
+            credentials = configured
                 .aws
                 .assume_role(&credentials, role, &home)
                 .await
@@ -296,11 +399,9 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
             .region(SSO_REGION)
             .map_err(|error| invalid_params(&error))?
             .unwrap_or_else(Region::default_region);
-        let run_region = fields
-            .region(DEFAULT_REGION)
-            .map_err(|error| invalid_params(&error))?
-            .unwrap_or_else(Region::default_region);
-        let token = sso::device_sign_in(&self.aws, prompts, &start_url, &sso_region).await?;
+        let run_region = self.run_region(fields)?;
+        let configured = self.configured()?;
+        let token = sso::device_sign_in(&configured.aws, prompts, &start_url, &sso_region).await?;
         let expires_at = token
             .expires_in
             .and_then(|lifetime| time::Duration::try_from(lifetime).ok())
@@ -318,10 +419,10 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
         if let (Some(account), Some(role)) = (login.pins.account.clone(), login.pins.role.clone()) {
             return Ok(ready(self.sign_in_to_role(login, account, role).await?));
         }
-        let accounts = sso::accounts(&self.aws, &login).await?;
+        let accounts = sso::accounts(&configured.aws, &login).await?;
         login.remember(&accounts);
         if let [only] = accounts.as_slice() {
-            let roles = sso::roles(&self.aws, &login, &only.id).await?;
+            let roles = sso::roles(&configured.aws, &login, &only.id).await?;
             if let [role] = roles.as_slice() {
                 let (account, role) = (only.id.clone(), role.clone());
                 return Ok(ready(self.sign_in_to_role(login, account, role).await?));
@@ -340,6 +441,7 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
     ) -> Result<Ready, PluginError> {
         sso::check_choice(&login.pins, &account, Some(&role))?;
         let credentials = self
+            .configured()?
             .aws
             .role_credentials(&login.token, &account, &role, &login.sso_region)
             .await
@@ -383,7 +485,8 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
             return Ok(ready);
         }
         let fresh = if let Some(sso) = &ready.sso {
-            self.aws
+            self.configured()?
+                .aws
                 .role_credentials(
                     &sso.login.token,
                     &sso.account,
@@ -397,7 +500,7 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
                 })
                 .map_err(|e| sso::sso_error(&e, "getting fresh keys for the role"))
         } else if let Some(sign_in) = &ready.profile {
-            self.sign_in_with_profile(sign_in.clone()).await
+            self.profile_sign_in_again(sign_in).await
         } else {
             return Ok(ready);
         };
@@ -430,6 +533,34 @@ fn not_signed_in() -> PluginError {
     )
 }
 
+/// The `caBundleFile`'s bytes, up to [`MAX_CA_BUNDLE_BYTES`]. Missing,
+/// unreadable and larger files are refused, by their path.
+async fn read_ca_bundle(path: &str) -> Result<Vec<u8>, PluginError> {
+    let refused = |why: &str| invalid_params(&format!("caBundleFile {path} {why}"));
+    let unreadable = |error: io::Error| refused(&format!("could not be read: {}", error.kind()));
+    let file = fs::File::open(path).await.map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            refused("does not exist")
+        } else {
+            unreadable(error)
+        }
+    })?;
+    let limit = u64::try_from(MAX_CA_BUNDLE_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(unreadable)?;
+    if bytes.len() > MAX_CA_BUNDLE_BYTES {
+        return Err(refused(&format!(
+            "is larger than {MAX_CA_BUNDLE_BYTES} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
 fn known_level(level: &str) -> Result<(), PluginError> {
     if level == ACCOUNT || level == ROLE {
         Ok(())
@@ -442,11 +573,40 @@ fn known_level(level: &str) -> Result<(), PluginError> {
 }
 
 impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
-    fn configure(
-        &self,
-        _params: ConfigureParams,
-    ) -> impl Future<Output = Result<ConfigureResult, PluginError>> + Send {
-        future::ready(Ok(methods::describe()))
+    /// Takes the block's settings and reaches AWS through the network it
+    /// names: `caBundleFile`'s roots beside the platform's, and `proxy` for
+    /// every call. Lists the shared files' profiles as the `profile` field's
+    /// choices. Files that do not parse list none: signing in with a profile
+    /// names the line.
+    async fn configure(&self, params: ConfigureParams) -> Result<ConfigureResult, PluginError> {
+        let default_region =
+            settings::default_region(&params.settings).map_err(|error| invalid_params(&error))?;
+        let ca_bundle = match &params.ca_bundle_file {
+            Some(path) => Some(read_ca_bundle(path).await?),
+            None => None,
+        };
+        let network = Network {
+            ca_bundle,
+            proxy: params.proxy,
+        };
+        let aws = (self.connect)(&network).map_err(|error| match error {
+            NetworkError::NoCertificate | NetworkError::BadCertificate => invalid_params(&format!(
+                "caBundleFile {} {error}",
+                params.ca_bundle_file.as_deref().unwrap_or_default()
+            )),
+            NetworkError::Proxy => invalid_params(&format!("proxy {error}")),
+        })?;
+        let choices = match read_profiles(profile::file_env(&self.env)).await {
+            Ok(profiles) => profile::choices(&profiles),
+            Err(_unparsed) => Vec::new(),
+        };
+        let profiles = choices.iter().map(|choice| choice.value.clone()).collect();
+        self.lock().configured = Some(Arc::new(Configured {
+            aws,
+            default_region,
+            profiles,
+        }));
+        Ok(methods::describe(&choices))
     }
 
     /// Tries each source in order and keeps the first credential AWS accepts
@@ -457,6 +617,7 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
         let pins = Pins::parse(&params.pins).map_err(|error| invalid_params(&error))?;
         no_requirements(&params.requirements)?;
         let sources = parse_sources(params.sources).map_err(|error| invalid_params(&error))?;
+        let default_region = self.configured()?.default_region.clone();
 
         let mut first_failure = None;
         for source in &sources {
@@ -468,7 +629,7 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
                     continue;
                 }
             };
-            let region = found.region.unwrap_or_else(Region::default_region);
+            let region = found.region.unwrap_or_else(|| default_region.clone());
             let origin = found.origin.to_string();
             let source = found.origin.source();
             match self
@@ -517,12 +678,18 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
             SignInMethod::Profile => {
                 let sign_in = ProfileSignIn {
                     name: fields.required(PROFILE).to_owned(),
-                    default_region: fields
-                        .region(DEFAULT_REGION)
-                        .map_err(|error| invalid_params(&error))?,
+                    default_region: self.run_region(fields)?,
                     pins,
                 };
-                ready(self.sign_in_with_profile(sign_in).await?)
+                // The files' reason first: it says what to do instead.
+                let (plan, region) = self.profile_plan(&sign_in).await?;
+                if !self.configured()?.lists(&sign_in.name) {
+                    return Err(invalid_params(&format!(
+                        "profile {:?} is not one of the profiles this block lists, which are the files' profiles when it was configured",
+                        sign_in.name
+                    )));
+                }
+                ready(self.sign_in_with_profile(sign_in, plan, region).await?)
             }
         };
         self.set(session);
@@ -535,8 +702,9 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
         let level = params.level.as_str();
         known_level(level)?;
         let login = self.sso_login(level)?;
+        let configured = self.configured()?;
         let targets = if level == ACCOUNT {
-            let accounts = sso::accounts(&self.aws, &login).await?;
+            let accounts = sso::accounts(&configured.aws, &login).await?;
             self.remember(&accounts);
             accounts
                 .into_iter()
@@ -555,7 +723,7 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
                 })?,
             };
             sso::check_choice(&login.pins, &account, None)?;
-            sso::roles(&self.aws, &login, &account)
+            sso::roles(&configured.aws, &login, &account)
                 .await?
                 .into_iter()
                 .map(|role| Target {

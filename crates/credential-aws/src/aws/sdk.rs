@@ -1,18 +1,28 @@
 //! [`Aws`] on the AWS SDK for Rust. The only module that names an SDK type.
 
 use std::error::Error as StdError;
+use std::fmt;
 use std::io;
 use std::time::{Duration, SystemTime};
 
+use aws_sdk_account::types::RegionOptStatus;
 use aws_sdk_ssooidc::operation::create_token::CreateTokenError;
 use aws_sdk_sts::config::timeout::TimeoutConfig;
 use aws_sdk_sts::config::{BehaviorVersion, Credentials, Region as SdkRegion};
 use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
+use aws_smithy_http_client::proxy::ProxyConfig;
+use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
+use aws_smithy_http_client::tls::{self, TlsContext, TrustStore};
+use aws_smithy_http_client::{Builder, ConnectorBuilder};
+use aws_types::SdkConfig;
+use rustls::RootCertStore;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use time::OffsetDateTime;
 
 use super::{
     AssumeRole, Aws, AwsCredentials, AwsError, AwsErrorKind, CallerIdentity, DeviceAuthorization,
-    Service, SsoAccount, SsoToken, TokenPoll,
+    Network, NetworkError, Service, SsoAccount, SsoToken, TokenPoll,
 };
 use crate::identity::AccountId;
 use crate::region::Region;
@@ -39,40 +49,114 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 /// than anyone is given.
 const MAX_PAGES: usize = 1000;
 
-/// Calls AWS with the SDK's default HTTPS client: rustls, the platform's
-/// trusted roots, and `HTTPS_PROXY` / `NO_PROXY` from the environment.
-#[derive(Debug, Default)]
+/// Calls AWS with the SDK's HTTPS client, built for the [`Network`].
+///
+/// That is rustls with aws-lc-rs, trusting the platform's roots and the
+/// network's CA bundle, through the network's proxy or none. The
+/// environment's proxy variables are the app's to pass as `proxy`.
+#[derive(Clone)]
 pub struct SdkAws {
-    /// Where the IAM Identity Center calls go in place of AWS's endpoint for
-    /// their region. Only this module's tests set one: a loopback server.
+    /// Where the IAM Identity Center and Account calls go in place of AWS's
+    /// endpoint for their region. Only this module's tests set one: a
+    /// loopback server.
     endpoint: Option<String>,
+    /// What every client is built from: the HTTPS client, the timeouts and
+    /// the SDK's behaviour version.
+    shared: SdkConfig,
+}
+
+impl fmt::Debug for SdkAws {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SdkAws")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SdkAws {
-    /// Calls AWS's own endpoints: each call builds its SDK client from its
-    /// keys and region.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self { endpoint: None }
+    /// Calls AWS's own endpoints through `network`: each call builds its SDK
+    /// client from its keys and region.
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkError`] for a CA bundle without a certificate or with one
+    /// that does not parse, or a proxy that is not an http or https URL.
+    pub fn new(network: &Network) -> Result<Self, NetworkError> {
+        let mut roots = TrustStore::default();
+        if let Some(pem) = &network.ca_bundle {
+            check_bundle(pem)?;
+            roots = roots.with_pem_certificate(pem.clone());
+        }
+        let tls_context = TlsContext::builder()
+            .with_trust_store(roots)
+            .build()
+            .map_err(|_unusable| NetworkError::BadCertificate)?;
+        let proxy = match &network.proxy {
+            Some(url) => ProxyConfig::all(url.as_str()).map_err(|_invalid| NetworkError::Proxy)?,
+            None => ProxyConfig::disabled(),
+        };
+        // As the SDK builds its default client, with this trust and proxy.
+        let http = Builder::new().build_with_connector_fn(move |settings, components| {
+            let mut connector = ConnectorBuilder::default()
+                .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
+                .tls_context(tls_context.clone())
+                .proxy_config(proxy.clone());
+            connector.set_connector_settings(settings.cloned());
+            if let Some(components) = components {
+                connector.set_sleep_impl(components.sleep_impl());
+            }
+            connector.build()
+        });
+        Ok(Self {
+            endpoint: None,
+            shared: SdkConfig::builder()
+                .behavior_version(BehaviorVersion::latest())
+                .timeout_config(timeouts())
+                .http_client(http)
+                .build(),
+        })
     }
 
     fn oidc_client(&self, region: &Region) -> aws_sdk_ssooidc::Client {
-        let mut config = aws_sdk_ssooidc::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(sdk_region(region))
-            .timeout_config(timeouts());
+        let mut config =
+            aws_sdk_ssooidc::config::Builder::from(&self.shared).region(sdk_region(region));
         config.set_endpoint_url(self.endpoint.clone());
         aws_sdk_ssooidc::Client::from_conf(config.build())
     }
 
     fn sso_client(&self, region: &Region) -> aws_sdk_sso::Client {
-        let mut config = aws_sdk_sso::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(sdk_region(region))
-            .timeout_config(timeouts());
+        let mut config =
+            aws_sdk_sso::config::Builder::from(&self.shared).region(sdk_region(region));
         config.set_endpoint_url(self.endpoint.clone());
         aws_sdk_sso::Client::from_conf(config.build())
     }
+
+    fn sts_client(&self, credentials: &AwsCredentials, region: &Region) -> aws_sdk_sts::Client {
+        aws_sdk_sts::Client::from_conf(
+            aws_sdk_sts::config::Builder::from(&self.shared)
+                .region(sdk_region(region))
+                .credentials_provider(sdk_credentials(credentials))
+                .build(),
+        )
+    }
+}
+
+/// Checks `pem` as the HTTPS client reads it, since a PEM block that does
+/// not parse, or a certificate rustls refuses, would panic there.
+fn check_bundle(pem: &[u8]) -> Result<(), NetworkError> {
+    let certificates = CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_unreadable| NetworkError::BadCertificate)?;
+    if certificates.is_empty() {
+        return Err(NetworkError::NoCertificate);
+    }
+    let mut roots = RootCertStore::empty();
+    for certificate in certificates {
+        roots
+            .add(certificate)
+            .map_err(|_refused| NetworkError::BadCertificate)?;
+    }
+    Ok(())
 }
 
 impl Aws for SdkAws {
@@ -81,14 +165,7 @@ impl Aws for SdkAws {
         credentials: &AwsCredentials,
         region: &Region,
     ) -> Result<CallerIdentity, AwsError> {
-        let sts = aws_sdk_sts::Client::from_conf(
-            aws_sdk_sts::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
-                .region(sdk_region(region))
-                .credentials_provider(sdk_credentials(credentials))
-                .timeout_config(timeouts())
-                .build(),
-        );
+        let sts = self.sts_client(credentials, region);
         let answer = sts
             .get_caller_identity()
             .send()
@@ -108,11 +185,9 @@ impl Aws for SdkAws {
             .ok_or_else(|| unexpected("a 12-digit Account"))?;
 
         let iam = aws_sdk_iam::Client::from_conf(
-            aws_sdk_iam::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
+            aws_sdk_iam::config::Builder::from(&self.shared)
                 .region(sdk_region(region))
                 .credentials_provider(sdk_credentials(credentials))
-                .timeout_config(timeouts())
                 .build(),
         );
         // The alias only names the account on the identity card. Keys that
@@ -137,14 +212,7 @@ impl Aws for SdkAws {
         request: &AssumeRole,
         region: &Region,
     ) -> Result<AwsCredentials, AwsError> {
-        let sts = aws_sdk_sts::Client::from_conf(
-            aws_sdk_sts::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
-                .region(sdk_region(region))
-                .credentials_provider(sdk_credentials(credentials))
-                .timeout_config(timeouts())
-                .build(),
-        );
+        let sts = self.sts_client(credentials, region);
         let duration = request
             .duration
             .map(|duration| i32::try_from(duration.as_secs()).unwrap_or(i32::MAX));
@@ -381,6 +449,35 @@ impl Aws for SdkAws {
                 .flatten(),
         })
     }
+
+    async fn region_enabled(
+        &self,
+        credentials: &AwsCredentials,
+        target: &Region,
+        region: &Region,
+    ) -> Result<bool, AwsError> {
+        let mut config = aws_sdk_account::config::Builder::from(&self.shared)
+            .region(sdk_region(region))
+            .credentials_provider(sdk_credentials(credentials));
+        config.set_endpoint_url(self.endpoint.clone());
+        let answer = aws_sdk_account::Client::from_conf(config.build())
+            .get_region_opt_status()
+            .region_name(target.as_str())
+            .send()
+            .await
+            .map_err(|error| classify(Service::Account, &error))?;
+        let status = answer.region_opt_status().ok_or_else(|| {
+            AwsError::new(
+                Service::Account,
+                AwsErrorKind::Unexpected,
+                "GetRegionOptStatus answered without a RegionOptStatus",
+            )
+        })?;
+        Ok(matches!(
+            status,
+            RegionOptStatus::Enabled | RegionOptStatus::EnabledByDefault
+        ))
+    }
 }
 
 /// A positive count of seconds, as SSO-OIDC gives lifetimes and intervals.
@@ -492,17 +589,19 @@ fn kind_of_code(code: &str, server_error: bool) -> AwsErrorKind {
 }
 
 /// rustls reports a failed handshake, an untrusted certificate among them,
-/// as an `io::Error` of kind `InvalidData` somewhere in the error's sources.
+/// as an `io::Error` of kind `InvalidData`, which hyper-rustls wraps in
+/// another `io::Error`. An `io::Error`'s `source` skips its payload, so the
+/// payload is looked at instead.
 fn is_tls_failure(error: &(dyn StdError + 'static)) -> bool {
     let mut next = Some(error);
     while let Some(current) = next {
-        if current
-            .downcast_ref::<io::Error>()
-            .is_some_and(|io| io.kind() == io::ErrorKind::InvalidData)
-        {
-            return true;
-        }
-        next = current.source();
+        next = match current.downcast_ref::<io::Error>() {
+            Some(io) if io.kind() == io::ErrorKind::InvalidData => return true,
+            Some(io) => io
+                .get_ref()
+                .map_or_else(|| current.source(), |payload| Some(payload)),
+            None => current.source(),
+        };
     }
     false
 }
@@ -525,7 +624,7 @@ mod tests {
     use std::error::Error;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use std::thread;
     use std::time::Duration;
 
@@ -533,13 +632,20 @@ mod tests {
     use aws_sdk_sts::config::http::HttpResponse;
     use aws_sdk_sts::error::{ConnectorError, ErrorMetadata, SdkError};
     use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::{ServerConfig, ServerConnection, StreamOwned};
     use time::OffsetDateTime;
 
     use super::{SdkAws, classify, seconds};
-    use crate::aws::{Aws, AwsError, AwsErrorKind, Service, SsoAccount, SsoToken};
+    use crate::aws::{
+        Aws, AwsCredentials, AwsError, AwsErrorKind, Network, NetworkError, Service, SsoAccount,
+        SsoToken,
+    };
     use crate::identity::AccountId;
     use crate::region::Region;
     use crate::secret::Secret;
+    use crate::test_tls::make_certificates;
 
     type TestResult = Result<(), Box<dyn Error>>;
     type StsError = SdkError<GetCallerIdentityError>;
@@ -633,6 +739,13 @@ mod tests {
                 .ends_with(": invalid peer certificate: UnknownIssuer"),
             "{error}"
         );
+        // As hyper-rustls hands it on, under an I/O error of another kind.
+        let wrapped = io::Error::other(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        let error = dispatch(ConnectorError::io(Box::new(wrapped)));
+        assert_eq!(error.kind, AwsErrorKind::Tls, "{error}");
 
         let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused");
         let error = dispatch(ConnectorError::io(Box::new(refused)));
@@ -660,24 +773,44 @@ mod tests {
 
     const ACCESS_TOKEN: &str = "test-sso-access-token";
 
-    /// [`SdkAws`] calling IAM Identity Center on a loopback port, where each
-    /// request, on a connection of its own, gets what `answer` gives for its
-    /// target. The server keeps each target it was sent, with its token.
+    /// What a fake answers for a request's target and body.
+    type Answer = fn(&str, &str) -> String;
+
+    /// [`SdkAws`] calling IAM Identity Center and Account on a loopback port,
+    /// where each request, on a connection of its own, gets what `answer`
+    /// gives. The server keeps each target it was sent, with its SSO token or
+    /// what it was signed for.
     struct FakeSso {
         aws: SdkAws,
         requests: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeSso {
-        fn start(answer: fn(&str) -> String) -> io::Result<Self> {
+        fn start(answer: Answer) -> Result<Self, Box<dyn Error>> {
+            Self::serving(answer, None, &Network::default())
+        }
+
+        /// Serves HTTPS with the test certificate for 127.0.0.1, which only
+        /// the test CA signs, to an [`SdkAws`] reaching it through `network`.
+        fn start_tls(answer: Answer, network: &Network) -> Result<Self, Box<dyn Error>> {
+            Self::serving(answer, Some(tls_server()?), network)
+        }
+
+        fn serving(
+            answer: Answer,
+            tls: Option<Arc<ServerConfig>>,
+            network: &Network,
+        ) -> Result<Self, Box<dyn Error>> {
             let listener = TcpListener::bind("127.0.0.1:0")?;
-            let endpoint = format!("http://{}", listener.local_addr()?);
+            let scheme = if tls.is_some() { "https" } else { "http" };
+            let endpoint = format!("{scheme}://{}", listener.local_addr()?);
             let requests = Arc::new(Mutex::new(Vec::new()));
             let seen = Arc::clone(&requests);
-            thread::spawn(move || serve(&listener, answer, &seen));
+            thread::spawn(move || serve(&listener, answer, tls.as_ref(), &seen));
             Ok(Self {
                 aws: SdkAws {
                     endpoint: Some(endpoint),
+                    ..SdkAws::new(network)?
                 },
                 requests,
             })
@@ -693,18 +826,33 @@ mod tests {
 
     /// Answers each connection to `listener` in turn. A connection that
     /// fails fails only its own call.
-    fn serve(listener: &TcpListener, answer: fn(&str) -> String, seen: &Mutex<Vec<String>>) {
+    fn serve(
+        listener: &TcpListener,
+        answer: Answer,
+        tls: Option<&Arc<ServerConfig>>,
+        seen: &Mutex<Vec<String>>,
+    ) {
         for stream in listener.incoming() {
-            let _served: io::Result<()> = stream.and_then(|stream| reply(stream, answer, seen));
+            let _served: io::Result<()> = stream.and_then(|stream| match tls {
+                Some(config) => {
+                    let connection =
+                        ServerConnection::new(Arc::clone(config)).map_err(io::Error::other)?;
+                    let mut tls = StreamOwned::new(connection, stream);
+                    reply(&mut tls, answer, seen)?;
+                    tls.conn.send_close_notify();
+                    tls.flush()
+                }
+                None => reply(stream, answer, seen),
+            });
         }
     }
 
     fn reply(
-        mut stream: TcpStream,
-        answer: fn(&str) -> String,
+        stream: impl Read + Write,
+        answer: Answer,
         seen: &Mutex<Vec<String>>,
     ) -> io::Result<()> {
-        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut reader = BufReader::new(stream);
         let mut request_line = String::new();
         reader.read_line(&mut request_line)?;
         let mut headers = Vec::new();
@@ -727,14 +875,34 @@ mod tests {
         let length = header("content-length")
             .and_then(|length| length.parse().ok())
             .unwrap_or(0);
-        reader.read_exact(&mut vec![0; length])?;
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body)?;
         let target = request_line.split(' ').nth(1).unwrap_or_default();
-        let token = header("x-amz-sso_bearer_token").unwrap_or_default();
+        let token = header("x-amz-sso_bearer_token")
+            .or_else(|| header("authorization").and_then(|value| signed_for(&value)))
+            .unwrap_or_default();
         seen.lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(format!("{target} with {token}"));
-        stream.write_all(answer(target).as_bytes())?;
+        let answer = answer(target, &String::from_utf8_lossy(&body));
+        let stream = reader.get_mut();
+        stream.write_all(answer.as_bytes())?;
         stream.flush()
+    }
+
+    /// The key, service and region an `Authorization` header signed for.
+    fn signed_for(authorization: &str) -> Option<String> {
+        let scope = authorization
+            .split("Credential=")
+            .nth(1)?
+            .split(',')
+            .next()?;
+        match scope.split('/').collect::<Vec<_>>().as_slice() {
+            [key, _date, region, service, _request] => {
+                Some(format!("{key} for {service} in {region}"))
+            }
+            _ => None,
+        }
     }
 
     /// An HTTP answer with a JSON body, and AWS's error type for an error.
@@ -749,7 +917,7 @@ mod tests {
 
     /// IAM Identity Center's answers: two pages of accounts and of roles,
     /// a role's keys with and without an expiry, and its refusals.
-    fn iam_identity_center(target: &str) -> String {
+    fn iam_identity_center(target: &str, _body: &str) -> String {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         let second_page = query.contains("next_token=more");
         let role = |name: &str| query.contains(&format!("role_name={name}"));
@@ -930,6 +1098,334 @@ mod tests {
                 "{role}"
             );
         }
+        Ok(())
+    }
+
+    /// Account's `GetRegionOptStatus` answers, by the region the body asks
+    /// about: each status AWS has, one it may add, none, and a refusal.
+    fn account(target: &str, body: &str) -> String {
+        let status = |status: &str| {
+            json(
+                200,
+                None,
+                &format!(r#"{{"RegionName":"x","RegionOptStatus":"{status}"}}"#),
+            )
+        };
+        let asked = |region: &str| body.contains(&format!(r#""RegionName":"{region}""#));
+        match target {
+            "/getRegionOptStatus" if asked("us-east-1") => status("ENABLED_BY_DEFAULT"),
+            "/getRegionOptStatus" if asked("ap-east-1") => status("ENABLED"),
+            "/getRegionOptStatus" if asked("me-south-1") => status("DISABLED"),
+            "/getRegionOptStatus" if asked("af-south-1") => status("ENABLING"),
+            "/getRegionOptStatus" if asked("eu-south-2") => status("DISABLING"),
+            "/getRegionOptStatus" if asked("il-central-1") => status("PAUSED"),
+            "/getRegionOptStatus" if asked("ca-west-1") => json(200, None, "{}"),
+            "/getRegionOptStatus" if asked("mx-central-1") => json(
+                403,
+                Some("AccessDeniedException"),
+                r#"{"message":"not authorized to perform account:GetRegionOptStatus"}"#,
+            ),
+            _ => json(400, Some("ValidationException"), "{}"),
+        }
+    }
+
+    /// Only `ENABLED` and `ENABLED_BY_DEFAULT` are enabled. An answer without a
+    /// status, and a refusal, are errors. Each request is signed with the
+    /// keys for the region it is sent to.
+    #[tokio::test]
+    async fn a_regions_status_is_read_from_accounts_answer() -> TestResult {
+        let account = FakeSso::start(account)?;
+        let keys = AwsCredentials {
+            access_key_id: "AKIATEST".to_owned(),
+            secret_access_key: Secret::new("test-secret-access-key"),
+            session_token: None,
+            expires_at: None,
+        };
+        let home = Region::parse("us-east-1")?;
+        let asked = [
+            "us-east-1",
+            "ap-east-1",
+            "me-south-1",
+            "af-south-1",
+            "eu-south-2",
+            "il-central-1",
+            "ca-west-1",
+            "mx-central-1",
+        ];
+        let mut answers = Vec::new();
+        for region in asked {
+            let answer = account
+                .aws
+                .region_enabled(&keys, &Region::parse(region)?, &home)
+                .await;
+            answers.push(answer.map_err(|error| (error.service, error.kind)));
+        }
+        let refused = (Service::Account, AwsErrorKind::Refused);
+        let unexpected = (Service::Account, AwsErrorKind::Unexpected);
+        assert_eq!(
+            answers,
+            [
+                Ok(true),
+                Ok(true),
+                Ok(false),
+                Ok(false),
+                Ok(false),
+                Ok(false),
+                Err(unexpected),
+                Err(refused),
+            ]
+        );
+        assert_eq!(
+            account.requests(),
+            vec!["/getRegionOptStatus with AKIATEST for account in us-east-1"; asked.len()]
+        );
+        Ok(())
+    }
+
+    /// A test CA no platform trusts, and the certificate it signs for
+    /// localhost and 127.0.0.1 with its key, in PEM.
+    struct Certificates {
+        ca: Vec<u8>,
+        localhost: Vec<u8>,
+        localhost_key: Vec<u8>,
+    }
+
+    /// The test certificates, made with `openssl` once for these tests.
+    fn certificates() -> Result<&'static Certificates, Box<dyn Error>> {
+        static MADE: OnceLock<Result<Certificates, String>> = OnceLock::new();
+        let made = MADE.get_or_init(|| {
+            let make = || -> Result<Certificates, Box<dyn Error>> {
+                let dir = tempfile::tempdir()?;
+                make_certificates(dir.path())?;
+                Ok(Certificates {
+                    ca: std::fs::read(dir.path().join("ca.pem"))?,
+                    localhost: std::fs::read(dir.path().join("localhost.pem"))?,
+                    localhost_key: std::fs::read(dir.path().join("localhost-key.pem"))?,
+                })
+            };
+            make().map_err(|error| error.to_string())
+        });
+        made.as_ref().map_err(|error| error.clone().into())
+    }
+
+    /// The keys a test signs with. A proxy must never see them.
+    const PROXY_MUST_NOT_SEE: &str = "test-secret-the-proxy-must-not-see";
+
+    fn tls_server() -> Result<Arc<ServerConfig>, Box<dyn Error>> {
+        let certificates = certificates()?;
+        let chain = CertificateDer::pem_slice_iter(&certificates.localhost)
+            .collect::<Result<Vec<_>, _>>()?;
+        let key = PrivateKeyDer::from_pem_slice(&certificates.localhost_key)?;
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(chain, key)?;
+        Ok(Arc::new(config))
+    }
+
+    fn signing_keys() -> AwsCredentials {
+        AwsCredentials {
+            access_key_id: "AKIATEST".to_owned(),
+            secret_access_key: Secret::new(PROXY_MUST_NOT_SEE),
+            session_token: Some(Secret::new(PROXY_MUST_NOT_SEE)),
+            expires_at: None,
+        }
+    }
+
+    /// The CA bundle is trusted beside the platform's roots, which alone do
+    /// not trust the test CA.
+    #[tokio::test]
+    async fn https_to_a_server_only_the_ca_bundle_trusts() -> TestResult {
+        let home = Region::parse("us-east-1")?;
+        let target = Region::parse("ap-east-1")?;
+        let bundle = Network {
+            ca_bundle: Some(certificates()?.ca.clone()),
+            proxy: None,
+        };
+        let trusted = FakeSso::start_tls(account, &bundle)?;
+        let enabled = trusted
+            .aws
+            .region_enabled(&signing_keys(), &target, &home)
+            .await?;
+        assert!(enabled);
+        assert_eq!(
+            trusted.requests(),
+            ["/getRegionOptStatus with AKIATEST for account in us-east-1"]
+        );
+
+        // A TLS failure, which the plugin answers with a hint to give
+        // Runbooks the CA certificate.
+        let untrusted = FakeSso::start_tls(account, &Network::default())?;
+        let refused = untrusted
+            .aws
+            .region_enabled(&signing_keys(), &target, &home)
+            .await
+            .err()
+            .map(|error| (error.service, error.kind, error.detail));
+        let (service, kind, detail) = refused.ok_or("trusted without the bundle")?;
+        assert_eq!((service, kind), (Service::Account, AwsErrorKind::Tls));
+        assert!(detail.ends_with("UnknownIssuer"), "{detail}");
+        assert_eq!(untrusted.requests(), Vec::<String>::new());
+        Ok(())
+    }
+
+    /// A proxy on a loopback port that refuses every tunnel, and the request
+    /// head of each. No call through it leaves the machine.
+    fn refusing_proxy() -> io::Result<(String, Arc<Mutex<Vec<String>>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&heads);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let _refused: io::Result<()> = stream.and_then(|stream| refuse(&stream, &seen));
+            }
+        });
+        Ok((
+            format!("http://proxy-user:test-proxy-password@{address}"),
+            heads,
+        ))
+    }
+
+    fn refuse(stream: &TcpStream, seen: &Mutex<Vec<String>>) -> io::Result<()> {
+        let mut reader = BufReader::new(stream);
+        let mut head = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            head.push(line.to_owned());
+        }
+        seen.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(head.join("\n"));
+        let mut stream = reader.into_inner();
+        stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+    }
+
+    /// Every service the plugin calls tunnels through the proxy to AWS's
+    /// own endpoint, with the proxy's credentials and never the keys or a
+    /// token. A refusal is a network error.
+    #[tokio::test]
+    async fn every_call_tunnels_through_the_proxy_which_never_sees_a_key() -> TestResult {
+        let (proxy, heads) = refusing_proxy()?;
+        let aws = SdkAws::new(&Network {
+            ca_bundle: None,
+            proxy: Some(proxy),
+        })?;
+        let keys = signing_keys();
+        let token = SsoToken {
+            access_token: Secret::new(PROXY_MUST_NOT_SEE),
+            expires_in: None,
+        };
+        let region = Region::parse("eu-west-1")?;
+        let account = production()?;
+        let failures = [
+            aws.caller_identity(&keys, &region).await.err(),
+            aws.start_device_authorization("https://my-org.awsapps.com/start", &region)
+                .await
+                .err(),
+            aws.sso_accounts(&token, &region).await.err(),
+            aws.region_enabled(&keys, &region, &region).await.err(),
+        ];
+        let kinds: Vec<_> = failures
+            .iter()
+            .map(|failure| failure.as_ref().map(|error| (error.service, error.kind)))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                Some((Service::Sts, AwsErrorKind::Network)),
+                Some((Service::SsoOidc, AwsErrorKind::Network)),
+                Some((Service::Sso, AwsErrorKind::Network)),
+                Some((Service::Account, AwsErrorKind::Network)),
+            ]
+        );
+        let heads = heads.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let mut hosts: Vec<&str> = heads
+            .iter()
+            .filter_map(|head| head.lines().next()?.split(' ').nth(1))
+            .collect();
+        hosts.dedup();
+        assert_eq!(
+            hosts,
+            [
+                "sts.eu-west-1.amazonaws.com:443",
+                "oidc.eu-west-1.amazonaws.com:443",
+                "portal.sso.eu-west-1.amazonaws.com:443",
+                // Account has one endpoint for the partition.
+                "account.us-east-1.amazonaws.com:443",
+            ]
+        );
+        for head in &heads {
+            assert!(head.starts_with("CONNECT "), "{head}");
+            assert!(head.contains("Proxy-Authorization: Basic "), "{head}");
+            assert!(!head.contains(PROXY_MUST_NOT_SEE), "{head}");
+            assert!(
+                !head.to_lowercase().contains("authorization: aws4"),
+                "{head}"
+            );
+            assert!(!head.contains(account.as_str()), "{head}");
+        }
+        Ok(())
+    }
+
+    /// The client is built only from a bundle it can read, which it would
+    /// otherwise panic on, and a proxy URL, which no error shows.
+    #[test]
+    fn a_bundle_without_a_good_certificate_and_a_bad_proxy_are_refused() -> TestResult {
+        let bundle = |pem: &str| Network {
+            ca_bundle: Some(pem.as_bytes().to_vec()),
+            proxy: None,
+        };
+        let refused = |network: &Network| SdkAws::new(network).err();
+        assert_eq!(
+            refused(&bundle("not a certificate")),
+            Some(NetworkError::NoCertificate)
+        );
+        // Not base64, then base64 that is not a certificate.
+        for pem in [
+            "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        ] {
+            assert_eq!(refused(&bundle(pem)), Some(NetworkError::BadCertificate));
+        }
+        // A good certificate among other text is enough.
+        let mixed = format!(
+            "a comment\n{}",
+            String::from_utf8_lossy(&certificates()?.ca)
+        );
+        assert_eq!(refused(&bundle(&mixed)), None);
+
+        for proxy in [
+            "proxy.example.com:8080",
+            "socks5://proxy.example.com:1080",
+            "http://user:test-proxy-password@[::1",
+        ] {
+            let network = Network {
+                ca_bundle: None,
+                proxy: Some(proxy.to_owned()),
+            };
+            assert_eq!(refused(&network), Some(NetworkError::Proxy), "{proxy}");
+        }
+        let network = Network {
+            ca_bundle: Some(b"12345".to_vec()),
+            proxy: Some("https://user:test-proxy-password@proxy.example.com".to_owned()),
+        };
+        assert_eq!(
+            format!("{network:?}"),
+            r#"Network { ca_bundle: Some(5), proxy: Some("<set>") }"#
+        );
+        let aws = SdkAws::new(&Network {
+            ca_bundle: None,
+            ..network
+        })?;
+        assert_eq!(format!("{aws:?}"), "SdkAws { endpoint: None, .. }");
         Ok(())
     }
 

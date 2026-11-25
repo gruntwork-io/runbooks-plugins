@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_protocol::credential::{
-    ConfigureResult, ConfigureResultCloud, Field, Level, LevelChosen, Method,
+    ConfigureResult, ConfigureResultCloud, Field, FieldChoicesItem, Level, LevelChosen, Method,
 };
 
 use crate::detect::{AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN};
@@ -23,8 +23,9 @@ pub(crate) const NAMES: [&str; 4] = [
 pub(crate) const ACCESS_KEY_ID: &str = "accessKeyId";
 pub(crate) const SECRET_ACCESS_KEY: &str = "secretAccessKey";
 pub(crate) const SESSION_TOKEN: &str = "sessionToken";
-/// The region a run gets as `AWS_REGION`, and that keys which name none are
-/// checked in. The block's `defaultRegion` fills it in.
+/// The region a run gets as `AWS_REGION` when the credential names none, and
+/// that keys which name none are checked in. As a field, the person's pick;
+/// as a setting, the block's, used when the field is left empty.
 pub(crate) const DEFAULT_REGION: &str = "defaultRegion";
 /// The AWS access portal, like `https://my-org.awsapps.com/start`, and the
 /// region IAM Identity Center runs in. The block's `ssoStartUrl` and
@@ -131,8 +132,8 @@ impl SignInMethod {
     }
 }
 
-/// The answer to `configure`.
-pub(crate) fn describe() -> ConfigureResult {
+/// The answer to `configure`. `profiles` are the [`PROFILE`] field's choices.
+pub(crate) fn describe(profiles: &[FieldChoicesItem]) -> ConfigureResult {
     let level = |name: &str, label: &str| Level {
         chosen: LevelChosen::AfterSignIn,
         label: label.to_owned(),
@@ -150,7 +151,11 @@ pub(crate) fn describe() -> ConfigureResult {
                     .fields()
                     .iter()
                     .map(|field| Field {
-                        choices: Vec::new(),
+                        choices: if field.name == PROFILE {
+                            profiles.to_vec()
+                        } else {
+                            Vec::new()
+                        },
                         label: field.label.to_owned(),
                         name: field.name.to_owned(),
                         required: field.required,

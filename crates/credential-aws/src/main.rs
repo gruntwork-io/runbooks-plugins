@@ -15,7 +15,7 @@ fn main() -> ExitCode {
     let env: HashMap<String, String> = std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect();
-    let plugin = AwsPlugin::new(SdkAws::new(), SystemClock, Environment::new(env));
+    let plugin = AwsPlugin::new(Box::new(SdkAws::new), SystemClock, Environment::new(env));
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

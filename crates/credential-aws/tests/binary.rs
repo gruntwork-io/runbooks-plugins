@@ -1,39 +1,94 @@
 //! Runs the binary that ships, with the real AWS SDK, and no network: its
-//! only route out is an HTTPS proxy on a loopback port nothing listens on.
+//! only route out is the proxy `configure` names, on a loopback port that
+//! refuses every tunnel.
 
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+
+#[path = "support/tls.rs"]
+mod tls;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 /// Longer than a refused loopback connection takes, even on Windows.
 const WAIT: Duration = Duration::from_secs(30);
 
+const SECRET: &str = "test-secret-access-key-as-long-as-a-real";
+
 /// The member of `value` at JSON Pointer `pointer`, or `null` if there is none.
 fn at(value: &Value, pointer: &str) -> Value {
     value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
+/// A proxy on a loopback port that refuses every tunnel, and the first line
+/// of each request it got.
+fn refusing_proxy() -> std::io::Result<(String, Arc<Mutex<Vec<String>>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&asked);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let _refused: std::io::Result<()> = stream.and_then(|stream| refuse(&stream, &seen));
+        }
+    });
+    Ok((url, asked))
+}
+
+fn refuse(stream: &TcpStream, seen: &Mutex<Vec<String>>) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream);
+    let mut head = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        if line.trim_end().is_empty() {
+            break;
+        }
+        head.push(line.trim_end().to_owned());
+    }
+    seen.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(head.join("\n"));
+    let mut stream = reader.into_inner();
+    stream.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+}
+
+/// The hosts the proxy was asked to tunnel to, a retry's repeats once.
+/// Fails if any request showed the secret.
+fn tunnels(asked: &Mutex<Vec<String>>) -> Vec<String> {
+    let asked = asked.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert!(asked.iter().all(|head| !head.contains(SECRET)), "{asked:?}");
+    let mut hosts: Vec<String> = asked
+        .iter()
+        .map(|head| head.strip_prefix("CONNECT ").unwrap_or(head))
+        .filter_map(|target| Some(target.split(' ').next()?.to_owned()))
+        .collect();
+    hosts.dedup();
+    hosts
+}
+
 #[test]
 fn the_binary_answers_over_stdio_and_reports_an_unreachable_aws_as_network() -> TestResult {
-    // A port that was free a moment ago: connecting to it is refused.
+    let (proxy, asked) = refusing_proxy()?;
+    // The environment's proxy, on a port that was free a moment ago, is
+    // not the plugin's: only the app's `proxy` is.
     let closed_port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let env_proxy = format!("http://127.0.0.1:{closed_port}");
     let mut command = Command::new(env!("CARGO_BIN_EXE_runbooks-credential-aws"));
     command
         .env_clear()
         .env("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
-        .env(
-            "AWS_SECRET_ACCESS_KEY",
-            "test-secret-access-key-as-long-as-a-real",
-        )
-        .env("HTTPS_PROXY", format!("http://127.0.0.1:{closed_port}"))
+        .env("AWS_SECRET_ACCESS_KEY", SECRET)
+        .env("HTTPS_PROXY", &env_proxy)
+        .env("ALL_PROXY", &env_proxy)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -60,15 +115,34 @@ fn the_binary_answers_over_stdio_and_reports_an_unreachable_aws_as_network() -> 
         Ok(serde_json::from_str(&line)?)
     };
 
-    let configured = call(
+    // A CA bundle the real client cannot use is refused by name, and a
+    // proxy is never repeated.
+    let not_a_bundle = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let not_a_bundle = not_a_bundle.to_str().ok_or("a UTF-8 path")?;
+    let refused = call(
         1,
         "configure",
-        json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "/unused"}),
+        json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "/unused",
+            "caBundleFile": not_a_bundle, "proxy": proxy}),
+    )?;
+    assert_eq!(
+        at(&refused, "/error/message"),
+        format!("caBundleFile {not_a_bundle} holds no PEM certificate"),
+        "{refused}"
+    );
+    let certificates = tempfile::tempdir()?;
+    tls::make_certificates(certificates.path())?;
+    let bundle = certificates.path().join("ca.pem");
+    let configured = call(
+        2,
+        "configure",
+        json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "/unused",
+            "caBundleFile": bundle.to_str().ok_or("a UTF-8 path")?, "proxy": proxy}),
     )?;
     assert_eq!(at(&configured, "/result/cloud"), "aws", "{configured}");
 
     let detected = call(
-        2,
+        3,
         "detect",
         json!({"sources": [{"kind": "env"}], "pins": {}, "requirements": []}),
     )?;
@@ -84,7 +158,7 @@ fn the_binary_answers_over_stdio_and_reports_an_unreachable_aws_as_network() -> 
 
     // The SSO sign-in's first call takes the same route out.
     let signed_in = call(
-        3,
+        4,
         "signIn",
         json!({"method": "sso", "fields": {"ssoStartUrl": "https://my-org.awsapps.com/start", "ssoRegion": "eu-west-1"}, "pins": {}, "requirements": []}),
     )?;
@@ -96,6 +170,14 @@ fn the_binary_answers_over_stdio_and_reports_an_unreachable_aws_as_network() -> 
     assert!(
         message.contains("SSO OIDC") && message.contains("eu-west-1"),
         "{message}"
+    );
+
+    assert_eq!(
+        tunnels(&asked),
+        [
+            "sts.us-east-1.amazonaws.com:443",
+            "oidc.eu-west-1.amazonaws.com:443"
+        ]
     );
 
     // Closing standard input, which `call` owns, stops the plugin.
