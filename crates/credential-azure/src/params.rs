@@ -209,14 +209,14 @@ pub(crate) fn service_principal(
     })
 }
 
-/// A `select` call's choice: a tenant, and a subscription unless the
-/// sign-in is tenant-level.
+/// A `select` call's choice: a tenant, and a subscription or, from a null,
+/// none: a tenant-level sign-in.
 ///
 /// # Errors
 ///
 /// `invalidParams` for a level the plugin does not declare, a missing
-/// tenant, a null at either level (neither is optional), or an id that is
-/// not a GUID.
+/// level, a null tenant (that level is not optional), or an id that is not
+/// a GUID.
 pub(crate) fn choice(
     targets: &HashMap<String, Option<String>>,
 ) -> Result<(TenantId, Option<SubscriptionId>), PluginError> {
@@ -233,36 +233,43 @@ pub(crate) fn choice(
     let tenant = targets.get(TENANT_LEVEL).map_or_else(
         || Err(format!("targets.{TENANT_LEVEL} is required")),
         |id| {
-            let id = id.as_deref().ok_or_else(|| not_optional(TENANT_LEVEL))?;
+            let id = id.as_deref().ok_or_else(|| {
+                format!(
+                    "targets.{TENANT_LEVEL} is null, but the {TENANT_LEVEL} level is not optional"
+                )
+            })?;
             TenantId::parse(id).ok_or_else(|| {
                 format!("targets.{TENANT_LEVEL} must be a tenant id from targets, not {id:?}")
             })
         },
     );
-    if let Err(problem) = &tenant {
+    let subscription = targets.get(SUBSCRIPTION_LEVEL).map_or_else(
+        || {
+            Err(format!(
+                "targets.{SUBSCRIPTION_LEVEL} is required: a subscription id from targets, or null for none"
+            ))
+        },
+        |id| {
+            id.as_deref()
+                .map(|id| {
+                    SubscriptionId::parse(id).ok_or_else(|| {
+                        format!(
+                            "targets.{SUBSCRIPTION_LEVEL} must be a subscription id from targets, not {id:?}"
+                        )
+                    })
+                })
+                .transpose()
+        },
+    );
+    for problem in [tenant.as_ref().err(), subscription.as_ref().err()]
+        .into_iter()
+        .flatten()
+    {
         problems.add(problem.clone());
     }
-    let subscription = targets.get(SUBSCRIPTION_LEVEL).and_then(|id| {
-        let Some(id) = id else {
-            problems.add(not_optional(SUBSCRIPTION_LEVEL));
-            return None;
-        };
-        let parsed = SubscriptionId::parse(id);
-        if parsed.is_none() {
-            problems.add(format!(
-                "targets.{SUBSCRIPTION_LEVEL} must be a subscription id from targets, not {id:?}"
-            ));
-        }
-        parsed
-    });
     problems.check("select")?;
-    let tenant = tenant.map_err(|problem| PluginError::new(ErrorKind::InvalidParams, problem))?;
-    Ok((tenant, subscription))
-}
-
-/// The refusal of a null target at `level`, which is not optional.
-fn not_optional(level: &str) -> String {
-    format!("targets.{level} is null, but the {level} level is not optional")
+    let invalid = |problem: String| PluginError::new(ErrorKind::InvalidParams, problem);
+    Ok((tenant.map_err(invalid)?, subscription.map_err(invalid)?))
 }
 
 #[cfg(test)]
@@ -474,38 +481,57 @@ mod tests {
         ] {
             assert!(message.contains(part), "{part} in {message}");
         }
-        choice(&targets(&[(
-            "tenant",
-            Some("72f988bf-86f1-41af-91ab-2d7cd011db47"),
-        )]))?;
+        choice(&targets(&[
+            ("tenant", Some("72f988bf-86f1-41af-91ab-2d7cd011db47")),
+            ("subscription", Some("aaaaaaaa-0000-4000-8000-000000000001")),
+        ]))?;
         Ok(())
     }
 
-    /// Neither level is optional, so a null at either is refused, not taken
-    /// as no target.
+    /// Only the subscription level is optional: a null there is no
+    /// subscription, and a null tenant is refused.
     #[test]
-    fn a_null_tenant_or_subscription_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    fn a_null_subscription_is_none_and_a_null_tenant_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tenant = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+        let (chosen, subscription) = choice(&targets(&[
+            ("tenant", Some(tenant)),
+            ("subscription", None),
+        ]))?;
+        assert_eq!((chosen.as_str(), subscription), (tenant, None));
         let error = choice(&targets(&[("tenant", None), ("subscription", None)]))
             .err()
-            .ok_or("the choice was accepted")?;
+            .ok_or("a null tenant was accepted")?;
         assert_eq!(error.kind(), ErrorKind::InvalidParams);
-        for part in [
-            "targets.tenant is null, but the tenant level is not optional",
-            "targets.subscription is null, but the subscription level is not optional",
-        ] {
-            assert!(
-                error.message().contains(part),
-                "{part} in {}",
-                error.message()
-            );
-        }
-        let error = choice(&targets(&[
-            ("tenant", Some("72f988bf-86f1-41af-91ab-2d7cd011db47")),
-            ("subscription", None),
-        ]))
+        assert!(
+            error
+                .message()
+                .contains("targets.tenant is null, but the tenant level is not optional"),
+            "{}",
+            error.message()
+        );
+        Ok(())
+    }
+
+    /// No subscription is a null, so a choice that leaves the level out has
+    /// not chosen.
+    #[test]
+    fn a_choice_without_the_subscription_level_is_refused() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let error = choice(&targets(&[(
+            "tenant",
+            Some("72f988bf-86f1-41af-91ab-2d7cd011db47"),
+        )]))
         .err()
-        .ok_or("a null subscription was taken as none")?;
+        .ok_or("a choice without a subscription was accepted")?;
         assert_eq!(error.kind(), ErrorKind::InvalidParams);
+        assert!(
+            error.message().contains(
+                "targets.subscription is required: a subscription id from targets, or null for none"
+            ),
+            "{}",
+            error.message()
+        );
         Ok(())
     }
 }

@@ -133,6 +133,12 @@ async fn configure_offers_the_methods_levels_and_every_name() -> TestResult {
         .map(|l| &l["name"])
         .collect();
     assert_eq!(levels, ["tenant", "subscription"]);
+    assert_eq!(at(&result, "/levels/0/optional"), Value::Null);
+    assert_eq!(
+        at(&result, "/levels/1/optional"),
+        true,
+        "a tenant-level sign-in"
+    );
     assert_eq!(at(&result, "/sources"), json!(["cli"]));
     assert_eq!(at(&result, "/requirements"), json!(["roles"]));
     assert_eq!(at(&result, "/cloud"), "azure");
@@ -622,16 +628,20 @@ async fn a_missing_role_fails_select_and_another_subscription_can_be_chosen() ->
 }
 
 #[tokio::test]
-async fn a_tenant_level_choice_sets_no_subscription() -> TestResult {
+async fn a_null_subscription_is_a_tenant_level_choice_that_can_be_changed() -> TestResult {
     let mut fixture = Fixture::new(World::two_tenants()?).await?;
     sign_in(&mut fixture, &json!({})).await?;
     let selected = fixture
         .app
-        .result("select", json!({"targets": {"tenant": CONTOSO}}))
+        .result(
+            "select",
+            json!({"targets": {"tenant": CONTOSO, "subscription": null}}),
+        )
         .await?;
+    assert_valid("selectResult", &selected)?;
     assert_eq!(
         at(&selected, "/targets"),
-        json!({"tenant": {"id": CONTOSO, "name": "Contoso"}})
+        json!({"tenant": {"id": CONTOSO, "name": "Contoso"}, "subscription": null})
     );
     let env = fixture.env().await?;
     for name in [
@@ -641,6 +651,38 @@ async fn a_tenant_level_choice_sets_no_subscription() -> TestResult {
     ] {
         assert_eq!(env_value(&env, name), None, "{name}");
     }
+
+    let selected = fixture
+        .app
+        .result(
+            "select",
+            json!({"targets": {"tenant": CONTOSO, "subscription": DEV}}),
+        )
+        .await?;
+    assert_eq!(at(&selected, "/targets/subscription/id"), DEV);
+    assert_eq!(
+        env_value(&fixture.env().await?, "AZURE_SUBSCRIPTION_ID"),
+        Some(DEV)
+    );
+    Ok(())
+}
+
+/// A tenant-level sign-in has nothing to choose: it is ready with no
+/// subscription.
+#[tokio::test]
+async fn a_tenant_with_no_subscription_signs_in_with_none() -> TestResult {
+    let mut world = World::one_subscription()?;
+    world.accounts.subscriptions.clear();
+    let mut fixture = Fixture::new(world).await?;
+    let identity = sign_in(&mut fixture, &json!({})).await?;
+    assert_valid("signInResult", &identity)?;
+    assert_eq!(
+        at(&identity, "/targets"),
+        json!({"tenant": {"id": CONTOSO, "name": "Contoso"}, "subscription": null})
+    );
+    let env = fixture.env().await?;
+    assert_eq!(env_value(&env, "AZURE_TENANT_ID"), Some(CONTOSO));
+    assert_eq!(env_value(&env, "AZURE_SUBSCRIPTION_ID"), None);
     Ok(())
 }
 
@@ -659,6 +701,7 @@ async fn select_and_targets_refuse_what_the_sign_in_cannot_see() -> TestResult {
             json!({"targets": {"tenant": CONTOSO, "subscription": SHARED}}),
         ),
         ("select", json!({"targets": {"subscription": PROD}})),
+        ("select", json!({"targets": {"tenant": CONTOSO}})),
         (
             "select",
             json!({"targets": {"tenant": CONTOSO, "role": "dev"}}),

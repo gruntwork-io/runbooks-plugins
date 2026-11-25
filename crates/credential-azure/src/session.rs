@@ -77,12 +77,10 @@ impl Session {
         let principal = match &self.stage {
             Stage::Ready(chosen) => {
                 targets.insert(TENANT_LEVEL.to_owned(), Some(tenant_target(&chosen.tenant)));
-                if let Some(subscription) = &chosen.subscription {
-                    targets.insert(
-                        SUBSCRIPTION_LEVEL.to_owned(),
-                        Some(subscription_target(subscription)),
-                    );
-                }
+                targets.insert(
+                    SUBSCRIPTION_LEVEL.to_owned(),
+                    chosen.subscription.as_ref().map(subscription_target),
+                );
                 &chosen.principal
             }
             Stage::Choosing { tenant } => {

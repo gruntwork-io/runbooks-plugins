@@ -119,7 +119,11 @@ pub(crate) fn configure_result(az: &impl Az) -> ConfigureResult {
         driver_version: env!("CARGO_PKG_VERSION").to_owned(),
         levels: vec![
             level(TENANT_LEVEL, "Tenant"),
-            level(SUBSCRIPTION_LEVEL, "Subscription"),
+            // A tenant-level sign-in has no subscription.
+            Level {
+                optional: Some(true),
+                ..level(SUBSCRIPTION_LEVEL, "Subscription")
+            },
         ],
         methods: SignInMethod::ALL
             .into_iter()
