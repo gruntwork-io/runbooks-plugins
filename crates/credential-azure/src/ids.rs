@@ -24,6 +24,7 @@ macro_rules! guid_type {
                 is_guid(text).then(|| Self(text.to_ascii_lowercase()))
             }
 
+            /// The GUID, in lower case.
             pub fn as_str(&self) -> &str {
                 &self.0
             }
@@ -53,6 +54,7 @@ guid_type!(
 /// A tenant as a person names it: its id, or one of its domains.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TenantRef {
+    /// The tenant's GUID.
     Id(TenantId),
     /// `contoso.onmicrosoft.com`. `az` resolves it to an id.
     Domain(String),
@@ -60,6 +62,7 @@ pub enum TenantRef {
 
 impl TenantRef {
     /// `None` for text that is neither a GUID nor a domain name.
+    #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         if let Some(id) = TenantId::parse(text) {
             return Some(Self::Id(id));
@@ -67,6 +70,8 @@ impl TenantRef {
         is_domain(text).then(|| Self::Domain(text.to_ascii_lowercase()))
     }
 
+    /// The id or the domain, in lower case.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
             Self::Id(id) => id.as_str(),

@@ -17,7 +17,7 @@ use tempfile::TempDir;
 
 /// A token for ana@contoso.com in Contoso, built from its claims. Its
 /// signature stands for the part that must never reach the app.
-pub fn token() -> String {
+pub(crate) fn token() -> String {
     let claims = json!({
         "oid": "00000000-0000-4000-8000-0000000000a1",
         "tid": "11111111-1111-4111-8111-111111111111",
@@ -30,7 +30,7 @@ pub fn token() -> String {
     )
 }
 
-pub const DEVICE_LINE: &str = "To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code SCRIPTED1 to authenticate.";
+pub(crate) const DEVICE_LINE: &str = "To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code SCRIPTED1 to authenticate.";
 
 #[cfg(not(windows))]
 const SCRIPT: (&str, &str) = (
@@ -64,14 +64,14 @@ if exist \"%FAKE_AZ_RESPONSES%\\%key%.fail\" exit /b 1\r\n\
 exit /b 0\r\n",
 );
 
-pub struct ScriptedAz {
+pub(crate) struct ScriptedAz {
     /// Holds the script, and the responses and calls beside it.
     dir: TempDir,
 }
 
 /// One call the script recorded.
 #[derive(Debug)]
-pub struct ScriptCall {
+pub(crate) struct ScriptCall {
     /// `AZURE_CONFIG_DIR`.
     pub config_dir: String,
     /// `AZURE_EXTENSION_DIR`, empty when unset.
@@ -83,7 +83,7 @@ pub struct ScriptCall {
 }
 
 impl ScriptedAz {
-    pub fn new() -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new() -> Result<Self, Box<dyn Error>> {
         let dir = tempfile::tempdir()?;
         let program = dir.path().join(SCRIPT.0);
         fs::write(&program, SCRIPT.1)?;
@@ -95,24 +95,24 @@ impl ScriptedAz {
         Ok(Self { dir })
     }
 
-    pub fn program(&self) -> PathBuf {
+    pub(crate) fn program(&self) -> PathBuf {
         self.dir.path().join(SCRIPT.0)
     }
 
     /// The environment `main` would pass: the test process's own, without
     /// its `az` config variables, plus where the script's responses are.
-    pub fn env(&self) -> Vec<(OsString, OsString)> {
+    pub(crate) fn env(&self) -> Vec<(OsString, OsString)> {
         let mut env = Host::new(std::env::vars_os(), cfg!(windows)).az_env();
         env.push(("FAKE_AZ_RESPONSES".into(), self.dir.path().into()));
         env
     }
 
-    pub fn respond(&self, file: &str, contents: &str) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn respond(&self, file: &str, contents: &str) -> Result<(), Box<dyn Error>> {
         fs::write(self.dir.path().join(file), contents)?;
         Ok(())
     }
 
-    pub fn calls(&self) -> Result<Vec<ScriptCall>, Box<dyn Error>> {
+    pub(crate) fn calls(&self) -> Result<Vec<ScriptCall>, Box<dyn Error>> {
         let calls = fs::read_to_string(self.dir.path().join("calls"))?;
         Ok(calls
             .lines()

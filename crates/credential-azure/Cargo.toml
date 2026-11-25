@@ -1,11 +1,11 @@
 [package]
 name = "runbooks-credential-azure"
-description = "The Runbooks credential plugin for Azure: signs in through the Azure CLI and hands a run its environment."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+description = "The Runbooks credential plugin for Azure: signs in through the Azure CLI and hands a run its environment."
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

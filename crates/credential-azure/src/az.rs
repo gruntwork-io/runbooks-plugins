@@ -20,13 +20,14 @@ use tokio::sync::oneshot;
 use crate::claims::{Principal, principal_of_token};
 use crate::ids::{ObjectId, SubscriptionId, TenantId, TenantRef};
 
+/// Where the error for a missing `az` sends the person to install it.
 pub const AZ_INSTALL_URL: &str = "https://learn.microsoft.com/cli/azure/install-azure-cli";
 
 /// How long one `az` call that needs no person may take.
 pub const AZ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long an interactive `az login` may wait for the person.
-pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+pub const LOGIN_TIMEOUT: Duration = Duration::from_mins(15);
 
 /// The most `az` may print to standard output: `az account list` for a
 /// large directory is a few hundred kilobytes.
@@ -51,12 +52,14 @@ const TENANTS_URL: &str = "https://management.azure.com/tenants?api-version=2022
 /// The config directory one sign-in's `az` runs with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AzDir {
+    /// `AZURE_CONFIG_DIR`.
     pub config: PathBuf,
     /// `AZURE_EXTENSION_DIR`. `None` leaves `az` its default, a
     /// `cliextensions` directory inside `config`.
     pub extensions: Option<PathBuf>,
 }
 
+/// How an `az login` with a person signs them in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Interactive {
     /// `az login`, which opens a browser.
@@ -68,14 +71,20 @@ pub enum Interactive {
 /// Where the person enters a device code, and the code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceCode {
+    /// The page to open.
     pub url: String,
+    /// The code to enter there.
     pub code: String,
 }
 
+/// A subscription, as `az account list` has it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Subscription {
+    /// Its id.
     pub id: SubscriptionId,
+    /// Its name, or its id when `az` gives none.
     pub name: String,
+    /// The tenant it belongs to.
     pub tenant_id: TenantId,
 }
 
@@ -88,8 +97,10 @@ pub struct Accounts {
     pub tenants: Vec<TenantId>,
 }
 
+/// A tenant the login can see.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tenant {
+    /// Its id.
     pub id: TenantId,
     /// Its display name, or else its default domain.
     pub name: Option<String>,
@@ -115,6 +126,7 @@ pub trait Az: Send + Sync + 'static {
         tenant: Option<&TenantRef>,
     ) -> impl Future<Output = Result<Principal, PluginError>> + Send;
 
+    /// The subscriptions and tenants `dir`'s login can use.
     fn accounts(&self, dir: &AzDir) -> impl Future<Output = Result<Accounts, PluginError>> + Send;
 
     /// Every tenant the login can see, including those it is a guest in.
@@ -148,8 +160,9 @@ pub struct AzCli {
 
 impl AzCli {
     /// Runs `program` with exactly `env`, plus the sign-in's config
-    /// directory and [`QUIET`].
-    pub fn new(program: Option<PathBuf>, env: Vec<(OsString, OsString)>) -> Self {
+    /// directory and settings that keep `az` quiet.
+    #[must_use]
+    pub const fn new(program: Option<PathBuf>, env: Vec<(OsString, OsString)>) -> Self {
         Self { program, env }
     }
 
@@ -179,12 +192,15 @@ impl AzCli {
         if let Some(extensions) = &dir.extensions {
             child.env("AZURE_EXTENSION_DIR", extensions);
         }
-        let mut child = child.spawn().map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => az_missing(),
-            _ => PluginError::new(
-                ErrorKind::Internal,
-                format!("could not start {}: {error}", program.display()),
-            ),
+        let mut child = child.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                az_missing()
+            } else {
+                PluginError::new(
+                    ErrorKind::Internal,
+                    format!("could not start {}: {error}", program.display()),
+                )
+            }
         })?;
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let finished = tokio::time::timeout(timeout, async {
@@ -455,7 +471,7 @@ fn accounts_of(raw: Vec<RawAccount>) -> Accounts {
 }
 
 /// MSAL's device code line: "To sign in, use a web browser to open the page
-/// https://microsoft.com/devicelogin and enter the code ABCD1234E to
+/// <https://microsoft.com/devicelogin> and enter the code ABCD1234E to
 /// authenticate."
 fn parse_device_code(line: &str) -> Option<DeviceCode> {
     let words: Vec<&str> = line.split_whitespace().collect();
@@ -631,7 +647,7 @@ mod tests {
     use runbooks_plugin_protocol::credential::ErrorKind;
     use serde_json::json;
 
-    use super::{DeviceCode, RawAccount, accounts_of, failure, parse_device_code};
+    use super::{DeviceCode, RawAccount, TenantId, accounts_of, failure, parse_device_code};
 
     #[test]
     fn reads_msals_device_code_line() {
@@ -732,7 +748,7 @@ mod tests {
             .map(|s| s.name.as_str())
             .collect();
         assert_eq!(names, ["Prod"]);
-        let tenants: Vec<&str> = accounts.tenants.iter().map(|t| t.as_str()).collect();
+        let tenants: Vec<&str> = accounts.tenants.iter().map(TenantId::as_str).collect();
         assert_eq!(tenants, [tenant, guest]);
         Ok(())
     }

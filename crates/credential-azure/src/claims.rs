@@ -1,4 +1,5 @@
 //! Who a Microsoft Entra access token was issued to, read from its claims.
+//!
 //! The token's signature is not checked: the token came straight from `az`
 //! or Entra, and the plugin uses it only to describe the sign-in.
 
@@ -14,22 +15,29 @@ use crate::ids::{ObjectId, TenantId};
 pub struct Principal {
     /// A user's sign-in name (UPN), or a service principal's client id.
     pub name: String,
+    /// Its object id in `tenant_id`.
     pub object_id: ObjectId,
+    /// Whether it is a user, a guest or a service principal.
     pub kind: PrincipalKind,
+    /// The tenant the token is for.
     pub tenant_id: TenantId,
 }
 
+/// What kind of principal a token was issued to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrincipalKind {
+    /// A user signed in to their home tenant.
     User,
     /// A user signed in to a tenant other than their home tenant.
     Guest,
+    /// An application, signed in with its client id.
     ServicePrincipal,
 }
 
 impl PrincipalKind {
     /// The value of `AZURE_PRINCIPAL_TYPE`.
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Guest => "guest",
@@ -57,6 +65,7 @@ struct Claims {
 /// names no object id and tenant.
 ///
 /// The payload is base64url, read with or without padding.
+#[must_use]
 pub fn principal_of_token(token: &str) -> Option<Principal> {
     let payload = token.split('.').nth(1)?;
     let payload = URL_SAFE_NO_PAD_INDIFFERENT.decode(payload).ok()?;
@@ -69,14 +78,14 @@ fn principal_of_claims(claims: Claims) -> Option<Principal> {
     let object_id = ObjectId::parse(&present(claims.oid)?)?;
     let tenant_id = TenantId::parse(&present(claims.tid)?)?;
     let user_name = present(claims.upn)
-        .or(present(claims.unique_name))
-        .or(present(claims.preferred_username));
+        .or_else(|| present(claims.unique_name))
+        .or_else(|| present(claims.preferred_username));
 
     let user_name = match user_name {
         Some(name) if claims.idtyp.as_deref() != Some("app") => name,
         _ => {
             let name = present(claims.appid)
-                .or(present(claims.azp))
+                .or_else(|| present(claims.azp))
                 .unwrap_or_else(|| object_id.to_string());
             return Some(Principal {
                 name,

@@ -2,6 +2,7 @@
 //! machine: where `az` is, and where the person's own `az` login lives.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Variables that point `az` at a config directory. The plugin sets its own
@@ -16,6 +17,19 @@ const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 pub struct Host {
     vars: Vec<(OsString, OsString)>,
     windows: bool,
+}
+
+/// The variables' names only: their values may hold the person's secrets.
+impl fmt::Debug for Host {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Host")
+            .field(
+                "vars",
+                &self.vars.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
+            .field("windows", &self.windows)
+            .finish()
+    }
 }
 
 /// The person's own `az` login, which the `cli` source copies.
@@ -38,6 +52,7 @@ impl Host {
     }
 
     /// A variable's value. Unset and empty are the same.
+    #[must_use]
     pub fn var(&self, name: &str) -> Option<&OsStr> {
         self.vars
             .iter()
@@ -56,6 +71,7 @@ impl Host {
 
     /// The environment every `az` the plugin runs starts from: all of it,
     /// except the variables that choose `az`'s config directory.
+    #[must_use]
     pub fn az_env(&self) -> Vec<(OsString, OsString)> {
         self.vars
             .iter()
@@ -89,12 +105,11 @@ impl Host {
     }
 
     fn is_program(&self, path: &Path) -> bool {
-        match path.metadata() {
-            Ok(meta) => meta.is_file() && (self.windows || executable(&meta)),
-            Err(_) => false,
-        }
+        path.metadata()
+            .is_ok_and(|meta| meta.is_file() && (self.windows || executable(&meta)))
     }
 
+    /// Where the environment says the person's own `az` login is.
     pub fn local_login(&self) -> LocalLogin {
         let home = if self.windows { "USERPROFILE" } else { "HOME" };
         let config_dir = self
@@ -162,7 +177,7 @@ mod tests {
             temp.path().join("second"),
         );
         for dir in [&empty, &first, &second] {
-            fs::create_dir(dir)?;
+            fs::create_dir_all(dir)?;
         }
         for dir in [&first, &second] {
             fs::write(dir.join("az"), "#!/bin/sh\n")?;
@@ -191,8 +206,8 @@ mod tests {
     fn on_windows_a_program_needs_an_extension_from_pathext() -> TestResult {
         let temp = tempfile::tempdir()?;
         let (bash_only, cli) = (temp.path().join("bash"), temp.path().join("cli"));
-        fs::create_dir(&bash_only)?;
-        fs::create_dir(&cli)?;
+        fs::create_dir_all(&bash_only)?;
+        fs::create_dir_all(&cli)?;
         fs::write(bash_only.join("az"), "#!/usr/bin/env bash\n")?;
         fs::write(cli.join("az"), "#!/usr/bin/env bash\n")?;
         fs::write(cli.join("az.cmd"), "@echo off\r\n")?;
@@ -245,5 +260,13 @@ mod tests {
         .az_env();
         let names: Vec<_> = env.iter().map(|(key, _)| key.clone()).collect();
         assert_eq!(names, [OsString::from("PATH")]);
+    }
+
+    #[test]
+    fn debug_shows_variable_names_but_not_their_values() {
+        let secret = OsString::from("hunter2");
+        let shown = format!("{:?}", host(&[("ARM_CLIENT_SECRET", &secret)], false));
+        assert!(shown.contains("ARM_CLIENT_SECRET"), "{shown}");
+        assert!(!shown.contains("hunter2"), "{shown}");
     }
 }
