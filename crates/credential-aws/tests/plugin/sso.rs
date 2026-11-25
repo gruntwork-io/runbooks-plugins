@@ -160,6 +160,18 @@ async fn a_pinned_account_and_role_are_signed_in_to_directly() -> TestResult {
     // Never listed, so the account goes by its IAM alias.
     assert_eq!(at(&identity, "/targets/account/name"), "sandbox");
     assert_eq!(at(&identity, "/targets/role/id"), "deploy");
+
+    // Once listed, it goes by its name in IAM Identity Center.
+    app.ok("targets", json!({"level": "account"}), "targetsResult")
+        .await?;
+    let identity = app
+        .ok(
+            "select",
+            json!({"targets": {"account": ACCOUNT, "role": "deploy"}}),
+            "selectResult",
+        )
+        .await?;
+    assert_eq!(at(&identity, "/targets/account/name"), "Production");
     Ok(())
 }
 
@@ -206,6 +218,20 @@ async fn with_a_choice_the_person_picks_an_account_then_a_role() -> TestResult {
     // Without a parent, the role level needs an account chosen first.
     app.fails("targets", json!({"level": "role"}), "invalidParams")
         .await?;
+    // AWS has two levels, and a call naming another is refused for it.
+    for (method, params) in [
+        ("targets", json!({"level": "region"})),
+        (
+            "select",
+            json!({"targets": {"account": ACCOUNT, "region": "eu-west-1"}}),
+        ),
+    ] {
+        let error = app.fails(method, params, "invalidParams").await?;
+        assert!(
+            message(&error)?.contains("AWS has no level \"region\""),
+            "{error}"
+        );
+    }
 
     let identity = app
         .ok(
@@ -357,6 +383,21 @@ async fn a_refused_expired_or_unanswered_sign_in_says_which() -> TestResult {
         "{error}"
     );
 
+    // Any other failed poll is that failure.
+    let unreachable = FakeAws::default().polls(vec![Err(AwsError::new(
+        Service::SsoOidc,
+        AwsErrorKind::Network,
+        "dispatch failure: connection refused",
+    ))]);
+    let mut app = paused(unreachable).await?;
+    let error = app
+        .fails("signIn", sso_sign_in(&json!({})), "network")
+        .await?;
+    assert!(
+        message(&error)?.contains("while waiting for the SSO sign-in"),
+        "{error}"
+    );
+
     // Never approved: polling stops when the device code expires, 600s in.
     let unanswered = FakeAws::default();
     let mut app = paused(unanswered.clone()).await?;
@@ -409,6 +450,11 @@ async fn the_sso_fields_are_checked_before_aws_is_called() -> TestResult {
         ),
         (json!({"ssoStartUrl": "https://"}), "https:// URL"),
         (
+            json!({"ssoStartUrl": "https://my-org.awsapps.com/ start"}),
+            "https:// URL",
+        ),
+        (json!({"ssoStartUrl": start_url_of(2049)}), "https:// URL"),
+        (
             json!({"ssoStartUrl": START_URL, "ssoRegion": "Ireland"}),
             "the ssoRegion field is invalid",
         ),
@@ -427,6 +473,33 @@ async fn the_sso_fields_are_checked_before_aws_is_called() -> TestResult {
         assert!(message(&error)?.contains(says), "{error}");
     }
     assert_eq!(aws.sso_log(), Vec::<String>::new());
+    Ok(())
+}
+
+/// An access portal URL of `len` bytes.
+fn start_url_of(len: usize) -> String {
+    let mut url = format!("{START_URL}/");
+    url.push_str(&"a".repeat(len.saturating_sub(url.len())));
+    url
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_access_portal_url_may_be_2048_bytes() -> TestResult {
+    let aws = FakeAws::default().polls(vec![Ok(approved())]);
+    let mut app = paused(aws.clone()).await?;
+    let url = start_url_of(2048);
+    let fields = json!({"ssoStartUrl": url, "ssoRegion": "eu-west-1"});
+    // Signed in, with no account to choose.
+    app.fails(
+        "signIn",
+        json!({"method": "sso", "fields": fields, "pins": {}, "requirements": []}),
+        "accessDenied",
+    )
+    .await?;
+    assert_eq!(
+        aws.sso_log().first(),
+        Some(&format!("start {url} in eu-west-1"))
+    );
     Ok(())
 }
 
@@ -461,6 +534,31 @@ async fn env_gets_a_role_fresh_keys_before_its_keys_expire() -> TestResult {
         .filter(|call| call.starts_with("keys"))
         .count();
     assert_eq!(fetched, 2);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn keys_due_in_exactly_five_minutes_are_refreshed() -> TestResult {
+    let aws = FakeAws::default()
+        .polls(vec![Ok(approved())])
+        .account(ACCOUNT, "Production", &["deploy"])?
+        .role_keys(
+            ACCOUNT,
+            "deploy",
+            vec![
+                Ok(keys("ASIAOLD", "2026-11-24T18:05:00Z")),
+                Ok(keys("ASIANEW", IN_AN_HOUR)),
+            ],
+        )
+        .caller("ASIAOLD", ACCOUNT, SSO_ARN)?;
+    let mut app = paused(aws).await?;
+    app.ok("signIn", sso_sign_in(&json!({})), "signInResult")
+        .await?;
+    let env = app.ok("env", json!({}), "envResult").await?;
+    assert_eq!(
+        values_of(&env)?.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "ASIANEW"
+    );
     Ok(())
 }
 
@@ -507,6 +605,29 @@ async fn keys_that_cannot_be_refreshed_are_used_until_they_expire() -> TestResul
         message(&error)?.contains("your SSO sign-in has expired"),
         "{error}"
     );
+
+    // Keys that expire this second are not used: the refresh's failure is
+    // the answer.
+    let aws = FakeAws::default()
+        .polls(vec![Ok(approved())])
+        .account(ACCOUNT, "Production", &["deploy"])?
+        .role_keys(
+            ACCOUNT,
+            "deploy",
+            vec![
+                Ok(keys("ASIAOLD", NOW)),
+                Err(sso_failure(AwsErrorKind::Network, "dispatch failure")),
+            ],
+        )
+        .caller("ASIAOLD", ACCOUNT, SSO_ARN)?;
+    let mut app = paused(aws).await?;
+    app.ok("signIn", sso_sign_in(&json!({})), "signInResult")
+        .await?;
+    let error = app.fails("env", json!({}), "network").await?;
+    assert!(
+        message(&error)?.contains("getting fresh keys for the role"),
+        "{error}"
+    );
     Ok(())
 }
 
@@ -543,6 +664,77 @@ async fn a_sign_out_during_a_refresh_stays_signed_out() -> TestResult {
     open.send(()).map_err(|()| "the refresh stopped waiting")?;
     // The env call that began before the sign-out may answer; nothing after it.
     app.response(env).await?;
+    app.fails("env", json!({}), "notSignedIn").await?;
+    Ok(())
+}
+
+/// Until the fake has had `count` `GetRoleCredentials` calls, each held or
+/// answered.
+async fn keys_calls(aws: &FakeAws, count: usize) -> TestResult {
+    let calls = || {
+        aws.sso_log()
+            .iter()
+            .filter(|call| call.starts_with("keys"))
+            .count()
+    };
+    for _ in 0..100 {
+        if calls() >= count {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err(format!("{} keys calls, not {count}: {:?}", calls(), aws.sso_log()).into())
+}
+
+/// Signed in to a role whose keys are about to expire, with two env calls
+/// that each refresh them: one still waiting on AWS, and one after it that
+/// has answered, its keys `ASIAFIRST` kept. The waiting one gets
+/// `ASIASECOND` once the sender is used.
+async fn two_refreshes() -> Result<(App, oneshot::Sender<()>, i64), Box<dyn Error>> {
+    let aws = FakeAws::default()
+        .polls(vec![Ok(approved())])
+        .account(ACCOUNT, "Production", &["deploy"])?
+        .role_keys(
+            ACCOUNT,
+            "deploy",
+            vec![
+                Ok(keys("ASIAOLD", IN_TWO_MINUTES)),
+                Ok(keys("ASIAFIRST", IN_AN_HOUR)),
+                Ok(keys("ASIASECOND", IN_AN_HOUR)),
+            ],
+        )
+        .caller("ASIAOLD", ACCOUNT, SSO_ARN)?;
+    let mut app = paused(aws.clone()).await?;
+    app.ok("signIn", sso_sign_in(&json!({})), "signInResult")
+        .await?;
+    let open = aws.hold_next_keys();
+    let waiting = app.send("env", json!({})).await?;
+    keys_calls(&aws, 2).await?;
+    let env = app.ok("env", json!({}), "envResult").await?;
+    assert_eq!(
+        values_of(&env)?.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "ASIAFIRST"
+    );
+    Ok((app, open, waiting))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refresh_that_ends_after_another_or_a_sign_out_changes_nothing() -> TestResult {
+    // The keys of the refresh that ended first are kept.
+    let (mut app, open, waiting) = two_refreshes().await?;
+    open.send(()).map_err(|()| "the refresh stopped waiting")?;
+    app.response(waiting).await?;
+    let env = app.ok("env", json!({}), "envResult").await?;
+    assert_eq!(
+        values_of(&env)?.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "ASIAFIRST"
+    );
+
+    // A sign-out after it stays a sign-out.
+    let (mut app, open, waiting) = two_refreshes().await?;
+    app.ok("signOut", json!({}), "signOutResult").await?;
+    open.send(()).map_err(|()| "the refresh stopped waiting")?;
+    app.response(waiting).await?;
     app.fails("env", json!({}), "notSignedIn").await?;
     Ok(())
 }

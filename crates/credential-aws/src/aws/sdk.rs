@@ -42,13 +42,36 @@ const MAX_PAGES: usize = 1000;
 /// Calls AWS with the SDK's default HTTPS client: rustls, the platform's
 /// trusted roots, and `HTTPS_PROXY` / `NO_PROXY` from the environment.
 #[derive(Debug, Default)]
-pub struct SdkAws;
+pub struct SdkAws {
+    /// Where the IAM Identity Center calls go in place of AWS's endpoint for
+    /// their region. Only this module's tests set one: a loopback server.
+    endpoint: Option<String>,
+}
 
 impl SdkAws {
-    /// Holds nothing: each call builds its SDK client from its keys and region.
+    /// Calls AWS's own endpoints: each call builds its SDK client from its
+    /// keys and region.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self { endpoint: None }
+    }
+
+    fn oidc_client(&self, region: &Region) -> aws_sdk_ssooidc::Client {
+        let mut config = aws_sdk_ssooidc::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(sdk_region(region))
+            .timeout_config(timeouts());
+        config.set_endpoint_url(self.endpoint.clone());
+        aws_sdk_ssooidc::Client::from_conf(config.build())
+    }
+
+    fn sso_client(&self, region: &Region) -> aws_sdk_sso::Client {
+        let mut config = aws_sdk_sso::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(sdk_region(region))
+            .timeout_config(timeouts());
+        config.set_endpoint_url(self.endpoint.clone());
+        aws_sdk_sso::Client::from_conf(config.build())
     }
 }
 
@@ -113,7 +136,7 @@ impl Aws for SdkAws {
         start_url: &str,
         region: &Region,
     ) -> Result<DeviceAuthorization, AwsError> {
-        let oidc = oidc_client(region);
+        let oidc = self.oidc_client(region);
         let client = oidc
             .register_client()
             .client_name(CLIENT_NAME)
@@ -169,7 +192,8 @@ impl Aws for SdkAws {
         device: &DeviceAuthorization,
         region: &Region,
     ) -> Result<TokenPoll, AwsError> {
-        let answer = oidc_client(region)
+        let answer = self
+            .oidc_client(region)
             .create_token()
             .client_id(&device.client_id)
             .client_secret(device.client_secret.expose())
@@ -208,7 +232,7 @@ impl Aws for SdkAws {
         token: &SsoToken,
         region: &Region,
     ) -> Result<Vec<SsoAccount>, AwsError> {
-        let sso = sso_client(region);
+        let sso = self.sso_client(region);
         let mut accounts = Vec::new();
         let mut next_token = None;
         for _page in 0..MAX_PAGES {
@@ -241,7 +265,7 @@ impl Aws for SdkAws {
         account: &AccountId,
         region: &Region,
     ) -> Result<Vec<String>, AwsError> {
-        let sso = sso_client(region);
+        let sso = self.sso_client(region);
         let mut roles = Vec::new();
         let mut next_token = None;
         for _page in 0..MAX_PAGES {
@@ -275,7 +299,8 @@ impl Aws for SdkAws {
         role: &str,
         region: &Region,
     ) -> Result<AwsCredentials, AwsError> {
-        let answer = sso_client(region)
+        let answer = self
+            .sso_client(region)
             .get_role_credentials()
             .access_token(token.access_token.expose())
             .account_id(account.as_str())
@@ -314,26 +339,6 @@ impl Aws for SdkAws {
                 .flatten(),
         })
     }
-}
-
-fn oidc_client(region: &Region) -> aws_sdk_ssooidc::Client {
-    aws_sdk_ssooidc::Client::from_conf(
-        aws_sdk_ssooidc::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(sdk_region(region))
-            .timeout_config(timeouts())
-            .build(),
-    )
-}
-
-fn sso_client(region: &Region) -> aws_sdk_sso::Client {
-    aws_sdk_sso::Client::from_conf(
-        aws_sdk_sso::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(sdk_region(region))
-            .timeout_config(timeouts())
-            .build(),
-    )
 }
 
 /// A positive count of seconds, as SSO-OIDC gives lifetimes and intervals.
@@ -476,17 +481,27 @@ fn chain(error: &(dyn StdError + 'static)) -> String {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
-    use std::io;
+    use std::io::{self, BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread;
+    use std::time::Duration;
 
+    use aws_sdk_sso::operation::get_role_credentials::GetRoleCredentialsError;
     use aws_sdk_sts::config::http::HttpResponse;
     use aws_sdk_sts::error::{ConnectorError, ErrorMetadata, SdkError};
     use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
+    use time::OffsetDateTime;
 
-    use super::classify;
-    use crate::aws::{AwsError, AwsErrorKind, Service};
+    use super::{SdkAws, classify, seconds};
+    use crate::aws::{Aws, AwsError, AwsErrorKind, Service, SsoAccount, SsoToken};
+    use crate::identity::AccountId;
+    use crate::region::Region;
+    use crate::secret::Secret;
 
     type TestResult = Result<(), Box<dyn Error>>;
     type StsError = SdkError<GetCallerIdentityError>;
+    type SsoError = SdkError<GetRoleCredentialsError>;
 
     /// What STS answering `status` with `code` and `message` reads as.
     fn answered(
@@ -599,5 +614,310 @@ mod tests {
         assert_eq!(error.kind, AwsErrorKind::Unexpected);
         assert!(error.detail.ends_with(": no region"), "{error}");
         Ok(())
+    }
+
+    const ACCESS_TOKEN: &str = "test-sso-access-token";
+
+    /// [`SdkAws`] calling IAM Identity Center on a loopback port, where each
+    /// request, on a connection of its own, gets what `answer` gives for its
+    /// target. The server keeps each target it was sent, with its token.
+    struct FakeSso {
+        aws: SdkAws,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeSso {
+        fn start(answer: fn(&str) -> String) -> io::Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            thread::spawn(move || serve(&listener, answer, &seen));
+            Ok(Self {
+                aws: SdkAws {
+                    endpoint: Some(endpoint),
+                },
+                requests,
+            })
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    /// Answers each connection to `listener` in turn. A connection that
+    /// fails fails only its own call.
+    fn serve(listener: &TcpListener, answer: fn(&str) -> String, seen: &Mutex<Vec<String>>) {
+        for stream in listener.incoming() {
+            let _served: io::Result<()> = stream.and_then(|stream| reply(stream, answer, seen));
+        }
+    }
+
+    fn reply(
+        mut stream: TcpStream,
+        answer: fn(&str) -> String,
+        seen: &Mutex<Vec<String>>,
+    ) -> io::Result<()> {
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line)?;
+        let mut headers = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            let line = line.trim_end().to_owned();
+            if line.is_empty() {
+                break;
+            }
+            headers.push(line);
+        }
+        let header = |name: &str| {
+            headers.iter().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_owned())
+            })
+        };
+        let length = header("content-length")
+            .and_then(|length| length.parse().ok())
+            .unwrap_or(0);
+        reader.read_exact(&mut vec![0; length])?;
+        let target = request_line.split(' ').nth(1).unwrap_or_default();
+        let token = header("x-amz-sso_bearer_token").unwrap_or_default();
+        seen.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("{target} with {token}"));
+        stream.write_all(answer(target).as_bytes())?;
+        stream.flush()
+    }
+
+    /// An HTTP answer with a JSON body, and AWS's error type for an error.
+    fn json(status: u16, error_type: Option<&str>, body: &str) -> String {
+        let error =
+            error_type.map_or_else(String::new, |kind| format!("x-amzn-errortype: {kind}\r\n"));
+        format!(
+            "HTTP/1.1 {status} Fake\r\ncontent-type: application/json\r\n{error}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// IAM Identity Center's answers: two pages of accounts and of roles,
+    /// a role's keys with and without an expiry, and its refusals.
+    fn iam_identity_center(target: &str) -> String {
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let second_page = query.contains("next_token=more");
+        let role = |name: &str| query.contains(&format!("role_name={name}"));
+        match path {
+            "/assignment/accounts" if second_page => json(
+                200,
+                None,
+                r#"{"accountList":[{"accountId":"210987654321","accountName":""},{"accountId":"not-an-account","accountName":"Bad"}]}"#,
+            ),
+            "/assignment/accounts" => json(
+                200,
+                None,
+                r#"{"accountList":[{"accountId":"123456789012","accountName":"Production"}],"nextToken":"more"}"#,
+            ),
+            "/assignment/roles" if second_page => {
+                json(200, None, r#"{"roleList":[{"roleName":"admin"}]}"#)
+            }
+            "/assignment/roles" => json(
+                200,
+                None,
+                r#"{"roleList":[{"roleName":"deploy","accountId":"123456789012"},{"roleName":""}],"nextToken":"more"}"#,
+            ),
+            "/federation/credentials" if role("deploy") => json(
+                200,
+                None,
+                r#"{"roleCredentials":{"accessKeyId":"ASIASSO","secretAccessKey":"test-sdk-role-secret","sessionToken":"test-sdk-role-token","expiration":1767225600000}}"#,
+            ),
+            "/federation/credentials" if role("lasting") => json(
+                200,
+                None,
+                r#"{"roleCredentials":{"accessKeyId":"ASIASSO","secretAccessKey":"test-sdk-role-secret","expiration":0}}"#,
+            ),
+            "/federation/credentials" if role("forbidden") => json(
+                403,
+                Some("ForbiddenException"),
+                r#"{"message":"No access"}"#,
+            ),
+            "/federation/credentials" if role("revoked") => json(
+                401,
+                Some("UnauthorizedException"),
+                r#"{"message":"Session token not found or invalid"}"#,
+            ),
+            "/federation/credentials" if role("gone") => json(
+                404,
+                Some("ResourceNotFoundException"),
+                r#"{"message":"Could not find account"}"#,
+            ),
+            _ => json(400, Some("InvalidRequestException"), "{}"),
+        }
+    }
+
+    fn token() -> SsoToken {
+        SsoToken {
+            access_token: Secret::new(ACCESS_TOKEN),
+            expires_in: None,
+        }
+    }
+
+    fn production() -> Result<AccountId, Box<dyn Error>> {
+        Ok(AccountId::parse("123456789012")?)
+    }
+
+    /// Every page is listed, with the token. An account with an empty name
+    /// goes by its id, and one whose id is not an account id is left out.
+    #[tokio::test]
+    async fn the_accounts_are_every_pages_by_name_or_else_id() -> TestResult {
+        let sso = FakeSso::start(iam_identity_center)?;
+        let accounts = sso
+            .aws
+            .sso_accounts(&token(), &Region::parse("eu-west-1")?)
+            .await?;
+        assert_eq!(
+            accounts,
+            [
+                SsoAccount {
+                    id: production()?,
+                    name: "Production".to_owned(),
+                },
+                SsoAccount {
+                    id: AccountId::parse("210987654321")?,
+                    name: "210987654321".to_owned(),
+                },
+            ]
+        );
+        let requests = sso.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("/assignment/accounts")
+                    && request.ends_with(&format!(" with {ACCESS_TOKEN}"))),
+            "{requests:?}"
+        );
+        Ok(())
+    }
+
+    /// Every page's roles, without the ones with an empty name.
+    #[tokio::test]
+    async fn the_roles_are_every_pages_named_ones() -> TestResult {
+        let sso = FakeSso::start(iam_identity_center)?;
+        let roles = sso
+            .aws
+            .sso_roles(&token(), &production()?, &Region::parse("eu-west-1")?)
+            .await?;
+        assert_eq!(roles, ["deploy", "admin"]);
+        let requests = sso.requests();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("account_id=123456789012")),
+            "{requests:?}"
+        );
+        Ok(())
+    }
+
+    /// A role's keys expire when AWS says, in milliseconds since the epoch,
+    /// and never when it says 0.
+    #[tokio::test]
+    async fn a_roles_keys_expire_at_the_millisecond_aws_gives() -> TestResult {
+        let sso = FakeSso::start(iam_identity_center)?;
+        let region = Region::parse("eu-west-1")?;
+        let keys = sso
+            .aws
+            .role_credentials(&token(), &production()?, "deploy", &region)
+            .await?;
+        assert_eq!(keys.access_key_id, "ASIASSO");
+        assert_eq!(keys.secret_access_key.expose(), "test-sdk-role-secret");
+        assert_eq!(
+            keys.session_token.as_ref().map(Secret::expose),
+            Some("test-sdk-role-token")
+        );
+        assert_eq!(
+            keys.expires_at,
+            Some(OffsetDateTime::from_unix_timestamp(1_767_225_600)?)
+        );
+
+        let keys = sso
+            .aws
+            .role_credentials(&token(), &production()?, "lasting", &region)
+            .await?;
+        assert_eq!(keys.expires_at, None);
+        assert!(keys.session_token.is_none());
+        Ok(())
+    }
+
+    /// IAM Identity Center's refusals: a role the person may not use, a
+    /// token it no longer takes, and an account or role it does not know.
+    #[tokio::test]
+    async fn iam_identity_centers_refusals_are_read_into_kinds() -> TestResult {
+        let sso = FakeSso::start(iam_identity_center)?;
+        let region = Region::parse("eu-west-1")?;
+        for (role, kind, detail) in [
+            (
+                "forbidden",
+                AwsErrorKind::Refused,
+                "ForbiddenException: No access",
+            ),
+            (
+                "revoked",
+                AwsErrorKind::Expired,
+                "UnauthorizedException: Session token not found or invalid",
+            ),
+            (
+                "gone",
+                AwsErrorKind::NotFound,
+                "ResourceNotFoundException: Could not find account",
+            ),
+        ] {
+            let error = sso
+                .aws
+                .role_credentials(&token(), &production()?, role, &region)
+                .await
+                .err()
+                .ok_or("IAM Identity Center gave keys")?;
+            assert_eq!(
+                (error.service, error.kind, error.detail.as_str()),
+                (Service::Sso, kind, detail),
+                "{role}"
+            );
+        }
+        Ok(())
+    }
+
+    /// An answer the SDK could not read may hold keys or a token, so none of
+    /// it is shown. A request it could not build says why.
+    #[test]
+    fn an_unreadable_answer_is_never_shown_and_an_unbuilt_request_says_why() -> TestResult {
+        let unreadable = SsoError::response_error(
+            r#"expected '}' after {"secretAccessKey":"test-sdk-role-secret""#,
+            HttpResponse::new(200.try_into()?, "".into()),
+        );
+        let error = classify(Service::Sso, &unreadable);
+        assert_eq!(
+            (error.kind, error.detail.as_str()),
+            (AwsErrorKind::Unexpected, "AWS's answer could not be read")
+        );
+        let unbuilt = SsoError::construction_failure("no account id");
+        let error = classify(Service::Sso, &unbuilt);
+        assert_eq!(error.kind, AwsErrorKind::Unexpected);
+        assert!(error.detail.ends_with(": no account id"), "{error}");
+        Ok(())
+    }
+
+    /// SSO-OIDC's lifetimes and intervals: a positive count of seconds. 0 or
+    /// less is none, so RFC 8628's default applies.
+    #[test]
+    fn only_a_positive_count_of_seconds_is_a_duration() {
+        assert_eq!(seconds(600), Some(Duration::from_secs(600)));
+        assert_eq!(seconds(1), Some(Duration::from_secs(1)));
+        assert_eq!(seconds(0), None);
+        assert_eq!(seconds(-5), None);
     }
 }
