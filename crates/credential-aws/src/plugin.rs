@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use runbooks_plugin_protocol::credential::{
     ConfigureParams, ConfigureResult, DetectParams, DetectResult, EnvResult, EnvValue,
-    EnvValueToItem, ErrorKind, Identity, Requirement, SelectParams, SelectResult, SignInParams,
-    SignInResult, SignOutResult, Target, TargetsParams, TargetsResult,
+    EnvValueToItem, ErrorKind, Identity, IdentityWarningsItem, Requirement, SelectParams,
+    SelectResult, SignInParams, SignInResult, SignOutResult, Target, TargetsParams, TargetsResult,
 };
 use runbooks_plugin_transport::{CredentialPlugin, PluginError, Prompts};
 use serde_json::Map;
@@ -101,6 +101,9 @@ struct Ready {
     credentials: AwsCredentials,
     /// The run's `AWS_REGION`.
     region: Region,
+    /// AWS said the account has not enabled `region`. False when the check
+    /// failed: that says nothing about the region.
+    region_not_enabled: bool,
     principal: Principal,
     /// The sign-in method or detection source it came from.
     method: String,
@@ -128,9 +131,17 @@ struct SsoRole {
 }
 
 impl Ready {
+    /// With today's block's warning when the run's region is not enabled.
     fn identity(&self) -> Identity {
-        self.principal
-            .identity(&self.method, self.credentials.expires_at)
+        let mut identity = self
+            .principal
+            .identity(&self.method, self.credentials.expires_at);
+        if self.region_not_enabled {
+            identity.warnings.push(IdentityWarningsItem {
+                message: format!("Region {} is not enabled for this AWS account", self.region),
+            });
+        }
+        identity
     }
 }
 
@@ -226,7 +237,8 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
     }
 
     /// Asks STS who `credentials` belong to, in the partition of
-    /// `sts_region`, and checks that against the pins.
+    /// `sts_region`, and checks that against the pins. Then asks whether the
+    /// account has enabled the run's region.
     async fn check(
         &self,
         credentials: AwsCredentials,
@@ -244,9 +256,20 @@ impl<A: Aws, C: Clock> AwsPlugin<A, C> {
         let principal = Principal::from_caller(caller);
         pins.check(&principal)
             .map_err(|mismatch| PluginError::new(ErrorKind::PinMismatch, mismatch.to_string()))?;
+        // As in today's block, a check that fails (keys that may not call
+        // account:GetRegionOptStatus, an SCP, the network) warns of nothing.
+        let region_not_enabled = match self
+            .aws
+            .region_enabled(&credentials, &region, &region.partition_home())
+            .await
+        {
+            Ok(enabled) => !enabled,
+            Err(_unchecked) => false,
+        };
         Ok(Ready {
             credentials,
             region,
+            region_not_enabled,
             principal,
             method,
             sso: None,

@@ -91,6 +91,10 @@ struct FakeAws {
     /// `AssumeRole`'s answers by role ARN, in order; the last repeats.
     assumed: Arc<Mutex<HashMap<String, VecDeque<KeysAnswer>>>>,
     sso: FakeSso,
+    /// `GetRegionOptStatus`'s answers by region. Enabled when not named.
+    regions: HashMap<String, Result<bool, AwsError>>,
+    /// Every `GetRegionOptStatus`, as "<region> with <key> in <region>".
+    region_checks: Arc<Mutex<Vec<String>>>,
 }
 
 type KeysAnswer = Result<AwsCredentials, AwsError>;
@@ -193,6 +197,16 @@ impl FakeAws {
 
     fn sso_log(&self) -> Vec<String> {
         lock(&self.sso.log).clone()
+    }
+
+    /// `GetRegionOptStatus` for `region` answers this.
+    fn region(mut self, region: &str, answer: Result<bool, AwsError>) -> Self {
+        self.regions.insert(region.to_owned(), answer);
+        self
+    }
+
+    fn region_checks(&self) -> Vec<String> {
+        lock(&self.region_checks).clone()
     }
 
     fn record(&self, entry: String) {
@@ -373,6 +387,24 @@ impl Aws for FakeAws {
                     "ForbiddenException: No access",
                 ))
             },
+        )
+    }
+
+    fn region_enabled(
+        &self,
+        credentials: &AwsCredentials,
+        target: &Region,
+        region: &Region,
+    ) -> impl Future<Output = Result<bool, AwsError>> + Send {
+        lock(&self.region_checks).push(format!(
+            "{target} with {} in {region}",
+            credentials.access_key_id
+        ));
+        future::ready(
+            self.regions
+                .get(target.as_str())
+                .cloned()
+                .unwrap_or(Ok(true)),
         )
     }
 }
@@ -1138,7 +1170,7 @@ async fn a_sign_in_names_every_missing_and_unknown_field() -> TestResult {
 #[tokio::test]
 async fn static_keys_for_another_account_than_the_pin_are_refused() -> TestResult {
     let aws = FakeAws::default().caller("AKIAKEYS", OTHER_ACCOUNT, USER_ARN)?;
-    let mut app = App::start(aws, Environment::default()).await?;
+    let mut app = App::start(aws.clone(), Environment::default()).await?;
     let mut params = keys_sign_in("AKIAKEYS", &[])?;
     params
         .as_object_mut()
@@ -1146,6 +1178,81 @@ async fn static_keys_for_another_account_than_the_pin_are_refused() -> TestResul
         .insert("pins".to_owned(), json!({"account": ACCOUNT}));
     app.fails("signIn", params, "pinMismatch").await?;
     app.fails("env", json!({}), "notSignedIn").await?;
+    // Keys that are refused are never asked about the region.
+    assert_eq!(aws.region_checks(), Vec::<String>::new());
+    Ok(())
+}
+
+// The run's region.
+
+/// As today's block warns: AWS asked in the region's partition, with the
+/// keys, and only "not enabled" warns. A check that fails says nothing.
+#[tokio::test]
+async fn a_region_the_account_has_not_enabled_is_a_warning_never_an_error() -> TestResult {
+    let aws = FakeAws::default()
+        .caller("AKIAKEYS", ACCOUNT, ROLE_ARN)?
+        .region("ap-east-1", Ok(false))
+        .region("us-gov-east-1", Ok(false))
+        .region(
+            "me-south-1",
+            Err(AwsError::new(
+                Service::Account,
+                AwsErrorKind::Refused,
+                "AccessDeniedException: not authorized to perform account:GetRegionOptStatus",
+            )),
+        );
+    let mut app = App::start(aws.clone(), Environment::default()).await?;
+    let mut warnings = Vec::new();
+    for region in ["ap-east-1", "eu-west-1", "me-south-1", "us-gov-east-1"] {
+        let identity = app
+            .ok(
+                "signIn",
+                keys_sign_in("AKIAKEYS", &[("defaultRegion", region)])?,
+                "signInResult",
+            )
+            .await?;
+        assert_valid("identity", &identity)?;
+        warnings.push(at(&identity, "/warnings"));
+    }
+    assert_eq!(
+        warnings,
+        [
+            json!([{"message": "Region ap-east-1 is not enabled for this AWS account"}]),
+            Value::Null,
+            Value::Null,
+            json!([{"message": "Region us-gov-east-1 is not enabled for this AWS account"}]),
+        ]
+    );
+    assert_eq!(
+        aws.region_checks(),
+        [
+            "ap-east-1 with AKIAKEYS in us-east-1",
+            "eu-west-1 with AKIAKEYS in us-east-1",
+            "me-south-1 with AKIAKEYS in us-east-1",
+            "us-gov-east-1 with AKIAKEYS in us-gov-west-1",
+        ]
+    );
+    Ok(())
+}
+
+/// Detected keys warn as signed-in ones do.
+#[tokio::test]
+async fn detected_keys_in_a_region_not_enabled_warn() -> TestResult {
+    let aws = FakeAws::default()
+        .caller("AKIAENV", ACCOUNT, ROLE_ARN)?
+        .region("ap-east-1", Ok(false));
+    let env = environment(&[
+        ("AWS_ACCESS_KEY_ID", "AKIAENV"),
+        ("AWS_SECRET_ACCESS_KEY", SECRET),
+        ("AWS_REGION", "ap-east-1"),
+    ]);
+    let mut app = App::start(aws, env).await?;
+    let response = app.detect(json!([{"kind": "env"}]), json!({})).await?;
+    assert_eq!(
+        at(&response, "/result/identity/warnings"),
+        json!([{"message": "Region ap-east-1 is not enabled for this AWS account"}]),
+        "{response}"
+    );
     Ok(())
 }
 

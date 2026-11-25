@@ -165,6 +165,16 @@ pub trait Aws: Send + Sync + 'static {
         role: &str,
         region: &Region,
     ) -> impl Future<Output = Result<AwsCredentials, AwsError>> + Send;
+
+    /// Account `GetRegionOptStatus` for `target`, signed with `credentials`:
+    /// whether the account has enabled it, as AWS says `ENABLED` or
+    /// `ENABLED_BY_DEFAULT`.
+    fn region_enabled(
+        &self,
+        credentials: &AwsCredentials,
+        target: &Region,
+        region: &Region,
+    ) -> impl Future<Output = Result<bool, AwsError>> + Send;
 }
 
 /// The AWS service a call went to.
@@ -178,6 +188,8 @@ pub enum Service {
     SsoOidc,
     /// IAM Identity Center's accounts, roles and role keys: SSO.
     Sso,
+    /// AWS Account Management: which regions an account has enabled.
+    Account,
 }
 
 impl fmt::Display for Service {
@@ -187,6 +199,7 @@ impl fmt::Display for Service {
             Self::Iam => "IAM",
             Self::SsoOidc => "SSO OIDC",
             Self::Sso => "SSO",
+            Self::Account => "Account",
         })
     }
 }
@@ -249,5 +262,6 @@ mod tests {
             "IAM: AccessDenied"
         );
         assert_eq!(Service::Sts.to_string(), "STS");
+        assert_eq!(Service::Account.to_string(), "Account");
     }
 }

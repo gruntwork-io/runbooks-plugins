@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 aws-config.workspace = true
 aws-runtime.workspace = true
+aws-sdk-account.workspace = true
 aws-sdk-iam.workspace = true
 aws-sdk-sso.workspace = true
 aws-sdk-ssooidc.workspace = true

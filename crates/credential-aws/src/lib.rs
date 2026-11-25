@@ -16,7 +16,9 @@
 //!   `configure` lists the profiles with keys or a role, sorted, as the
 //!   field's choices; signing in with a profile it did not list is refused.
 //! - Every credential is checked with STS `GetCallerIdentity`, in the home
-//!   region of its region's partition, before it is used.
+//!   region of its region's partition, before it is used. Then Account
+//!   `GetRegionOptStatus` says whether the account has enabled the run's
+//!   region: if not, the identity warns. A check that fails warns of nothing.
 //! - **Pins** are keyed by level: `account` (`ssoAccountId`) and `role`
 //!   (`ssoRoleName`). A credential that does not match fails with
 //!   `pinMismatch`.

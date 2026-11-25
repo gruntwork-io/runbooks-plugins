@@ -19,6 +19,7 @@ aws-config = { version = "1.13.3", default-features = false }
 aws-runtime = "1.10.4"
 # The SDK's own HTTPS client (hyper 1, rustls with aws-lc-rs). Each crate's
 # default `rustls` feature adds the legacy hyper 0.14 client beside it.
+aws-sdk-account = { version = "1.129.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-iam = { version = "1.137.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-sso = { version = "1.122.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-ssooidc = { version = "1.124.0", default-features = false, features = ["default-https-client", "rt-tokio"] }

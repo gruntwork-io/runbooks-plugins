@@ -4,6 +4,7 @@ use std::error::Error as StdError;
 use std::io;
 use std::time::{Duration, SystemTime};
 
+use aws_sdk_account::types::RegionOptStatus;
 use aws_sdk_ssooidc::operation::create_token::CreateTokenError;
 use aws_sdk_sts::config::timeout::TimeoutConfig;
 use aws_sdk_sts::config::{BehaviorVersion, Credentials, Region as SdkRegion};
@@ -43,8 +44,9 @@ const MAX_PAGES: usize = 1000;
 /// trusted roots, and `HTTPS_PROXY` / `NO_PROXY` from the environment.
 #[derive(Debug, Default)]
 pub struct SdkAws {
-    /// Where the IAM Identity Center calls go in place of AWS's endpoint for
-    /// their region. Only this module's tests set one: a loopback server.
+    /// Where the IAM Identity Center and Account calls go in place of AWS's
+    /// endpoint for their region. Only this module's tests set one: a
+    /// loopback server.
     endpoint: Option<String>,
 }
 
@@ -381,6 +383,37 @@ impl Aws for SdkAws {
                 .flatten(),
         })
     }
+
+    async fn region_enabled(
+        &self,
+        credentials: &AwsCredentials,
+        target: &Region,
+        region: &Region,
+    ) -> Result<bool, AwsError> {
+        let mut config = aws_sdk_account::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(sdk_region(region))
+            .credentials_provider(sdk_credentials(credentials))
+            .timeout_config(timeouts());
+        config.set_endpoint_url(self.endpoint.clone());
+        let answer = aws_sdk_account::Client::from_conf(config.build())
+            .get_region_opt_status()
+            .region_name(target.as_str())
+            .send()
+            .await
+            .map_err(|error| classify(Service::Account, &error))?;
+        let status = answer.region_opt_status().ok_or_else(|| {
+            AwsError::new(
+                Service::Account,
+                AwsErrorKind::Unexpected,
+                "GetRegionOptStatus answered without a RegionOptStatus",
+            )
+        })?;
+        Ok(matches!(
+            status,
+            RegionOptStatus::Enabled | RegionOptStatus::EnabledByDefault
+        ))
+    }
 }
 
 /// A positive count of seconds, as SSO-OIDC gives lifetimes and intervals.
@@ -536,7 +569,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{SdkAws, classify, seconds};
-    use crate::aws::{Aws, AwsError, AwsErrorKind, Service, SsoAccount, SsoToken};
+    use crate::aws::{Aws, AwsCredentials, AwsError, AwsErrorKind, Service, SsoAccount, SsoToken};
     use crate::identity::AccountId;
     use crate::region::Region;
     use crate::secret::Secret;
@@ -660,16 +693,20 @@ mod tests {
 
     const ACCESS_TOKEN: &str = "test-sso-access-token";
 
-    /// [`SdkAws`] calling IAM Identity Center on a loopback port, where each
-    /// request, on a connection of its own, gets what `answer` gives for its
-    /// target. The server keeps each target it was sent, with its token.
+    /// What a fake answers for a request's target and body.
+    type Answer = fn(&str, &str) -> String;
+
+    /// [`SdkAws`] calling IAM Identity Center and Account on a loopback port,
+    /// where each request, on a connection of its own, gets what `answer`
+    /// gives. The server keeps each target it was sent, with its SSO token or
+    /// what it was signed for.
     struct FakeSso {
         aws: SdkAws,
         requests: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeSso {
-        fn start(answer: fn(&str) -> String) -> io::Result<Self> {
+        fn start(answer: Answer) -> io::Result<Self> {
             let listener = TcpListener::bind("127.0.0.1:0")?;
             let endpoint = format!("http://{}", listener.local_addr()?);
             let requests = Arc::new(Mutex::new(Vec::new()));
@@ -693,17 +730,13 @@ mod tests {
 
     /// Answers each connection to `listener` in turn. A connection that
     /// fails fails only its own call.
-    fn serve(listener: &TcpListener, answer: fn(&str) -> String, seen: &Mutex<Vec<String>>) {
+    fn serve(listener: &TcpListener, answer: Answer, seen: &Mutex<Vec<String>>) {
         for stream in listener.incoming() {
             let _served: io::Result<()> = stream.and_then(|stream| reply(stream, answer, seen));
         }
     }
 
-    fn reply(
-        mut stream: TcpStream,
-        answer: fn(&str) -> String,
-        seen: &Mutex<Vec<String>>,
-    ) -> io::Result<()> {
+    fn reply(mut stream: TcpStream, answer: Answer, seen: &Mutex<Vec<String>>) -> io::Result<()> {
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut request_line = String::new();
         reader.read_line(&mut request_line)?;
@@ -727,14 +760,32 @@ mod tests {
         let length = header("content-length")
             .and_then(|length| length.parse().ok())
             .unwrap_or(0);
-        reader.read_exact(&mut vec![0; length])?;
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body)?;
         let target = request_line.split(' ').nth(1).unwrap_or_default();
-        let token = header("x-amz-sso_bearer_token").unwrap_or_default();
+        let token = header("x-amz-sso_bearer_token")
+            .or_else(|| header("authorization").and_then(|value| signed_for(&value)))
+            .unwrap_or_default();
         seen.lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(format!("{target} with {token}"));
-        stream.write_all(answer(target).as_bytes())?;
+        stream.write_all(answer(target, &String::from_utf8_lossy(&body)).as_bytes())?;
         stream.flush()
+    }
+
+    /// The key, service and region an `Authorization` header signed for.
+    fn signed_for(authorization: &str) -> Option<String> {
+        let scope = authorization
+            .split("Credential=")
+            .nth(1)?
+            .split(',')
+            .next()?;
+        match scope.split('/').collect::<Vec<_>>().as_slice() {
+            [key, _date, region, service, _request] => {
+                Some(format!("{key} for {service} in {region}"))
+            }
+            _ => None,
+        }
     }
 
     /// An HTTP answer with a JSON body, and AWS's error type for an error.
@@ -749,7 +800,7 @@ mod tests {
 
     /// IAM Identity Center's answers: two pages of accounts and of roles,
     /// a role's keys with and without an expiry, and its refusals.
-    fn iam_identity_center(target: &str) -> String {
+    fn iam_identity_center(target: &str, _body: &str) -> String {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         let second_page = query.contains("next_token=more");
         let role = |name: &str| query.contains(&format!("role_name={name}"));
@@ -930,6 +981,87 @@ mod tests {
                 "{role}"
             );
         }
+        Ok(())
+    }
+
+    /// Account's `GetRegionOptStatus` answers, by the region the body asks
+    /// about: each status AWS has, one it may add, none, and a refusal.
+    fn account(target: &str, body: &str) -> String {
+        let status = |status: &str| {
+            json(
+                200,
+                None,
+                &format!(r#"{{"RegionName":"x","RegionOptStatus":"{status}"}}"#),
+            )
+        };
+        let asked = |region: &str| body.contains(&format!(r#""RegionName":"{region}""#));
+        match target {
+            "/getRegionOptStatus" if asked("us-east-1") => status("ENABLED_BY_DEFAULT"),
+            "/getRegionOptStatus" if asked("ap-east-1") => status("ENABLED"),
+            "/getRegionOptStatus" if asked("me-south-1") => status("DISABLED"),
+            "/getRegionOptStatus" if asked("af-south-1") => status("ENABLING"),
+            "/getRegionOptStatus" if asked("eu-south-2") => status("DISABLING"),
+            "/getRegionOptStatus" if asked("il-central-1") => status("PAUSED"),
+            "/getRegionOptStatus" if asked("ca-west-1") => json(200, None, "{}"),
+            "/getRegionOptStatus" if asked("mx-central-1") => json(
+                403,
+                Some("AccessDeniedException"),
+                r#"{"message":"not authorized to perform account:GetRegionOptStatus"}"#,
+            ),
+            _ => json(400, Some("ValidationException"), "{}"),
+        }
+    }
+
+    /// Only `ENABLED` and `ENABLED_BY_DEFAULT` are enabled. An answer without a
+    /// status, and a refusal, are errors. Each request is signed with the
+    /// keys for the region it is sent to.
+    #[tokio::test]
+    async fn a_regions_status_is_read_from_accounts_answer() -> TestResult {
+        let account = FakeSso::start(account)?;
+        let keys = AwsCredentials {
+            access_key_id: "AKIATEST".to_owned(),
+            secret_access_key: Secret::new("test-secret-access-key"),
+            session_token: None,
+            expires_at: None,
+        };
+        let home = Region::parse("us-east-1")?;
+        let asked = [
+            "us-east-1",
+            "ap-east-1",
+            "me-south-1",
+            "af-south-1",
+            "eu-south-2",
+            "il-central-1",
+            "ca-west-1",
+            "mx-central-1",
+        ];
+        let mut answers = Vec::new();
+        for region in asked {
+            let answer = account
+                .aws
+                .region_enabled(&keys, &Region::parse(region)?, &home)
+                .await;
+            answers.push(answer.map_err(|error| (error.service, error.kind)));
+        }
+        let refused = (Service::Account, AwsErrorKind::Refused);
+        let unexpected = (Service::Account, AwsErrorKind::Unexpected);
+        assert_eq!(
+            answers,
+            [
+                Ok(true),
+                Ok(true),
+                Ok(false),
+                Ok(false),
+                Ok(false),
+                Ok(false),
+                Err(unexpected),
+                Err(refused),
+            ]
+        );
+        assert_eq!(
+            account.requests(),
+            vec!["/getRegionOptStatus with AKIATEST for account in us-east-1"; asked.len()]
+        );
         Ok(())
     }
 

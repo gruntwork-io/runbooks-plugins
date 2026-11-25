@@ -133,6 +133,30 @@ async fn sso_shows_the_url_and_code_polls_at_awss_pace_and_takes_the_only_role()
     Ok(())
 }
 
+/// A role's keys are asked about the run's region, not the SSO region's.
+#[tokio::test(start_paused = true)]
+async fn a_roles_identity_warns_of_a_run_region_not_enabled() -> TestResult {
+    let aws = FakeAws::default()
+        .polls(vec![Ok(approved())])
+        .account(ACCOUNT, "Production", &["deploy"])?
+        .role_keys(ACCOUNT, "deploy", vec![Ok(keys("ASIASSO", IN_AN_HOUR))])
+        .caller("ASIASSO", ACCOUNT, SSO_ARN)?
+        .region("eu-central-1", Ok(false));
+    let mut app = paused(aws.clone()).await?;
+    let identity = app
+        .ok("signIn", sso_sign_in(&json!({})), "signInResult")
+        .await?;
+    assert_eq!(
+        at(&identity, "/warnings"),
+        json!([{"message": "Region eu-central-1 is not enabled for this AWS account"}])
+    );
+    assert_eq!(
+        aws.region_checks(),
+        ["eu-central-1 with ASIASSO in us-east-1"]
+    );
+    Ok(())
+}
+
 /// The block's `defaultRegion` is the run's when the field is left empty.
 /// IAM Identity Center stays in the SSO region.
 #[tokio::test(start_paused = true)]
