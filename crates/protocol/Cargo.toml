@@ -1,11 +1,11 @@
 [package]
 name = "runbooks-plugin-protocol"
-description = "The Runbooks plugin protocol: its version and the Rust types generated from its JSON Schemas."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+description = "The Runbooks plugin protocol: its version and the Rust types generated from its JSON Schemas."
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]
@@ -13,12 +13,12 @@ serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 
-[build-dependencies]
-typify.workspace = true
-serde_json.workspace = true
-
 [dev-dependencies]
 jsonschema.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
+typify.workspace = true
 
 [lints]
 workspace = true

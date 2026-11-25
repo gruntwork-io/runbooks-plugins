@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#MISE description="Lint, semver, then test: run before handing work back"
+set -euo pipefail
+
+mise run lint
+mise run semver
+mise run test

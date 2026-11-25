@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Run every test"
+set -euo pipefail
+export CARGO_BUILD_WARNINGS=deny
+
+cargo nextest run --workspace --all-features --locked --no-tests=fail
+# nextest does not run doctests.
+cargo test --doc --workspace --all-features --locked

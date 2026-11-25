@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Check dependencies against RustSec advisories; needs the network"
+set -euo pipefail
+
+cargo deny --locked check advisories

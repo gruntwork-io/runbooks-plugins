@@ -26,12 +26,14 @@ pub(crate) enum ReadError {
 
 /// The file's text, if it is at most `max` bytes.
 pub(crate) async fn read_text(path: &Path, max: usize) -> Result<String, ReadError> {
-    let file = fs::File::open(path)
-        .await
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => ReadError::NotFound,
-            kind => ReadError::Io(kind),
-        })?;
+    let file = fs::File::open(path).await.map_err(|error| {
+        let kind = error.kind();
+        if kind == io::ErrorKind::NotFound {
+            ReadError::NotFound
+        } else {
+            ReadError::Io(kind)
+        }
+    })?;
     let mut bytes = Vec::new();
     let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
     file.take(limit)

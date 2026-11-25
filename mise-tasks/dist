@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#MISE description="Build every binary for one target into target/dist, under its release asset name"
+#USAGE arg "<target>" help="aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc"
+set -euo pipefail
+
+target=${usage_target:?}
+case "${target}" in
+aarch64-apple-darwin) platform=darwin_arm64 ;;
+x86_64-apple-darwin) platform=darwin_amd64 ;;
+x86_64-unknown-linux-gnu) platform=linux_amd64 ;;
+x86_64-pc-windows-msvc) platform=windows_amd64 ;;
+*)
+  echo "dist: no release asset name for target '${target}'. Expected aarch64-apple-darwin," \
+    "x86_64-apple-darwin, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc." >&2
+  exit 2
+  ;;
+esac
+suffix=""
+if [[ ${target} == *-windows-* ]]; then
+  suffix=.exe
+fi
+
+# --binary: a native jq.exe would otherwise end each line with CRLF.
+metadata=$(cargo metadata --format-version 1 --no-deps --locked)
+version=$(jq --binary -r '[.packages[] | select(any(.targets[]; .kind == ["bin"])) | .version]
+  | unique | if length == 1 then .[0] else error("binaries at versions \(.); a release has one") end' \
+  <<<"${metadata}")
+bins=$(jq --binary -r '.packages[].targets[] | select(.kind == ["bin"]) | .name' <<<"${metadata}")
+
+cargo build --release --locked --target "${target}" --target-dir target --workspace --bins
+
+mkdir -p target/dist
+while IFS= read -r bin; do
+  asset="target/dist/${bin}_${version}_${platform}${suffix}"
+  cp "target/${target}/release/${bin}${suffix}" "${asset}"
+  echo "${asset}"
+done <<<"${bins}"

@@ -1,0 +1,11 @@
+# Lint public items too. The default skips any lint whose fix would change an exported API.
+avoid-breaking-exported-api = false
+cognitive-complexity-threshold = 15
+excessive-nesting-threshold = 4
+
+disallowed-methods = [
+  { path = "std::env::set_current_dir", reason = "pass explicit paths; use Command::current_dir for a child process" },
+  { path = "core::result::Result::unwrap_or_default", reason = "return the error or log it; never hide it" },
+  { path = "core::any::Any::downcast_ref", reason = "add the behavior to the trait instead of downcasting" },
+  { path = "std::boxed::Box::downcast", reason = "add the behavior to the trait instead of downcasting" },
+]

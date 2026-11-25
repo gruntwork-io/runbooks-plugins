@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+#MISE description="Lint GitHub Actions workflows"
+set -euo pipefail
+
+# zizmor's online audits need a GitHub token. Without one it runs offline.
+if [[ -z ${GH_TOKEN-} ]] && token=$(gh auth token 2>/dev/null); then
+  export GH_TOKEN="${token}"
+fi
+
+actionlint
+zizmor .github

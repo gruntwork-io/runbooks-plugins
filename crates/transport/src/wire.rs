@@ -40,7 +40,7 @@ impl RpcMethod {
         }
     }
 
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Configure => "configure",
             Self::Detect => "detect",

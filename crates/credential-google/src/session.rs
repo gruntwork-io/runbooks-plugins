@@ -14,7 +14,6 @@ use crate::api::GoogleApi;
 use crate::credential::{
     Credential, CredentialType, Origin, access_token, api_error, denies_project,
 };
-use crate::crypto::Crypto;
 
 /// The one target level: the project commands operate on.
 pub(crate) const PROJECT: &str = "project";
@@ -113,6 +112,20 @@ pub(crate) fn invalid_params(message: impl Into<String>) -> PluginError {
     PluginError::new(ErrorKind::InvalidParams, message)
 }
 
+/// `name` as an error may show it: a name that isn't an identifier could be
+/// pasted material.
+pub(crate) fn shown_name(name: &str) -> &str {
+    let identifier = name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if identifier {
+        name
+    } else {
+        "(a name that is not an identifier)"
+    }
+}
+
 /// A credential to prove, with what came with it.
 #[derive(Clone, Debug)]
 pub(crate) struct Candidate {
@@ -144,13 +157,12 @@ pub(crate) struct Session {
 }
 
 /// What proving a credential needs from the plugin.
-pub(crate) struct Prover<'a, A, C> {
+pub(crate) struct Prover<'a, A> {
     pub(crate) api: &'a A,
-    pub(crate) crypto: &'a C,
     pub(crate) now: OffsetDateTime,
 }
 
-impl<A: GoogleApi, C: Crypto> Prover<'_, A, C> {
+impl<A: GoogleApi> Prover<'_, A> {
     /// Mints a token for `candidate` and asks Google who it is, then checks
     /// the required scopes and that a pinned project is readable.
     ///
@@ -171,7 +183,7 @@ impl<A: GoogleApi, C: Crypto> Prover<'_, A, C> {
             .api
             .token_info(&token)
             .await
-            .map_err(|error| api_error(error, origin))?;
+            .map_err(|error| api_error(&error, origin))?;
         let credential_type = credential.credential_type();
         let principal = info
             .email
@@ -231,7 +243,7 @@ impl<A: GoogleApi, C: Crypto> Prover<'_, A, C> {
         &self,
         credential: &Credential,
     ) -> Result<crate::Secret, PluginError> {
-        access_token(self.api, self.crypto, self.now.unix_timestamp(), credential).await
+        access_token(self.api, self.now.unix_timestamp(), credential).await
     }
 
     /// The project as a target, named by its display name when Google says it.
@@ -283,7 +295,7 @@ impl Session {
     pub(crate) fn identity(&self) -> Identity {
         let mut targets = HashMap::new();
         if let Some(project) = &self.project {
-            targets.insert(PROJECT.to_owned(), project.clone());
+            targets.insert(PROJECT.to_owned(), Some(project.clone()));
         }
         Identity {
             expires_at: self.expires_at.map(Timestamp::from),
@@ -291,12 +303,15 @@ impl Session {
             method: self.method.clone(),
             principal: self.principal.clone(),
             targets,
+            warnings: Vec::new(),
         }
     }
 
     /// The values a run gets. `credentials_file` is where the document was
     /// written, for a credential that is one.
     pub(crate) fn env_values(&self, credentials_file: Option<&str>) -> Vec<EnvValue> {
+        const BOTH: &[EnvValueToItem] = &[EnvValueToItem::Env, EnvValueToItem::Output];
+        const ENV: &[EnvValueToItem] = &[EnvValueToItem::Env];
         let mut values = Vec::new();
         let mut set = |names: &[&str], value: &str, sensitive: bool, to: &[EnvValueToItem]| {
             for name in names {
@@ -308,11 +323,9 @@ impl Session {
                 });
             }
         };
-        const BOTH: &[EnvValueToItem] = &[EnvValueToItem::Env, EnvValueToItem::Output];
-        const ENV: &[EnvValueToItem] = &[EnvValueToItem::Env];
         match (&self.credential, credentials_file) {
             (Credential::AccessToken(token), _) => {
-                set(&ACCESS_TOKEN_VARS, token.expose(), true, ENV)
+                set(&ACCESS_TOKEN_VARS, token.expose(), true, ENV);
             }
             (Credential::Document(_), Some(path)) => set(&CREDENTIAL_FILE_VARS, path, false, BOTH),
             (Credential::Document(_), None) => {}

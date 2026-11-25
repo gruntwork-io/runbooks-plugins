@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Stop: exit 2 keeps Claude working while `mise run check` fails. Claude Code caps the loop.
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+if ! out=$(mise run check 2>&1); then
+  echo "mise run check failed. Fix it before finishing:" >&2
+  tail -n 60 <<<"${out}" >&2
+  exit 2
+fi

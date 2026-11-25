@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#MISE description="Check each publishable crate's API against its latest release"
+set -euo pipefail
+
+# cargo-semver-checks has no flag to skip `publish = false` crates, so select the rest here.
+# Needs the network once a crate is publishable: the baseline is its latest release on crates.io.
+publishable=$(cargo metadata --format-version 1 --no-deps --locked |
+  jq -r '.packages[] | select(.publish != []) | "--package=\(.name)"')
+if [[ -z ${publishable} ]]; then
+  echo "no publishable crates"
+  exit 0
+fi
+# A read loop, not mapfile: macOS ships bash 3.2.
+packages=()
+while IFS= read -r package; do
+  packages+=("${package}")
+done <<<"${publishable}"
+cargo semver-checks "${packages[@]}"

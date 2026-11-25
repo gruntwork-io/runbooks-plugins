@@ -111,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_wins_over_inline_json_and_a_token() {
+    fn a_path_wins_over_inline_json_and_a_token() -> Result<(), String> {
         let found = find(
             &vars(&[
                 ("GOOGLE_OAUTH_ACCESS_TOKEN", "ya29.token"),
@@ -121,14 +121,13 @@ mod tests {
                 ("GOOGLE_CLOUD_PROJECT", "second"),
             ]),
             &Prefix::default(),
-        );
-        let Some(found) = found else {
-            panic!("expected a credential")
-        };
+        )
+        .ok_or("expected a credential")?;
         assert!(
             matches!(found.credential, VarCredential::Path(ref path) if path == "/keys/sa.json")
         );
         assert_eq!(found.project.as_deref(), Some("second"));
+        Ok(())
     }
 
     #[test]
@@ -153,11 +152,12 @@ mod tests {
     }
 
     #[test]
-    fn a_prefix_must_match_the_shared_pattern() {
+    fn a_prefix_must_match_the_shared_pattern() -> Result<(), String> {
         for bad in ["ci_", "CI", "_CI_", "C-I_", "CI_$(x)_"] {
             assert_eq!(Prefix::parse(Some(bad.to_owned())), Err(bad.to_owned()));
         }
         assert_eq!(Prefix::parse(None), Ok(Prefix::default()));
-        assert!(Prefix::parse(Some("MY_APP2_".to_owned())).is_ok());
+        Prefix::parse(Some("MY_APP2_".to_owned()))?;
+        Ok(())
     }
 }

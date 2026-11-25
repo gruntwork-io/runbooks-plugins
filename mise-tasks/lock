@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Update Cargo.lock after a manifest change, without upgrading other crates"
+set -euo pipefail
+
+cargo update --workspace

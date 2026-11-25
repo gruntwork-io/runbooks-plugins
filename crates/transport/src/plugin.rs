@@ -27,6 +27,8 @@ pub trait CredentialPlugin: Send + Sync + 'static {
         params: ConfigureParams,
     ) -> impl Future<Output = Result<ConfigureResult, PluginError>> + Send;
 
+    /// Looks in the sources for a credential that matches the pins and meets
+    /// the requirements, without signing in.
     fn detect(
         &self,
         params: DetectParams,
@@ -39,11 +41,13 @@ pub trait CredentialPlugin: Send + Sync + 'static {
         prompts: Prompts,
     ) -> impl Future<Output = Result<SignInResult, PluginError>> + Send;
 
+    /// The targets at one level, under a parent target if the level has one.
     fn targets(
         &self,
         params: TargetsParams,
     ) -> impl Future<Output = Result<TargetsResult, PluginError>> + Send;
 
+    /// Takes the chosen target at each level.
     fn select(
         &self,
         params: SelectParams,
@@ -52,6 +56,7 @@ pub trait CredentialPlugin: Send + Sync + 'static {
     /// The only method that returns secret values.
     fn env(&self) -> impl Future<Output = Result<EnvResult, PluginError>> + Send;
 
+    /// Drops the credential the plugin holds.
     fn sign_out(&self) -> impl Future<Output = Result<SignOutResult, PluginError>> + Send;
 }
 
@@ -64,7 +69,7 @@ pub struct Prompts {
 }
 
 impl Prompts {
-    pub(crate) fn new(request: Id, lines: mpsc::Sender<String>) -> Self {
+    pub(crate) const fn new(request: Id, lines: mpsc::Sender<String>) -> Self {
         Self { request, lines }
     }
 

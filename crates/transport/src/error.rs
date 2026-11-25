@@ -25,6 +25,7 @@ enum Detail {
 }
 
 impl PluginError {
+    /// An error of `kind` with no fields beyond it.
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -64,10 +65,14 @@ impl PluginError {
         }
     }
 
-    pub fn kind(&self) -> ErrorKind {
+    /// What the app branches on.
+    #[must_use]
+    pub const fn kind(&self) -> ErrorKind {
         self.kind
     }
 
+    /// For a person to read. It never carries a secret.
+    #[must_use]
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -92,8 +97,10 @@ impl PluginError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ServeError {
+    /// The input could not be read.
     #[error("reading the plugin's input")]
     Read(#[source] io::Error),
+    /// The output could not be written.
     #[error("writing the plugin's output")]
     Write(#[source] io::Error),
     /// A bug: a generated protocol type failed to serialize.

@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
+use std::future::{self, Future};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,11 +60,16 @@ fn assert_valid(def: &str, value: &Value) -> TestResult {
     Ok(())
 }
 
+/// The member of `value` at JSON Pointer `pointer`, or `null` if there is none.
+fn at(value: &Value, pointer: &str) -> Value {
+    value.pointer(pointer).cloned().unwrap_or(Value::Null)
+}
+
 /// Asserts `response` is an error answering `id`, with `code` and `kind`.
-fn assert_error(response: &Value, id: Value, code: i64, kind: &str) {
-    assert_eq!(response["id"], id, "{response}");
-    assert_eq!(response["error"]["code"], code, "{response}");
-    assert_eq!(response["error"]["data"]["kind"], kind, "{response}");
+fn assert_error(response: &Value, id: &Value, code: i64, kind: &str) {
+    assert_eq!(at(response, "/id"), *id, "{response}");
+    assert_eq!(at(response, "/error/code"), code, "{response}");
+    assert_eq!(at(response, "/error/data/kind"), kind, "{response}");
 }
 
 /// The app: it writes the plugin's input and reads its output.
@@ -131,7 +137,8 @@ impl App {
             .call(json!(0), "configure", configure_params(PROTOCOL_VERSION))
             .await?;
         assert_eq!(
-            response["result"]["protocolVersion"], PROTOCOL_VERSION,
+            at(&response, "/result/protocolVersion"),
+            PROTOCOL_VERSION,
             "{response}"
         );
         Ok(())
@@ -189,12 +196,16 @@ fn identity(method: &str) -> Identity {
         method: method.to_owned(),
         principal: "arn:aws:sts::123456789012:assumed-role/dev/someone".to_owned(),
         targets: HashMap::new(),
+        warnings: Vec::new(),
     }
 }
 
 impl CredentialPlugin for Fake {
-    async fn configure(&self, _params: ConfigureParams) -> Result<ConfigureResult, PluginError> {
-        Ok(ConfigureResult {
+    fn configure(
+        &self,
+        _params: ConfigureParams,
+    ) -> impl Future<Output = Result<ConfigureResult, PluginError>> + Send {
+        future::ready(Ok(ConfigureResult {
             cloud: None,
             driver_version: "0.0.0".to_owned(),
             levels: Vec::new(),
@@ -203,11 +214,14 @@ impl CredentialPlugin for Fake {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             requirements: Vec::new(),
             sources: Vec::new(),
-        })
+        }))
     }
 
-    async fn detect(&self, _params: DetectParams) -> Result<DetectResult, PluginError> {
-        Ok(DetectResult::not_found())
+    fn detect(
+        &self,
+        _params: DetectParams,
+    ) -> impl Future<Output = Result<DetectResult, PluginError>> + Send {
+        future::ready(Ok(DetectResult::not_found()))
     }
 
     async fn sign_in(
@@ -230,36 +244,40 @@ impl CredentialPlugin for Fake {
         Ok(SignInResult(identity(&params.method)))
     }
 
-    async fn targets(&self, params: TargetsParams) -> Result<TargetsResult, PluginError> {
-        if params.level == "panic" {
-            panic!("the test asked targets to panic");
-        }
-        Ok(TargetsResult {
+    fn targets(
+        &self,
+        params: TargetsParams,
+    ) -> impl Future<Output = Result<TargetsResult, PluginError>> + Send {
+        assert_ne!(params.level, "panic", "the test asked targets to panic");
+        future::ready(Ok(TargetsResult {
             targets: vec![Target {
                 id: params.level.clone(),
                 name: params.level,
             }],
-        })
+        }))
     }
 
-    async fn select(&self, _params: SelectParams) -> Result<SelectResult, PluginError> {
-        Err(PluginError::requirement_not_met(
+    fn select(
+        &self,
+        _params: SelectParams,
+    ) -> impl Future<Output = Result<SelectResult, PluginError>> + Send {
+        future::ready(Err(PluginError::requirement_not_met(
             vec![Requirement::Scopes {
                 scopes: vec!["https://www.googleapis.com/auth/cloud-platform".to_owned()],
             }],
             "the credential lacks a scope",
-        ))
+        )))
     }
 
-    async fn env(&self) -> Result<EnvResult, PluginError> {
-        Ok(EnvResult {
+    fn env(&self) -> impl Future<Output = Result<EnvResult, PluginError>> + Send {
+        future::ready(Ok(EnvResult {
             expires_at: None,
             values: Vec::new(),
-        })
+        }))
     }
 
-    async fn sign_out(&self) -> Result<SignOutResult, PluginError> {
-        Ok(SignOutResult(Map::new()))
+    fn sign_out(&self) -> impl Future<Output = Result<SignOutResult, PluginError>> + Send {
+        future::ready(Ok(SignOutResult(Map::new())))
     }
 }
 
@@ -269,7 +287,7 @@ impl CredentialPlugin for Fake {
 async fn calls_before_configure_get_not_configured() -> TestResult {
     let mut app = App::start(Fake::default())?;
     let response = app.call(json!(1), "detect", detect_params()).await?;
-    assert_error(&response, json!(1), -32000, "notConfigured");
+    assert_error(&response, &json!(1), -32000, "notConfigured");
 
     app.configure().await?;
     let response = app.call(json!(2), "detect", detect_params()).await?;
@@ -286,10 +304,10 @@ async fn an_unsupported_protocol_version_is_refused_and_configures_nothing() -> 
     let response = app
         .call(json!(1), "configure", configure_params("2"))
         .await?;
-    assert_error(&response, json!(1), -32000, "unsupportedProtocolVersion");
+    assert_error(&response, &json!(1), -32000, "unsupportedProtocolVersion");
 
     let response = app.call(json!(2), "detect", detect_params()).await?;
-    assert_error(&response, json!(2), -32000, "notConfigured");
+    assert_error(&response, &json!(2), -32000, "notConfigured");
     Ok(())
 }
 
@@ -318,11 +336,11 @@ async fn a_line_that_is_not_a_request_is_answered_and_the_next_is_read() -> Test
         ),
     ] {
         app.send(line).await?;
-        assert_error(&app.receive().await?, id, code, "invalidParams");
+        assert_error(&app.receive().await?, &id, code, "invalidParams");
     }
 
     let response = app.call(json!(8), "detect", detect_params()).await?;
-    assert_eq!(response["result"]["found"], false, "{response}");
+    assert_eq!(at(&response, "/result/found"), false, "{response}");
     Ok(())
 }
 
@@ -331,10 +349,10 @@ async fn a_line_over_the_limit_is_refused_and_the_next_is_read() -> TestResult {
     let mut app = App::start(Fake::default())?;
     app.configure().await?;
     app.send(&"x".repeat(MAX_LINE_BYTES + 1)).await?;
-    assert_error(&app.receive().await?, json!(null), -32600, "invalidParams");
+    assert_error(&app.receive().await?, &json!(null), -32600, "invalidParams");
 
     let response = app.call(json!(1), "detect", detect_params()).await?;
-    assert_eq!(response["result"]["found"], false, "{response}");
+    assert_eq!(at(&response, "/result/found"), false, "{response}");
     Ok(())
 }
 
@@ -343,7 +361,7 @@ async fn an_unknown_method_is_not_found() -> TestResult {
     let mut app = App::start(Fake::default())?;
     app.configure().await?;
     let response = app.call(json!("x"), "describe", json!({})).await?;
-    assert_error(&response, json!("x"), -32601, "invalidParams");
+    assert_error(&response, &json!("x"), -32601, "invalidParams");
     Ok(())
 }
 
@@ -354,9 +372,10 @@ async fn unknown_fields_are_ignored() -> TestResult {
     app.send(r#"{"jsonrpc":"2.0","id":3,"method":"targets","params":{"level":"account","addedLater":1},"trace":"t"}"#)
         .await?;
     let response = app.receive().await?;
-    assert_eq!(response["id"], 3, "{response}");
+    assert_eq!(at(&response, "/id"), 3, "{response}");
     assert_eq!(
-        response["result"]["targets"][0]["id"], "account",
+        at(&response, "/result/targets/0/id"),
+        "account",
         "{response}"
     );
     Ok(())
@@ -371,20 +390,20 @@ async fn a_sign_in_prompt_names_its_request_and_comes_before_the_response() -> T
     app.request(json!("a"), "signIn", sign_in_params()).await?;
 
     let prompt = app.receive().await?;
-    assert_eq!(prompt["method"], "signIn.prompt", "{prompt}");
-    assert_eq!(prompt["params"]["request"], "a", "{prompt}");
-    assert_eq!(prompt["params"]["code"], "ABCD-EFGH", "{prompt}");
+    assert_eq!(at(&prompt, "/method"), "signIn.prompt", "{prompt}");
+    assert_eq!(at(&prompt, "/params/request"), "a", "{prompt}");
+    assert_eq!(at(&prompt, "/params/code"), "ABCD-EFGH", "{prompt}");
     assert_valid(
         "credential.schema.json#/$defs/signInPrompt",
-        &prompt["params"],
+        &at(&prompt, "/params"),
     )?;
 
     release.notify_one();
     let response = app.receive().await?;
-    assert_eq!(response["id"], "a", "{response}");
+    assert_eq!(at(&response, "/id"), "a", "{response}");
     assert_valid(
         "credential.schema.json#/$defs/signInResult",
-        &response["result"],
+        &at(&response, "/result"),
     )
 }
 
@@ -396,17 +415,17 @@ async fn overlapping_calls_are_answered_by_id() -> TestResult {
     app.configure().await?;
     app.request(json!(1), "signIn", sign_in_params()).await?;
     let prompt = app.receive().await?;
-    assert_eq!(prompt["params"]["request"], 1, "{prompt}");
+    assert_eq!(at(&prompt, "/params/request"), 1, "{prompt}");
 
     let targets = app
         .call(json!(2), "targets", json!({"level": "account"}))
         .await?;
-    assert_eq!(targets["id"], 2, "{targets}");
+    assert_eq!(at(&targets, "/id"), 2, "{targets}");
 
     release.notify_one();
     let signed_in = app.receive().await?;
-    assert_eq!(signed_in["id"], 1, "{signed_in}");
-    assert_eq!(signed_in["result"]["method"], "sso", "{signed_in}");
+    assert_eq!(at(&signed_in, "/id"), 1, "{signed_in}");
+    assert_eq!(at(&signed_in, "/result/method"), "sso", "{signed_in}");
     Ok(())
 }
 
@@ -437,13 +456,14 @@ async fn a_call_that_panics_is_answered_internal() -> TestResult {
     let response = app
         .call(json!(4), "targets", json!({"level": "panic"}))
         .await?;
-    assert_error(&response, json!(4), -32000, "internal");
+    assert_error(&response, &json!(4), -32000, "internal");
 
     let response = app
         .call(json!(5), "targets", json!({"level": "account"}))
         .await?;
     assert_eq!(
-        response["result"]["targets"][0]["id"], "account",
+        at(&response, "/result/targets/0/id"),
+        "account",
         "{response}"
     );
     Ok(())
@@ -455,8 +475,11 @@ async fn invalid_params_name_the_definition_and_not_the_value() -> TestResult {
     app.configure().await?;
     let params = json!({"method": "credentials", "fields": "hunter2-secret-access-key", "pins": {}, "requirements": []});
     let response = app.call(json!(6), "signIn", params).await?;
-    assert_error(&response, json!(6), -32602, "invalidParams");
-    let message = response["error"]["message"].as_str().ok_or("no message")?;
+    assert_error(&response, &json!(6), -32602, "invalidParams");
+    let message = response
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .ok_or("no message")?;
     assert!(message.contains("#/$defs/signInParams"), "{message}");
     assert!(!response.to_string().contains("hunter2"), "{response}");
     Ok(())
@@ -473,9 +496,9 @@ async fn an_error_keeps_its_kinds_own_fields() -> TestResult {
             json!({"targets": {"project": "sandbox-1234"}}),
         )
         .await?;
-    assert_error(&response, json!(7), -32000, "requirementNotMet");
+    assert_error(&response, &json!(7), -32000, "requirementNotMet");
     assert_valid(
         "credential.schema.json#/$defs/requirementNotMetData",
-        &response["error"]["data"],
+        &at(&response, "/error/data"),
     )
 }

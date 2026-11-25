@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#MISE description="Upgrade mise, every tool, crate and action to its newest release at least 7 days old"
+set -euo pipefail
+
+latest=$(mise latest aqua:jdx/mise)
+current=$(mise config get --file mise.toml min_version)
+mise_version=$(printf '%s\n' "${current}" "${latest}" | sort --version-sort | tail --lines=1)
+mise config set --file mise.toml min_version "${mise_version}"
+sed -i -E "s/(version: )[0-9.]+( # mise.toml's min_version\.)/\1${mise_version}\2/" .github/workflows/*.yml
+mise upgrade --bump --no-global
+rust=$(mise current rust)
+sed -i "s/^rust-version = .*/rust-version = \"${rust%.*}\"/" Cargo.toml
+mise run upgrade-crates
+# This task's environment still points at the previous toolchain.
+mise exec -- cargo update
+pinact run --update --min-age 7

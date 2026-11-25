@@ -3,7 +3,9 @@
 
 mod detect;
 mod gcloud;
+mod oauth;
 mod secrets;
+mod settings;
 mod sign_in;
 mod support;
 mod targets;

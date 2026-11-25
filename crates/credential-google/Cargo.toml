@@ -1,27 +1,30 @@
 [package]
 name = "runbooks-credential-google"
-description = "The Runbooks credential plugin for Google Cloud: service account keys, gcloud's Application Default Credentials, and browser sign-in."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+description = "The Runbooks credential plugin for Google Cloud: service account keys, gcloud's Application Default Credentials, and browser sign-in."
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
+reqwest.workspace = true
 runbooks-plugin-protocol.workspace = true
 runbooks-plugin-transport.workspace = true
-reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 jsonschema.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "test-util"] }
 
 [lints]
 workspace = true

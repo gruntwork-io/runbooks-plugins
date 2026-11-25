@@ -5,30 +5,141 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
-license = "MPL-2.0"
+rust-version = "1.100"
 repository = "https://github.com/gruntwork-io/runbooks-plugins"
+license = "MPL-2.0"
 publish = false
 
 [workspace.dependencies]
-runbooks-plugin-protocol = { path = "crates/protocol" }
-runbooks-plugin-transport = { path = "crates/transport" }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-thiserror = "2.0.21"
-time = { version = "0.3.55", features = ["serde", "formatting", "parsing"] }
-tokio = "1.54.1"
-typify = "0.10.1"
+# Only the shared config and credentials file parser: the plugin reads the
+# files itself and makes every AWS call through its own boundary.
+aws-config = { version = "1.13.3", default-features = false }
+# The profile file set aws-config's parser takes. aws-config's own alias for
+# it is deprecated in favour of this crate's type.
+aws-runtime = "1.10.4"
+# The SDK's own HTTPS client (hyper 1, rustls with aws-lc-rs). Each crate's
+# default `rustls` feature adds the legacy hyper 0.14 client beside it.
+aws-sdk-iam = { version = "1.137.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sso = { version = "1.122.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ssooidc = { version = "1.124.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "1.127.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+# The filesystem aws-config's profile parser reads through.
+aws-types = "1.7.0"
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 jsonschema = { version = "0.61.2", default-features = false }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+runbooks-plugin-protocol = { path = "crates/protocol", version = "0.1.0" }
+runbooks-plugin-transport = { path = "crates/transport", version = "0.1.0" }
+# For its aws-lc-rs provider's RSA signing, SHA-256 and random source.
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+subtle = { version = "2.6.1", default-features = false }
 tempfile = "3.27.0"
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["formatting", "parsing", "serde"] }
+tokio = "1.54.1"
+typify = "0.10.1"
 
 [workspace.lints.clippy]
+cargo = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# cargo-deny checks duplicate versions, per target and with reasons.
+multiple_crate_versions = "allow"
+# Conflicts with unreachable_pub, which catches accidental exports.
+redundant_pub_crate = "allow"
+
+# Restriction lints. Suppress with `#[expect(lint, reason = "…")]`; `#[allow]` is denied.
 allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+as_conversions = "deny"
+assertions_on_result_states = "deny"
+cfg_not_test = "deny"
+clone_on_ref_ptr = "deny"
+create_dir = "deny"
 dbg_macro = "deny"
+deref_by_slicing = "deny"
+doc_include_without_cfg = "deny"
+doc_paragraphs_missing_punctuation = "deny"
+empty_drop = "deny"
+empty_enum_variants_with_brackets = "deny"
+empty_structs_with_brackets = "deny"
+error_impl_error = "deny"
+excessive_nesting = "deny"
+exit = "deny"
+expect_used = "deny"
+filetype_is_file = "deny"
+float_cmp_const = "deny"
+fn_to_numeric_cast_any = "deny"
+format_push_string = "deny"
+get_unwrap = "deny"
+if_then_some_else_none = "deny"
+indexing_slicing = "deny"
+infinite_loop = "deny"
+large_include_file = "deny"
+let_underscore_must_use = "deny"
+let_underscore_untyped = "deny"
+lossy_float_literal = "deny"
+map_err_ignore = "deny"
+map_with_unused_argument_over_ranges = "deny"
+mem_forget = "deny"
+mixed_read_write_in_expression = "deny"
+mod_module_files = "deny"
+multiple_inherent_impl = "deny"
+mutex_atomic = "deny"
+mutex_integer = "deny"
+needless_raw_strings = "deny"
+non_zero_suggestions = "deny"
+panic = "deny"
+pathbuf_init_then_push = "deny"
+precedence_bits = "deny"
+print_stderr = "deny"
 print_stdout = "deny"
+rc_buffer = "deny"
+rc_mutex = "deny"
+redundant_test_prefix = "deny"
+renamed_function_params = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+same_name_method = "deny"
+str_to_string = "deny"
+string_add = "deny"
+string_lit_chars_any = "deny"
+string_slice = "deny"
+suspicious_xor_used_as_pow = "deny"
 todo = "deny"
+try_err = "deny"
+unimplemented = "deny"
+unnecessary_rest_pattern = "deny"
+unnecessary_self_imports = "deny"
+unreachable = "deny"
+unseparated_literal_suffix = "deny"
+unused_result_ok = "deny"
+unwrap_in_result = "deny"
 unwrap_used = "deny"
+verbose_file_reads = "deny"
+wildcard_enum_match_arm = "deny"
+
+[workspace.lints.rust]
+let_underscore_drop = "warn"
+meta_variable_misuse = "warn"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+non_ascii_idents = "forbid"
+redundant_lifetimes = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unit_bindings = "warn"
+unreachable_pub = "warn"
+unsafe_code = "forbid"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.rustdoc]
+missing_crate_level_docs = "warn"
+unescaped_backticks = "warn"
+
+[profile.release]
+overflow-checks = true

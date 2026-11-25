@@ -18,7 +18,7 @@ pub(crate) struct LineReader<R> {
 }
 
 impl<R: AsyncBufRead + Unpin> LineReader<R> {
-    pub(crate) fn new(input: R, max: usize) -> Self {
+    pub(crate) const fn new(input: R, max: usize) -> Self {
         Self {
             input,
             max,
@@ -36,10 +36,12 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
         loop {
             let available = self.input.fill_buf().await?;
             let ended = available.is_empty();
-            let (chunk, ends_line) = match available.iter().position(|&byte| byte == b'\n') {
-                Some(newline) => (available.split_at(newline).0, true),
-                None => (available, false),
-            };
+            let (chunk, ends_line) = available
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or((available, false), |newline| {
+                    (available.split_at(newline).0, true)
+                });
             let consumed = chunk.len() + usize::from(ends_line);
             if self.line.len() + chunk.len() > self.max {
                 self.too_long = true;
@@ -50,16 +52,21 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
             self.input.consume(consumed);
 
             if ends_line || (ended && (self.too_long || !self.line.is_empty())) {
-                let line = mem::take(&mut self.line);
-                return Ok(Some(if mem::take(&mut self.too_long) {
-                    Line::TooLong
-                } else {
-                    Line::Complete(line)
-                }));
+                return Ok(Some(self.take_line()));
             }
             if ended {
                 return Ok(None);
             }
+        }
+    }
+
+    /// The line read so far, leaving the reader ready for the next.
+    fn take_line(&mut self) -> Line {
+        let line = mem::take(&mut self.line);
+        if mem::take(&mut self.too_long) {
+            Line::TooLong
+        } else {
+            Line::Complete(line)
         }
     }
 }
@@ -74,10 +81,17 @@ mod tests {
 
     /// Each line of `input`, `None` for one over `max`, read through a
     /// three-byte buffer so lines span several reads.
+    ///
+    /// Every line but the last ends in a newline and the last has a byte, so
+    /// there are never more lines than bytes. A reader that gives more is
+    /// looping, and the read fails at once instead of hanging the test.
     async fn lines(input: &[u8], max: usize) -> io::Result<Vec<Option<Vec<u8>>>> {
         let mut reader = LineReader::new(BufReader::with_capacity(3, input), max);
         let mut out = Vec::new();
         while let Some(line) = reader.next_line().await? {
+            if out.len() == input.len() {
+                return Err(io::Error::other("more lines than the input has bytes"));
+            }
             out.push(match line {
                 Line::Complete(bytes) => Some(bytes),
                 Line::TooLong => None,

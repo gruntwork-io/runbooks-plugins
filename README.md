@@ -14,6 +14,26 @@ The first are the credential plugins, which sign in to a cloud and hand a run it
 
 Being built as track A of the Runbooks rebuild (gruntwork-io/runbooks, PR stack #519). Nothing is released yet.
 
+## Development
+
+mise installs every tool and runs every gate:
+
+```sh
+mise install
+mise run check
+mise tasks
+```
+
+## Releases
+
+Pushing a tag `v<version>`, where `<version>` is the workspace version in `Cargo.toml`, makes a draft release. [`release.yml`](.github/workflows/release.yml) builds each binary for macOS (arm64 and amd64), Linux (amd64) and Windows (amd64), signs and notarizes the macOS ones, and attaches them with a `SHA256SUMS` file. The Windows ones are not signed. A maintainer publishes the draft.
+
+Each asset is named `<binary>_<version>_<os>_<arch>`, plus `.exe` on Windows, such as `runbooks-credential-aws_0.1.0_darwin_arm64`. `<os>` is `darwin`, `linux` or `windows`, and `<arch>` is `arm64` or `amd64`.
+
+Signing needs `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`, `MACOS_AC_LOGIN`, `MACOS_AC_PASSWORD` and `MACOS_AC_PROVIDER` in the `release` environment. A tag's run fails without them.
+
+`mise run dist <target>` and `mise run checksums` make the same files, unsigned, in `target/dist`.
+
 ## The protocol
 
 - One JSON object per line: requests on standard input, responses and notifications on standard output, logs on standard error.

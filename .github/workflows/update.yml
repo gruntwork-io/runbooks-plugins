@@ -1,0 +1,83 @@
+name: Update dependencies
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+
+jobs:
+  # Skips repos made from the template until the Grrilla app is installed.
+  app-installed:
+    name: Check the Grrilla app is installed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      installed: ${{ steps.app.outcome == 'success' }}
+    steps:
+      - id: app
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.GRRILLA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GRRILLA_APP_PRIVATE_KEY }}
+          permission-metadata: read
+
+  update:
+    name: Update, check and merge
+    needs: app-installed
+    if: needs.app-installed.outputs.installed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # GITHUB_TOKEN cannot push changes to workflow files.
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.GRRILLA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GRRILLA_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+          permission-pull-requests: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          version: 2026.11.8 # mise.toml's min_version.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: mise run update
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # pinact's and mise's API rate limits.
+      - run: mise run check
+      - run: mise run lint-workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: mise run audit
+      # gh merges at once when no ruleset requires checks, so the steps above are the gate.
+      - name: Open and auto-merge a pull request
+        env:
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BRANCH: update-dependencies
+        run: |
+          git add --all
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git -c user.name="${APP_SLUG}[bot]" -c user.email="${APP_SLUG}[bot]@users.noreply.github.com" \
+            commit --message "Update dependencies"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          open=$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" --state open --json number --jq length)
+          if [[ ${open} == 0 ]]; then
+            gh pr create --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" --title "Update dependencies" \
+              --body "Every tool, crate and action at its newest release at least 7 days old."
+          fi
+          gh pr merge "${BRANCH}" --repo "${GITHUB_REPOSITORY}" --auto --squash

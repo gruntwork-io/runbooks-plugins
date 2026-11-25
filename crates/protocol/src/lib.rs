@@ -6,6 +6,10 @@ mod timestamp;
 
 pub use timestamp::Timestamp;
 
+/// The generated types' public fields hold `serde_json::Map` and `Value`.
+/// Re-exported so callers name them at the version these types use.
+pub use serde_json;
+
 /// The protocol version these types describe. A plugin answers `configure`
 /// with any other version with error kind `unsupportedProtocolVersion`.
 pub const PROTOCOL_VERSION: &str = "1";
@@ -13,6 +17,13 @@ pub const PROTOCOL_VERSION: &str = "1";
 /// The value of every message's `jsonrpc` member.
 pub const JSONRPC_VERSION: &str = "2.0";
 
+#[expect(
+    missing_docs,
+    unused_qualifications,
+    clippy::if_not_else,
+    clippy::needless_raw_strings,
+    reason = "typify's output, generated from schema/base.schema.json, can't be edited"
+)]
 pub mod base {
     //! The transport every plugin kind shares, from `schema/base.schema.json`.
 
@@ -32,6 +43,13 @@ pub mod base {
     }
 }
 
+#[expect(
+    missing_docs,
+    unused_qualifications,
+    clippy::implicit_hasher,
+    clippy::needless_raw_strings,
+    reason = "typify's output, generated from schema/credential.schema.json, can't be edited"
+)]
 pub mod credential {
     //! The credential kind, from `schema/credential.schema.json`.
 
@@ -49,6 +67,7 @@ pub mod credential {
         }
 
         /// No source held a credential that matches.
+        #[must_use]
         pub fn not_found() -> Self {
             Self::Variant1 {
                 found: false.into(),

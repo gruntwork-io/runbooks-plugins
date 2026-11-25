@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
+use std::future::{self, Future};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -13,12 +15,15 @@ use serde_json::Map;
 use time::OffsetDateTime;
 
 use crate::Secret;
-use crate::api::{GoogleApi, Network, NetworkError};
+use crate::api::{GoogleApi, Network, NetworkError, Project};
 use crate::credential::{Credential, MAX_DOCUMENT_BYTES, Origin, api_error, parse_document};
-use crate::crypto::Crypto;
 use crate::files::{self, CREDENTIALS_FILE, ReadError};
 use crate::gcloud::{ADC_LOGIN, Configuration, ConfigurationName, Root};
-use crate::session::{self, Candidate, Constraints, PROJECT, Prover, Session, invalid_params};
+use crate::oauth::{self, ClientFields, DEFAULT_SCOPES};
+use crate::session::{
+    self, Candidate, Constraints, PROJECT, Prover, Session, invalid_params, shown_name,
+};
+use crate::settings::Settings;
 use crate::sources::{self, FoundVars, Prefix, VarCredential};
 
 /// The most projects `targets` lists, as the app did.
@@ -29,26 +34,38 @@ const MAX_CA_BUNDLE_BYTES: usize = 1024 * 1024;
 
 const SERVICE_ACCOUNT: &str = "service_account";
 const GCLOUD: &str = "gcloud";
+const OAUTH: &str = "oauth";
 const ADC: &str = "adc";
 const CONFIGURATION_NAME_RULE: &str =
     "a gcloud configuration name: lower case letters, digits and hyphens, starting with a letter";
 
 /// What `main` found in the process: its environment, read once, and the
 /// clock. The plugin reads no other global state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Host {
+    /// The process environment.
     pub env: HashMap<String, String>,
+    /// The clock.
     pub now: fn() -> OffsetDateTime,
+}
+
+/// The variables' names only: their values may hold the person's secrets.
+impl fmt::Debug for Host {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Host")
+            .field("env", &self.env.keys().collect::<BTreeSet<_>>())
+            .field("now", &self.now)
+            .finish()
+    }
 }
 
 /// Builds the API client once `configure` says how to reach Google.
 pub type Connect<A> = Box<dyn Fn(&Network) -> Result<A, NetworkError> + Send + Sync>;
 
 /// The Google credential plugin, for one block.
-pub struct GooglePlugin<A, C> {
+pub struct GooglePlugin<A> {
     host: Host,
     connect: Connect<A>,
-    crypto: C,
     state: Mutex<State<A>>,
 }
 
@@ -59,17 +76,73 @@ struct State<A> {
     project_names: HashMap<String, String>,
 }
 
+impl<A> State<A> {
+    fn select(&mut self, params: SelectParams) -> Result<SelectResult, PluginError> {
+        let mut targets = params.targets;
+        let project = targets.remove(PROJECT);
+        if let Some(level) = targets.keys().next() {
+            return Err(invalid_params(format!(
+                "targets has level {level:?}; this plugin's only level is \"project\""
+            )));
+        }
+        let Some(project) = project.flatten().filter(|project| !project.is_empty()) else {
+            return Err(invalid_params("select needs targets.project"));
+        };
+        let names = self.project_names.get(&project).cloned();
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| PluginError::new(ErrorKind::NotSignedIn, "Sign in first."))?;
+        if let Some(pinned) = session
+            .pinned_project
+            .as_ref()
+            .filter(|pinned| **pinned != project)
+        {
+            return Err(PluginError::new(
+                ErrorKind::PinMismatch,
+                format!("The block pins project {pinned}, so {project} can't be selected."),
+            ));
+        }
+        session.project = Some(Target {
+            name: names.unwrap_or_else(|| project.clone()),
+            id: project,
+        });
+        Ok(SelectResult(session.identity()))
+    }
+}
+
 struct Configured<A> {
     api: Arc<A>,
     state_dir: PathBuf,
+    settings: Settings,
 }
 
-impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
-    pub fn new(host: Host, connect: Connect<A>, crypto: C) -> Self {
+// A derive would need `A: Clone`.
+impl<A> Clone for Configured<A> {
+    fn clone(&self) -> Self {
+        Self {
+            api: Arc::clone(&self.api),
+            state_dir: self.state_dir.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+}
+
+// The host's environment and the session hold secrets.
+impl<A> fmt::Debug for GooglePlugin<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GooglePlugin").finish_non_exhaustive()
+    }
+}
+
+impl<A: GoogleApi> GooglePlugin<A> {
+    /// A plugin that reads `host` and reaches Google through what `connect`
+    /// builds.
+    #[must_use]
+    pub fn new(host: Host, connect: Connect<A>) -> Self {
         Self {
             host,
             connect,
-            crypto,
             state: Mutex::new(State {
                 configured: None,
                 session: None,
@@ -84,12 +157,10 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn configured(&self) -> Result<(Arc<A>, PathBuf), PluginError> {
-        let state = self.state();
-        let configured = state.configured.as_ref().ok_or_else(|| {
+    fn configured(&self) -> Result<Configured<A>, PluginError> {
+        self.state().configured.clone().ok_or_else(|| {
             PluginError::new(ErrorKind::NotConfigured, "configure has not succeeded")
-        })?;
-        Ok((Arc::clone(&configured.api), configured.state_dir.clone()))
+        })
     }
 
     fn session(&self) -> Result<Session, PluginError> {
@@ -99,10 +170,9 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
             .ok_or_else(|| PluginError::new(ErrorKind::NotSignedIn, "Sign in first."))
     }
 
-    fn prover<'a>(&'a self, api: &'a A) -> Prover<'a, A, C> {
+    fn prover<'a>(&'a self, api: &'a A) -> Prover<'a, A> {
         Prover {
             api,
-            crypto: &self.crypto,
             now: (self.host.now)(),
         }
     }
@@ -113,8 +183,11 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
         candidate: Candidate,
         constraints: &Constraints,
     ) -> Result<Session, PluginError> {
-        let (api, _) = self.configured()?;
-        let session = self.prover(&api).prove(candidate, constraints).await?;
+        let Configured { api, settings, .. } = self.configured()?;
+        let session = self
+            .prover(&api)
+            .prove(settings.apply(candidate), constraints)
+            .await?;
         self.state().session = Some(session.clone());
         Ok(session)
     }
@@ -155,6 +228,40 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
             credential: Credential::Document(document),
             method: SERVICE_ACCOUNT.to_owned(),
             project,
+            region: None,
+            zone: None,
+            configuration: None,
+        };
+        self.sign_in_with(candidate, constraints).await
+    }
+
+    /// Google sign-in in the browser, asking for the block's required scopes,
+    /// or the app's default ones if it requires none.
+    async fn sign_in_oauth(
+        &self,
+        fields: HashMap<String, String>,
+        constraints: &Constraints,
+        prompts: &Prompts,
+    ) -> Result<Session, PluginError> {
+        let mut fields =
+            MethodFields::new(OAUTH, fields, &["clientId", "clientSecret", "clientFile"])?;
+        let client = ClientFields {
+            id: fields.take("clientId"),
+            secret: fields.take("clientSecret").map(Secret::new),
+            file: fields.take("clientFile"),
+        };
+        let client = oauth::resolve_client(client, &self.host.env).await?;
+        let api = self.configured()?.api;
+        let scopes = if constraints.scopes.is_empty() {
+            DEFAULT_SCOPES.map(str::to_owned).to_vec()
+        } else {
+            constraints.scopes.clone()
+        };
+        let document = oauth::sign_in(&*api, &client, &scopes, prompts).await?;
+        let candidate = Candidate {
+            credential: Credential::Document(document),
+            method: OAUTH.to_owned(),
+            project: None,
             region: None,
             zone: None,
             configuration: None,
@@ -225,7 +332,9 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
     /// The credential a detection source names, or `None` if it has none.
     async fn find(&self, lookup: Lookup) -> Result<Option<Candidate>, PluginError> {
         match lookup {
-            Lookup::Vars { vars, prefix, name } => match sources::find(&vars, &prefix) {
+            Lookup::Vars {
+                vars, prefix, name, ..
+            } => match sources::find(&vars, &prefix) {
                 None => Ok(None),
                 Some(found) => candidate_from_vars(found, name).await.map(Some),
             },
@@ -331,22 +440,11 @@ impl MethodFields {
         fields: HashMap<String, String>,
         known: &[&str],
     ) -> Result<Self, PluginError> {
-        // A name that isn't an identifier could be pasted material.
         let mut unknown: Vec<&str> = fields
             .keys()
             .map(String::as_str)
             .filter(|name| !known.contains(name))
-            .map(|name| {
-                let identifier = name.len() <= 64
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-                if identifier {
-                    name
-                } else {
-                    "(a name that is not an identifier)"
-                }
-            })
+            .map(shown_name)
             .collect();
         if !unknown.is_empty() {
             unknown.sort_unstable();
@@ -389,6 +487,7 @@ async fn read_document(
 
 fn methods() -> Vec<Method> {
     let field = |name: &str, label: &str, secret: bool| Field {
+        choices: Vec::new(),
         label: label.to_owned(),
         name: name.to_owned(),
         required: false,
@@ -403,13 +502,41 @@ fn methods() -> Vec<Method> {
             ],
             label: "Service Account Key".to_owned(),
             name: SERVICE_ACCOUNT.to_owned(),
+            one_of: Vec::new(),
+            unavailable: None,
+        },
+        Method {
+            fields: vec![
+                field("clientId", "OAuth client ID", false),
+                field("clientSecret", "OAuth client secret", true),
+                field("clientFile", "OAuth client file", false),
+            ],
+            label: "Google Sign-In".to_owned(),
+            name: OAUTH.to_owned(),
+            one_of: Vec::new(),
+            unavailable: None,
         },
         Method {
             fields: vec![field("configuration", "gcloud configuration", false)],
             label: "gcloud Config".to_owned(),
             name: GCLOUD.to_owned(),
+            one_of: Vec::new(),
+            unavailable: None,
         },
     ]
+}
+
+/// `project` as a target, unless it is pending deletion. Google lists those
+/// too; gcloud hides them.
+fn live_target(project: Project) -> Option<Target> {
+    project
+        .state
+        .as_deref()
+        .is_none_or(|state| state == "ACTIVE")
+        .then(|| Target {
+            name: project.display_name.unwrap_or_else(|| project.id.clone()),
+            id: project.id,
+        })
 }
 
 /// A detection source, checked before any is read.
@@ -418,6 +545,9 @@ enum Lookup {
         vars: HashMap<String, String>,
         prefix: Prefix,
         name: &'static str,
+        /// A values source's block, which a credential found here names as
+        /// its source.
+        from: Option<String>,
     },
     /// gcloud's Application Default Credentials file.
     Adc,
@@ -425,7 +555,7 @@ enum Lookup {
     Gcloud,
 }
 
-impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
+impl<A: GoogleApi> CredentialPlugin for GooglePlugin<A> {
     async fn configure(&self, params: ConfigureParams) -> Result<ConfigureResult, PluginError> {
         let state_dir = PathBuf::from(&params.state_dir);
         if !state_dir.is_absolute() {
@@ -434,6 +564,7 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                 params.state_dir
             )));
         }
+        let settings = Settings::parse(params.settings)?;
         files::create_private_dir(&state_dir)
             .await
             .map_err(|error| {
@@ -469,6 +600,7 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
         self.state().configured = Some(Configured {
             api: Arc::new(api),
             state_dir,
+            settings,
         });
         Ok(ConfigureResult {
             cloud: Some(ConfigureResultCloud::Gcp),
@@ -477,6 +609,7 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                 chosen: LevelChosen::AfterSignIn,
                 label: "Project".to_owned(),
                 name: PROJECT.to_owned(),
+                optional: None,
             }],
             methods: methods(),
             names: session::names(),
@@ -497,15 +630,17 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                         vars: self.host.env.clone(),
                         prefix,
                         name: "env",
+                        from: None,
                     }),
                     Err(prefix) => problems.push(format!(
                         "env prefix {prefix:?} must match ^[A-Z][A-Z0-9_]*_$"
                     )),
                 },
-                Source::Values { values } => lookups.push(Lookup::Vars {
+                Source::Values { values, from } => lookups.push(Lookup::Vars {
                     vars: values,
                     prefix: Prefix::default(),
                     name: "values",
+                    from: Some(from),
                 }),
                 Source::Named { name } => match name.as_str() {
                     ADC => lookups.push(Lookup::Adc),
@@ -524,6 +659,10 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
         // did; one that lacks a required scope stops the search.
         let mut failures: Vec<PluginError> = Vec::new();
         for lookup in lookups {
+            let from = match &lookup {
+                Lookup::Vars { from, .. } => from.clone(),
+                Lookup::Adc | Lookup::Gcloud => None,
+            };
             let proved = match self.find(lookup).await {
                 Ok(None) => continue,
                 Ok(Some(candidate)) => self.sign_in_with(candidate, &constraints).await,
@@ -531,15 +670,19 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
             };
             match proved {
                 Ok(session) => {
-                    return Ok(DetectResult::found(session.identity(), session.method));
+                    let identity = session.identity();
+                    return Ok(DetectResult::found(
+                        identity,
+                        from.unwrap_or(session.method),
+                    ));
                 }
                 Err(error) if error.kind() == ErrorKind::RequirementNotMet => return Err(error),
                 Err(error) => failures.push(error),
             }
         }
-        match failures.first() {
-            None => Ok(DetectResult::not_found()),
-            Some(first) => {
+        failures.first().map_or_else(
+            || Ok(DetectResult::not_found()),
+            |first| {
                 let messages: Vec<&str> = failures.iter().map(PluginError::message).collect();
                 Err(PluginError::new(
                     first.kind(),
@@ -548,14 +691,14 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                         messages.join("; ")
                     ),
                 ))
-            }
-        }
+            },
+        )
     }
 
     async fn sign_in(
         &self,
         params: SignInParams,
-        _prompts: Prompts,
+        prompts: Prompts,
     ) -> Result<SignInResult, PluginError> {
         let constraints = Constraints::parse(&params.pins, &params.requirements)?;
         let session = match params.method.as_str() {
@@ -563,10 +706,14 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                 self.sign_in_service_account(params.fields, &constraints)
                     .await?
             }
+            OAUTH => {
+                self.sign_in_oauth(params.fields, &constraints, &prompts)
+                    .await?
+            }
             GCLOUD => self.sign_in_gcloud(params.fields, &constraints).await?,
             other => {
                 return Err(invalid_params(format!(
-                    "this plugin has no sign-in method {other:?}; its methods are {SERVICE_ACCOUNT} and {GCLOUD}"
+                    "this plugin has no sign-in method {other:?}; its methods are {SERVICE_ACCOUNT}, {OAUTH} and {GCLOUD}"
                 )));
             }
         };
@@ -580,7 +727,7 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                 params.level
             )));
         }
-        let (api, _) = self.configured()?;
+        let api = self.configured()?.api;
         let session = self.session()?;
         let origin = Origin::of(&session.credential);
         let token = self.prover(&api).token(&session.credential).await?;
@@ -595,20 +742,8 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                     u32::try_from(size).unwrap_or(1),
                 )
                 .await
-                .map_err(|error| api_error(error, origin))?;
-            // Projects pending deletion are listed too; gcloud hides them.
-            for project in page.projects {
-                if project
-                    .state
-                    .as_deref()
-                    .is_none_or(|state| state == "ACTIVE")
-                {
-                    targets.push(Target {
-                        name: project.display_name.unwrap_or_else(|| project.id.clone()),
-                        id: project.id,
-                    });
-                }
-            }
+                .map_err(|error| api_error(&error, origin))?;
+            targets.extend(page.projects.into_iter().filter_map(live_target));
             page_token = page.next_page_token;
             if page_token.is_none() || targets.len() >= MAX_PROJECTS {
                 break;
@@ -622,42 +757,15 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
         Ok(TargetsResult { targets })
     }
 
-    async fn select(&self, params: SelectParams) -> Result<SelectResult, PluginError> {
-        let mut targets = params.targets;
-        let project = targets.remove(PROJECT);
-        if let Some(level) = targets.keys().next() {
-            return Err(invalid_params(format!(
-                "targets has level {level:?}; this plugin's only level is \"project\""
-            )));
-        }
-        let Some(project) = project.filter(|project| !project.is_empty()) else {
-            return Err(invalid_params("select needs targets.project"));
-        };
-        let mut state = self.state();
-        let names = state.project_names.get(&project).cloned();
-        let session = state
-            .session
-            .as_mut()
-            .ok_or_else(|| PluginError::new(ErrorKind::NotSignedIn, "Sign in first."))?;
-        if let Some(pinned) = session
-            .pinned_project
-            .as_ref()
-            .filter(|pinned| **pinned != project)
-        {
-            return Err(PluginError::new(
-                ErrorKind::PinMismatch,
-                format!("The block pins project {pinned}, so {project} can't be selected."),
-            ));
-        }
-        session.project = Some(Target {
-            name: names.unwrap_or_else(|| project.clone()),
-            id: project,
-        });
-        Ok(SelectResult(session.identity()))
+    fn select(
+        &self,
+        params: SelectParams,
+    ) -> impl Future<Output = Result<SelectResult, PluginError>> + Send {
+        future::ready(self.state().select(params))
     }
 
     async fn env(&self) -> Result<EnvResult, PluginError> {
-        let (_, state_dir) = self.configured()?;
+        let state_dir = self.configured()?.state_dir;
         let session = self.session()?;
         let file = match &session.credential {
             Credential::AccessToken(_) => None,

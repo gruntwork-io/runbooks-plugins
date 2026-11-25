@@ -1,0 +1,59 @@
+{
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
+  "permissions": {
+    "allow": [
+      "Bash(mise run fmt)",
+      "Bash(mise run lock)",
+      "Bash(mise run lint)",
+      "Bash(mise run lint-workflows)",
+      "Bash(mise run test)",
+      "Bash(mise run semver)",
+      "Bash(mise run check)",
+      "Bash(mise exec -- cargo check *)",
+      "Bash(mise exec -- cargo clippy *)",
+      "Bash(mise exec -- cargo nextest *)",
+      "Bash(mise exec -- cargo test *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-edit",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-edit",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/stop",
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
+}

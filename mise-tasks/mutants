@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="List each mutation no test catches; takes minutes"
+set -euo pipefail
+
+cargo mutants --workspace

@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .with_derive("Eq")
             .with_derive("Hash"),
     );
-    write_types(&out_dir.join("base.rs"), &base_settings, base.clone())?;
+    write_types(&out_dir.join("base.rs"), &base_settings, &base)?;
 
     let mut credential_settings = settings()?;
     let mut defs = Map::new();
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     write_types(
         &out_dir.join("credential.rs"),
         &credential_settings,
-        Value::Object(defs),
+        &Value::Object(defs),
     )?;
     Ok(())
 }
@@ -108,7 +108,11 @@ fn read_defs(path: &Path) -> Result<Value, Box<dyn Error>> {
 fn object(value: Value) -> Result<Map<String, Value>, String> {
     match value {
         Value::Object(map) => Ok(map),
-        other => Err(format!("expected an object, found {other}")),
+        other @ (Value::Null
+        | Value::Bool(_)
+        | Value::Number(_)
+        | Value::String(_)
+        | Value::Array(_)) => Err(format!("expected an object, found {other}")),
     }
 }
 
@@ -138,14 +142,14 @@ fn rewrite_refs(value: Value, file: &str, prefix: &str) -> Result<Value, Box<dyn
             }
             Value::Object(out)
         }
-        other => other,
+        leaf @ (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)) => leaf,
     })
 }
 
 fn write_types(
     path: &Path,
     settings: &TypeSpaceSettings,
-    defs: Value,
+    defs: &Value,
 ) -> Result<(), Box<dyn Error>> {
     let mut type_space = TypeSpace::new(settings);
     type_space.add_root_schema(serde_json::from_value(json!({ "$defs": defs }))?)?;
@@ -158,8 +162,8 @@ fn write_types(
 /// the name typify gives the type.
 fn prefixed(prefix: &str, name: &str) -> String {
     let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => format!("{prefix}{}{}", first.to_uppercase(), chars.as_str()),
-        None => prefix.to_owned(),
-    }
+    chars.next().map_or_else(
+        || prefix.to_owned(),
+        |first| format!("{prefix}{}{}", first.to_uppercase(), chars.as_str()),
+    )
 }

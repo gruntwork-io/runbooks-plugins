@@ -27,9 +27,10 @@ pub(crate) const MAX_CALLS: usize = 16;
 /// Lines waiting to be written to the output.
 const OUTPUT_QUEUE: usize = 64;
 
-/// Answers requests from `input` with `plugin` until `input` ends, writing
-/// responses and notifications to `output`. Returns `Ok` once `input` has
-/// ended, every call still in flight has been cancelled, and every line
+/// Answers requests from `input` with `plugin` until `input` ends.
+///
+/// Writes responses and notifications to `output`. Returns `Ok` once `input`
+/// has ended, every call still in flight has been cancelled, and every line
 /// already answered has been written.
 ///
 /// # Errors

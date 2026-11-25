@@ -260,10 +260,11 @@ mod tests {
     }
 
     #[test]
-    fn a_configuration_name_cannot_leave_the_directory() {
+    fn a_configuration_name_cannot_leave_the_directory() -> Result<(), String> {
         for bad in ["../x", "Dev", "a/b", "", "-x", "a b"] {
             assert!(ConfigurationName::parse(bad.to_owned()).is_err(), "{bad}");
         }
-        assert!(ConfigurationName::parse("prod-2".to_owned()).is_ok());
+        ConfigurationName::parse("prod-2".to_owned())?;
+        Ok(())
     }
 }
