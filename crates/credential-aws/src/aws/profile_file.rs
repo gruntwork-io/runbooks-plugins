@@ -152,3 +152,27 @@ pub(crate) async fn read_profiles(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{ProfileSettings, Profiles};
+    use crate::secret::Secret;
+
+    #[test]
+    fn profiles_print_only_their_names() {
+        let keys = ProfileSettings {
+            access_key_id: Some("AKIADEV".to_owned()),
+            secret_access_key: Some(Secret::new("test-secret-access-key-value")),
+            ..ProfileSettings::default()
+        };
+        let profiles = Profiles {
+            by_name: BTreeMap::from([
+                ("prod".to_owned(), keys.clone()),
+                ("default".to_owned(), keys),
+            ]),
+        };
+        assert_eq!(format!("{profiles:?}"), r#"["default", "prod"]"#);
+    }
+}

@@ -398,6 +398,42 @@ region = us-gov-east-1
     Ok(())
 }
 
+/// Keys that have expired are not used: when signing in with the profile
+/// again fails, env fails with why.
+#[tokio::test]
+async fn an_assumed_roles_expired_keys_are_not_used_when_signing_in_again_fails() -> TestResult {
+    let config = "
+[profile deploy]
+role_arn = arn:aws-us-gov:iam::123456789012:role/deploy
+source_profile = default
+region = us-gov-east-1
+";
+    let (_home, env) = home(config, KEYS, &[])?;
+    let aws = FakeAws::default()
+        .assumes(
+            DEPLOY_ROLE,
+            vec![
+                Ok(assumed("ASIAOLD", NOW)),
+                Err(AwsError::new(
+                    Service::Sts,
+                    AwsErrorKind::Network,
+                    "dispatch failure: connection refused",
+                )),
+            ],
+        )
+        .caller("ASIAOLD", ACCOUNT, DEPLOY_ARN)?;
+    let mut app = App::start(aws.clone(), env).await?;
+    app.ok("signIn", profile_sign_in("deploy", &[])?, "signInResult")
+        .await?;
+    let error = app.fails("env", json!({}), "network").await?;
+    assert!(
+        message(&error)?.contains(&format!("assuming role {DEPLOY_ROLE}")),
+        "{error}"
+    );
+    assert_eq!(aws.sso_log().len(), 2);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_profiles_secrets_leave_the_plugin_only_in_envs_result() -> TestResult {
     let config = "
