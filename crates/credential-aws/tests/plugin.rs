@@ -763,3 +763,30 @@ async fn a_secret_leaves_the_plugin_only_in_envs_result() -> TestResult {
     assert_eq!(env_lines, 1);
     Ok(())
 }
+
+/// Each refusal says which it is: a level AWS has, fixed for these keys, or
+/// a level AWS does not have.
+#[tokio::test]
+async fn targets_says_whether_aws_has_the_level() -> TestResult {
+    let mut app = App::start(FakeAws::default(), Environment::default()).await?;
+    for (level, message) in [
+        (
+            "account",
+            "AWS has no account to choose for these credentials: their account and role are fixed",
+        ),
+        (
+            "role",
+            "AWS has no role to choose for these credentials: their account and role are fixed",
+        ),
+        (
+            "project",
+            "AWS has no level \"project\": its levels are account and role",
+        ),
+    ] {
+        let error = app
+            .fails("targets", json!({"level": level}), "invalidParams")
+            .await?;
+        assert_eq!(at(&error, "/message"), message, "{level}");
+    }
+    Ok(())
+}

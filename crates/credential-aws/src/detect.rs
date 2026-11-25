@@ -330,6 +330,21 @@ mod tests {
         let secret = "do-not-print-this";
         let env = Environment::new(vars(&[("AWS_SECRET_ACCESS_KEY", secret)]));
         let source = DetectSource::Values(vars(&[("AWS_SECRET_ACCESS_KEY", secret)]));
-        assert!(!format!("{env:?} {source:?}").contains(secret));
+        assert_eq!(
+            format!("{env:?} {source:?}"),
+            "Environment(1 variables) Values(1 values)"
+        );
+    }
+
+    #[test]
+    fn an_empty_prefix_is_no_prefix() -> Result<(), InvalidSource> {
+        let sources = parse_sources(vec![Source::Env {
+            prefix: Some(String::new()),
+        }])?;
+        assert!(
+            matches!(sources.as_slice(), [DetectSource::Env(None)]),
+            "{sources:?}"
+        );
+        Ok(())
     }
 }

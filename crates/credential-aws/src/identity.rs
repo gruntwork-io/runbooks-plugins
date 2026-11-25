@@ -269,6 +269,10 @@ mod tests {
             Pins::parse(&wire(&[("account", "12345")])),
             Err(InvalidPin::Account(_))
         ));
+        assert_eq!(
+            Pins::parse(&wire(&[("role", "")])),
+            Err(InvalidPin::EmptyRole)
+        );
         Ok(())
     }
 
