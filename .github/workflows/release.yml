@@ -91,7 +91,7 @@ jobs:
             fi
           done
           if ((${#missing[@]} > 0)); then
-            echo "::error::A tag's macOS binaries are signed, but these secrets are not set in the release environment: ${missing[*]}"
+            echo "::error::A tag's macOS binaries are signed, but these repository secrets are not set: ${missing[*]}"
             exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

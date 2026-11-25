@@ -30,7 +30,7 @@ Pushing a tag `v<version>`, where `<version>` is the workspace version in `Cargo
 
 Each asset is named `<binary>_<version>_<os>_<arch>`, plus `.exe` on Windows, such as `runbooks-credential-aws_0.1.0_darwin_arm64`. `<os>` is `darwin`, `linux` or `windows`, and `<arch>` is `arm64` or `amd64`.
 
-Signing needs `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`, `MACOS_AC_LOGIN`, `MACOS_AC_PASSWORD` and `MACOS_AC_PROVIDER` in the `release` environment. A tag's run fails without them.
+Signing needs `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`, `MACOS_AC_LOGIN`, `MACOS_AC_PASSWORD` and `MACOS_AC_PROVIDER` as repository secrets. A tag's run fails without them.
 
 `mise run dist <target>` and `mise run checksums` make the same files, unsigned, in `target/dist`.
 
