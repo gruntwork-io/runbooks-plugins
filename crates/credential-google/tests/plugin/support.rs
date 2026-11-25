@@ -27,7 +27,7 @@ use tokio::time::timeout;
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-pub const WAIT: Duration = Duration::from_secs(10);
+pub(crate) const WAIT: Duration = Duration::from_secs(10);
 const SCHEMAS: [&str; 2] = ["base.schema.json", "credential.schema.json"];
 const ROOT: &str = "json-schema:///";
 
@@ -206,7 +206,7 @@ impl GoogleApi for Google {
             TokenRequest::AuthorizationCode { code, .. } => {
                 let exchanged = self.with(|state| {
                     state.token_requests.push(request.clone());
-                    state.codes.get(code.expose()).cloned()
+                    state.codes.get(code.expose()).copied()
                 });
                 return future::ready(match exchanged {
                     Some(Ok(refresh_token)) => Ok(Token {
@@ -302,9 +302,9 @@ impl Crypto for FakeCrypto {
     }
 }
 
-pub const STATE: &str = "state-4b1d";
-pub const VERIFIER: &str = "SENTINEL-VERIFIER";
-pub const CHALLENGE: &str = "challenge-of-the-verifier";
+pub(crate) const STATE: &str = "state-4b1d";
+pub(crate) const VERIFIER: &str = "SENTINEL-VERIFIER";
+pub(crate) const CHALLENGE: &str = "challenge-of-the-verifier";
 
 /// The app: it writes the plugin's input and reads every line it writes.
 pub(crate) struct App {
@@ -366,7 +366,7 @@ impl App {
     }
 
     /// The next line the plugin writes, recorded as written for `method`.
-    pub async fn next_message(&mut self, method: &str, wait: Duration) -> TestResult<Value> {
+    pub(crate) async fn next_message(&mut self, method: &str, wait: Duration) -> TestResult<Value> {
         let line = timeout(wait, self.stdout.next_line())
             .await??
             .ok_or("the plugin's output ended")?;
@@ -379,7 +379,12 @@ impl App {
     }
 
     /// The response to request `id`, after any notifications.
-    pub async fn response(&mut self, method: &str, id: u64, wait: Duration) -> TestResult<Value> {
+    pub(crate) async fn response(
+        &mut self,
+        method: &str,
+        id: u64,
+        wait: Duration,
+    ) -> TestResult<Value> {
         loop {
             let message = self.next_message(method, wait).await?;
             if at(&message, "/id") == id {
@@ -536,22 +541,25 @@ pub(crate) fn gcloud_root(dir: &Path, adc: Option<&str>) -> TestResult<String> {
         .to_owned())
 }
 
-pub const OAUTH_CLIENT_ID: &str = "client.apps.googleusercontent.com";
+pub(crate) const OAUTH_CLIENT_ID: &str = "client.apps.googleusercontent.com";
 
 /// Starts an `oauth` sign-in and returns its request id and the URL the
 /// person is asked to open.
-pub async fn start_oauth(app: &mut App, params: Value) -> TestResult<(u64, Url)> {
+pub(crate) async fn start_oauth(app: &mut App, params: Value) -> TestResult<(u64, Url)> {
     let id = app.send("signIn", params).await?;
     let prompt = app.next_message("signIn", WAIT).await?;
-    assert_eq!(prompt["method"], "signIn.prompt", "{prompt}");
-    assert_eq!(prompt["params"]["kind"], "openUrl", "{prompt}");
-    assert_eq!(prompt["params"]["request"], id, "{prompt}");
-    let url = prompt["params"]["url"].as_str().ok_or("no url")?;
+    assert_eq!(at(&prompt, "/method"), "signIn.prompt", "{prompt}");
+    assert_eq!(at(&prompt, "/params/kind"), "openUrl", "{prompt}");
+    assert_eq!(at(&prompt, "/params/request"), id, "{prompt}");
+    let url = prompt
+        .pointer("/params/url")
+        .and_then(Value::as_str)
+        .ok_or("no url")?;
     Ok((id, Url::parse(url)?))
 }
 
 /// The value of the query parameter `name`.
-pub fn query(url: &Url, name: &str) -> Option<String> {
+pub(crate) fn query(url: &Url, name: &str) -> Option<String> {
     url.query_pairs()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.into_owned())
@@ -559,7 +567,7 @@ pub fn query(url: &Url, name: &str) -> Option<String> {
 
 /// The person's browser, sent back to the redirect URI in the sign-in URL
 /// with `query`, as Google's redirect does. Returns the plugin's response.
-pub async fn redirect(sign_in_url: &Url, query_string: &str) -> TestResult<String> {
+pub(crate) async fn redirect(sign_in_url: &Url, query_string: &str) -> TestResult<String> {
     let redirect_uri = query(sign_in_url, "redirect_uri").ok_or("no redirect_uri")?;
     let redirect_uri = Url::parse(&redirect_uri)?;
     let host = format!(
@@ -576,7 +584,7 @@ pub async fn redirect(sign_in_url: &Url, query_string: &str) -> TestResult<Strin
 }
 
 /// Sends `head` to `host` and returns what comes back.
-pub async fn request(host: &str, head: &str) -> TestResult<String> {
+pub(crate) async fn request(host: &str, head: &str) -> TestResult<String> {
     let mut stream = TcpStream::connect(host).await?;
     stream.write_all(head.as_bytes()).await?;
     let mut response = String::new();

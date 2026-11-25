@@ -46,10 +46,15 @@ pub enum TokenRequest {
     /// The code Google's redirect brought back from a browser sign-in, with
     /// its PKCE verifier.
     AuthorizationCode {
+        /// The OAuth client's ID.
         client_id: String,
+        /// The OAuth client's secret.
         client_secret: Secret,
+        /// The authorization code.
         code: Secret,
+        /// The PKCE code verifier the sign-in URL's challenge was made from.
         code_verifier: Secret,
+        /// The redirect URI the sign-in URL named.
         redirect_uri: String,
     },
 }

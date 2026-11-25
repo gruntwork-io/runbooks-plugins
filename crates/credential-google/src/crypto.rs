@@ -61,7 +61,9 @@ pub struct FlowSecrets {
     /// Sent to Google in the sign-in URL and checked on the way back, so it
     /// is shown to the person; it guards only this one sign-in.
     pub state: String,
+    /// The PKCE code verifier, sent only in the token exchange.
     pub verifier: Secret,
+    /// The verifier's S256 challenge, sent in the sign-in URL.
     pub challenge: String,
 }
 

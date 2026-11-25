@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::support::{
     App, CHALLENGE, CLOUD_PLATFORM, FakeCrypto, OAUTH_CLIENT_ID, STATE, TestResult,
-    USER_CLIENT_SECRET, USER_EMAIL, USER_REFRESH_TOKEN, VERIFIER, env_value, google, query,
+    USER_CLIENT_SECRET, USER_EMAIL, USER_REFRESH_TOKEN, VERIFIER, at, env_value, google, query,
     redirect, request, sign_in, start_oauth,
 };
 
@@ -67,7 +67,7 @@ async fn a_browser_sign_in_ends_in_a_credential_that_refreshes_itself() -> TestR
         "{page}"
     );
     let response = app.response("signIn", id, crate::support::WAIT).await?;
-    let identity = &response["result"];
+    let identity = &at(&response, "/result");
     crate::support::assert_valid("signInResult", identity)?;
     assert_eq!(identity["method"], "oauth");
     assert_eq!(
@@ -115,7 +115,7 @@ async fn client_used(app: &mut App, fields: Value) -> TestResult<Option<String>>
     let (id, url) = start_oauth(app, sign_in("oauth", &fields)).await?;
     redirect(&url, &format!("state={STATE}&error=access_denied")).await?;
     let response = app.response("signIn", id, crate::support::WAIT).await?;
-    assert_eq!(response["error"]["data"]["kind"], "cancelled", "{response}");
+    assert_eq!(at(&response, "/error/data/kind"), "cancelled", "{response}");
     Ok(query(&url, "client_id"))
 }
 
@@ -186,7 +186,10 @@ async fn without_a_whole_client_sign_in_says_how_to_give_one() -> TestResult {
         let error = app
             .error("signIn", sign_in("oauth", &fields), "invalidParams")
             .await?;
-        let message = error["message"].as_str().unwrap_or_default();
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(message.contains(expect), "{fields}: {message}");
     }
 
@@ -200,7 +203,7 @@ async fn without_a_whole_client_sign_in_says_how_to_give_one() -> TestResult {
         .error("signIn", sign_in("oauth", &json!({})), "invalidParams")
         .await?;
     assert!(
-        error["message"]
+        at(&error, "/message")
             .as_str()
             .is_some_and(|m| m.contains("GOOGLE_OAUTH_CLIENT_SECRET"))
     );
@@ -231,11 +234,12 @@ async fn the_blocks_required_scopes_are_asked_for_and_checked() -> TestResult {
     redirect(&url, &format!("state={STATE}&code=4%2F0-code")).await?;
     let response = app.response("signIn", id, crate::support::WAIT).await?;
     assert_eq!(
-        response["error"]["data"]["kind"], "requirementNotMet",
+        at(&response, "/error/data/kind"),
+        "requirementNotMet",
         "{response}"
     );
     assert_eq!(
-        response["error"]["data"]["unmet"],
+        at(&response, "/error/data/unmet"),
         json!([{"kind": "scopes", "scopes": [admin]}])
     );
     Ok(())
@@ -289,10 +293,14 @@ async fn a_declined_or_refused_sign_in_says_what_happened() -> TestResult {
         assert!(!shown.contains("script"), "{shown}");
         let response = app.response("signIn", id, crate::support::WAIT).await?;
         assert_eq!(
-            response["error"]["data"]["kind"], kind,
+            at(&response, "/error/data/kind"),
+            kind,
             "{callback}: {response}"
         );
-        let message = response["error"]["message"].as_str().unwrap_or_default();
+        let message = response
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(message.contains(expect), "{callback}: {message}");
     }
     Ok(())
@@ -304,10 +312,8 @@ async fn the_sign_in_window_closes_after_five_minutes() -> TestResult {
     let mut app = App::start(&[], &google(), FakeCrypto::default())?;
     app.configure(&dir.path().join("state")).await?;
     let (id, url) = start_oauth(&mut app, sign_in("oauth", &client_fields())).await?;
-    let response = app
-        .response("signIn", id, Duration::from_secs(6 * 60))
-        .await?;
-    assert_eq!(response["error"]["data"]["kind"], "timedOut", "{response}");
+    let response = app.response("signIn", id, Duration::from_mins(6)).await?;
+    assert_eq!(at(&response, "/error/data/kind"), "timedOut", "{response}");
     // The listener is gone with the sign-in.
     let redirect_uri = query(&url, "redirect_uri").ok_or("no redirect_uri")?;
     let host = redirect_uri
@@ -333,7 +339,10 @@ async fn without_a_random_source_browser_sign_in_says_what_is_missing() -> TestR
     let error = app
         .error("signIn", sign_in("oauth", &client_fields()), "internal")
         .await?;
-    let message = error["message"].as_str().unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     assert!(
         message.contains("cannot start a browser sign-in"),
         "{message}"

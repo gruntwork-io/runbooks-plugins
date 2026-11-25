@@ -29,7 +29,7 @@ pub(crate) const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth"
 /// The one path the listener answers.
 const CALLBACK_PATH: &str = "/oauth2callback";
 /// How long the person has to finish signing in, as the app allowed.
-pub(crate) const SIGN_IN_WINDOW: Duration = Duration::from_secs(5 * 60);
+pub(crate) const SIGN_IN_WINDOW: Duration = Duration::from_mins(5);
 /// How long one connection may take to send its request.
 const REQUEST_WINDOW: Duration = Duration::from_secs(10);
 const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
@@ -232,7 +232,12 @@ pub(crate) async fn sign_in<A: GoogleApi, C: Crypto>(
     // 127.0.0.1, not localhost, which may resolve to ::1.
     let host = format!("127.0.0.1:{port}");
     let redirect_uri = format!("http://{host}{CALLBACK_PATH}");
-    let mut url = Url::parse(AUTH_URL).expect("a literal URL parses");
+    let mut url = Url::parse(AUTH_URL).map_err(|error| {
+        PluginError::new(
+            ErrorKind::Internal,
+            format!("Google's sign-in URL doesn't parse: {error}"),
+        )
+    })?;
     url.query_pairs_mut()
         .append_pair("client_id", &client.id)
         .append_pair("redirect_uri", &redirect_uri)
@@ -359,7 +364,7 @@ enum Page {
 }
 
 impl Page {
-    fn status(self) -> &'static str {
+    const fn status(self) -> &'static str {
         match self {
             Self::SignedIn | Self::NotSignedIn => "200 OK",
             Self::BadRequest => "400 Bad Request",
@@ -367,7 +372,7 @@ impl Page {
         }
     }
 
-    fn body(self) -> &'static str {
+    const fn body(self) -> &'static str {
         match self {
             Self::SignedIn => {
                 "<!doctype html><meta charset=utf-8><title>Signed in</title><p>You're signed in to Google Cloud. You can close this tab and return to Runbooks."
@@ -413,7 +418,10 @@ impl Callbacks {
     fn listen(listener: TcpListener, host: String) -> Self {
         let (send, received) = mpsc::channel(MAX_CONNECTIONS);
         let mut tasks = JoinSet::new();
-        tasks.spawn(accept(listener, host, send));
+        // A block, as the set's type can't name `!` on stable Rust.
+        tasks.spawn(async move {
+            accept(listener, host, send).await;
+        });
         Self {
             received,
             _listener: tasks,
@@ -428,7 +436,7 @@ impl Callbacks {
     }
 }
 
-async fn accept(listener: TcpListener, host: String, send: mpsc::Sender<Callback>) {
+async fn accept(listener: TcpListener, host: String, send: mpsc::Sender<Callback>) -> ! {
     let mut connections = JoinSet::new();
     loop {
         let stream = match listener.accept().await {
