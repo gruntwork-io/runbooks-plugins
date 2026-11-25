@@ -240,10 +240,13 @@ pub fn check_choice(
 mod tests {
     use std::error::Error;
 
-    use runbooks_plugin_protocol::credential::ErrorKind;
+    use runbooks_plugin_protocol::credential::{ErrorKind, Target};
     use runbooks_plugin_transport::PluginError;
 
-    use super::{Pins, Resolution, TenantPin, check_choice, resolve, visible_tenants};
+    use super::{
+        Pins, Resolution, TenantPin, check_choice, resolve, subscription_targets, tenant_targets,
+        visible_tenants,
+    };
     use crate::az::{Accounts, Subscription, Tenant};
     use crate::ids::{SubscriptionId, TenantId};
 
@@ -283,6 +286,10 @@ mod tests {
             id: tenant(id)?,
             written: id.to_owned(),
         })
+    }
+
+    fn ids(targets: &[Target]) -> Vec<&str> {
+        targets.iter().map(|target| target.id.as_str()).collect()
     }
 
     fn chosen(tenant_id: &str, subscription: Option<&str>) -> Result<Resolution, Box<dyn Error>> {
@@ -445,6 +452,36 @@ mod tests {
         assert_eq!(
             kind(&sub_pinned, T2, s2.as_ref())?,
             Some(ErrorKind::PinMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_targets_offered_are_the_pinned_tenant_and_the_tenants_subscriptions() -> TestResult {
+        let all = tenants(&[T1, T2])?;
+        assert_eq!(ids(&tenant_targets(&all, &Pins::default())), [T1, T2]);
+        let pinned = Pins {
+            tenant: Some(pin_tenant(T2)?),
+            subscription: None,
+        };
+        assert_eq!(ids(&tenant_targets(&all, &pinned)), [T2]);
+
+        let subs = [
+            sub(S1, "Prod", T1)?,
+            sub(S2, "Dev", T1)?,
+            sub(S3, "Other", T2)?,
+        ];
+        assert_eq!(
+            ids(&subscription_targets(&subs, &tenant(T1)?, &Pins::default())),
+            [S1, S2]
+        );
+        let by_name = Pins {
+            tenant: None,
+            subscription: Some("dev".to_owned()),
+        };
+        assert_eq!(
+            ids(&subscription_targets(&subs, &tenant(T1)?, &by_name)),
+            [S2]
         );
         Ok(())
     }

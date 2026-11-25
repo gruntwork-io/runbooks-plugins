@@ -140,4 +140,25 @@ mod tests {
             "{message}"
         );
     }
+
+    /// One role is "it"; the elevation hint needs User Access Administrator
+    /// and the root scope both.
+    #[test]
+    fn one_missing_role_is_named_alone_and_only_uaa_at_root_gets_the_hint() {
+        for (role, scope) in [
+            ("Owner", "/"),
+            ("User Access Administrator", "/subscriptions/x"),
+        ] {
+            let missing = [MissingRole {
+                role: role.to_owned(),
+                scope: scope.to_owned(),
+            }];
+            assert_eq!(
+                unmet(&missing, "ana@contoso.com").message(),
+                format!(
+                    "ana@contoso.com is missing the required role: {role} at {scope}. Ask an administrator to assign it, then sign in again."
+                )
+            );
+        }
+    }
 }

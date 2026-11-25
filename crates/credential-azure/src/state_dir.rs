@@ -277,4 +277,110 @@ mod tests {
         assert!(temp.path().join("engine-file").exists());
         Ok(())
     }
+
+    /// `az`'s login files may each be 64 MiB; a larger one fails the copy,
+    /// which leaves nothing behind.
+    #[tokio::test]
+    async fn a_login_file_may_be_as_large_as_64_mib() -> TestResult {
+        let (home, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        fs::write(home.path().join("azureProfile.json"), "{}")?;
+        let cache = fs::File::create(home.path().join("msal_token_cache.bin"))?;
+        cache.set_len(64 * 1024 * 1024)?;
+        let state = StateDir::new(state.path().to_owned());
+        let dir = state
+            .copy_login(home.path())
+            .await?
+            .ok_or("no login copied")?;
+        assert_eq!(
+            fs::metadata(dir.join("msal_token_cache.bin"))?.len(),
+            64 * 1024 * 1024
+        );
+        state.remove(&dir).await?;
+
+        cache.set_len(64 * 1024 * 1024 + 1)?;
+        let error = state
+            .copy_login(home.path())
+            .await
+            .err()
+            .ok_or("a login file over 64 MiB was copied")?;
+        let message = error.message();
+        assert!(
+            message.contains("msal_token_cache.bin")
+                && message.contains("larger than 67108864 bytes"),
+            "{message}"
+        );
+        assert_eq!(fs::read_dir(state.path())?.count(), 0);
+        Ok(())
+    }
+
+    /// A login file that is there but can't be opened fails the copy; only
+    /// a missing one is skipped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_login_file_that_cannot_be_opened_fails_the_copy() -> TestResult {
+        let (home, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        fs::write(home.path().join("azureProfile.json"), "{}")?;
+        let looped = home.path().join("msal_token_cache.json");
+        std::os::unix::fs::symlink(&looped, &looped)?;
+        let state = StateDir::new(state.path().to_owned());
+        let error = state
+            .copy_login(home.path())
+            .await
+            .err()
+            .ok_or("a login with an unreadable file was copied")?;
+        assert!(
+            error
+                .message()
+                .starts_with("copying the Azure CLI login in"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(fs::read_dir(state.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_one_sign_in_directory_and_a_missing_one_is_no_error() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let state = StateDir::new(temp.path().to_owned());
+        let (first, second) = (state.create().await?, state.create().await?);
+        state.remove(&first).await?;
+        assert!(!first.exists() && second.exists());
+        state.remove(&first).await?;
+
+        let gone = StateDir::new(temp.path().join("not-there"));
+        gone.remove_all().await?;
+        Ok(())
+    }
+
+    /// A failure other than the directory being gone is an error: here, a
+    /// state directory or a sign-in directory that is a file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_state_or_sign_in_directory_that_is_a_file_is_an_error() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let file = temp.path().join("az-1");
+        fs::write(&file, "not a directory")?;
+        let state = StateDir::new(temp.path().to_owned());
+        assert!(state.remove(&file).await.is_err());
+        assert!(state.remove_all().await.is_err());
+        assert!(StateDir::new(file).remove_all().await.is_err());
+        Ok(())
+    }
+
+    /// A sign-in directory that can't be created for a reason other than
+    /// one already being there is an error at once.
+    #[tokio::test]
+    async fn a_state_directory_that_is_not_there_is_an_error_at_once() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let state = StateDir::new(temp.path().join("not-there"));
+        let error = state.create().await.err().ok_or("created")?;
+        assert!(
+            error.message().starts_with("the state directory")
+                && !error.message().contains("already holds"),
+            "{}",
+            error.message()
+        );
+        Ok(())
+    }
 }
