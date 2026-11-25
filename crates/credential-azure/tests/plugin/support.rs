@@ -15,15 +15,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, 
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-pub type TestResult = Result<(), Box<dyn Error>>;
+pub(crate) type TestResult = Result<(), Box<dyn Error>>;
 
 /// Longer than any answer takes on a loaded runner; a hang fails the test.
-const WAIT: Duration = Duration::from_secs(30);
+pub(crate) const WAIT: Duration = Duration::from_secs(30);
 
 const SCHEMAS: [&str; 2] = ["base.schema.json", "credential.schema.json"];
 const ROOT: &str = "json-schema:///";
 
-pub fn validator(schema: &Value) -> Result<Validator, Box<dyn Error>> {
+fn validator(schema: &Value) -> Result<Validator, Box<dyn Error>> {
     let mut registry = Registry::new();
     for file in SCHEMAS {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -41,19 +41,29 @@ pub fn validator(schema: &Value) -> Result<Validator, Box<dyn Error>> {
 }
 
 /// Asserts `value` is valid for a definition in the credential schema.
-pub fn assert_valid(def: &str, value: &Value) -> TestResult {
+pub(crate) fn assert_valid(def: &str, value: &Value) -> TestResult {
     validator(&json!({ "$ref": format!("{ROOT}credential.schema.json#/$defs/{def}") }))?
         .validate(value)
         .map_err(|e| format!("{def}: {e} in {value}"))?;
     Ok(())
 }
 
-/// The error kind of a response, or `None` for a result.
-pub fn error_kind(response: &Value) -> Option<&str> {
-    response["error"]["data"]["kind"].as_str()
+/// The member of `value` at JSON Pointer `pointer`, or `null` if there is none.
+pub(crate) fn at(value: &Value, pointer: &str) -> Value {
+    value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
-pub struct App {
+/// The error kind of a response, or `None` for a result.
+pub(crate) fn error_kind(response: &Value) -> Option<&str> {
+    response.pointer("/error/data/kind").and_then(Value::as_str)
+}
+
+/// The error message of a response, or `None` for a result.
+pub(crate) fn error_message(response: &Value) -> Option<&str> {
+    response.pointer("/error/message").and_then(Value::as_str)
+}
+
+pub(crate) struct App {
     stdin: Option<DuplexStream>,
     stdout: Lines<BufReader<DuplexStream>>,
     serve: JoinHandle<Result<(), ServeError>>,
@@ -64,7 +74,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn start(plugin: impl CredentialPlugin) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn start(plugin: impl CredentialPlugin) -> Result<Self, Box<dyn Error>> {
         let (stdin, plugin_stdin) = duplex(64 * 1024);
         let (plugin_stdout, stdout) = duplex(64 * 1024);
         let message = json!({ "oneOf": [
@@ -83,7 +93,11 @@ impl App {
     }
 
     /// Sends a request and returns its id.
-    pub async fn request(&mut self, method: &str, params: Value) -> Result<i64, Box<dyn Error>> {
+    pub(crate) async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<i64, Box<dyn Error>> {
         self.next_id += 1;
         let request =
             json!({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params});
@@ -94,7 +108,7 @@ impl App {
     }
 
     /// The plugin's next line, valid for the schema.
-    pub async fn receive(&mut self) -> Result<Value, Box<dyn Error>> {
+    pub(crate) async fn receive(&mut self) -> Result<Value, Box<dyn Error>> {
         let line = timeout(WAIT, self.stdout.next_line())
             .await??
             .ok_or("the plugin's output ended")?;
@@ -107,25 +121,33 @@ impl App {
     }
 
     /// Calls `method` and returns its response, checking it answers the call.
-    pub async fn call(&mut self, method: &str, params: Value) -> Result<Value, Box<dyn Error>> {
+    pub(crate) async fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, Box<dyn Error>> {
         let id = self.request(method, params).await?;
         let response = self.receive().await?;
-        if response["id"] != id {
+        if at(&response, "/id") != id {
             return Err(format!("expected the response to {id}, got {response}").into());
         }
         Ok(response)
     }
 
     /// Calls `method` and returns its result, failing on an error response.
-    pub async fn result(&mut self, method: &str, params: Value) -> Result<Value, Box<dyn Error>> {
+    pub(crate) async fn result(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, Box<dyn Error>> {
         let response = self.call(method, params).await?;
-        match response.get("result") {
-            Some(result) => Ok(result.clone()),
-            None => Err(format!("{method} failed: {response}").into()),
-        }
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| format!("{method} failed: {response}").into())
     }
 
-    pub async fn configure(&mut self, state_dir: &Path) -> Result<Value, Box<dyn Error>> {
+    pub(crate) async fn configure(&mut self, state_dir: &Path) -> Result<Value, Box<dyn Error>> {
         let state_dir = state_dir
             .to_str()
             .ok_or("the state directory is not UTF-8")?;
@@ -140,7 +162,7 @@ impl App {
     }
 
     /// Closes the plugin's input and waits for `serve` to return.
-    pub async fn close(mut self) -> Result<Vec<String>, Box<dyn Error>> {
+    pub(crate) async fn close(mut self) -> Result<Vec<String>, Box<dyn Error>> {
         self.stdin = None;
         timeout(WAIT, self.serve).await???;
         while let Some(line) = timeout(WAIT, self.stdout.next_line()).await?? {
@@ -150,16 +172,16 @@ impl App {
     }
 }
 
-pub fn detect_params(sources: Value, pins: Value, requirements: Value) -> Value {
+pub(crate) fn detect_params(sources: &Value, pins: &Value, requirements: &Value) -> Value {
     json!({"sources": sources, "pins": pins, "requirements": requirements})
 }
 
-pub fn sign_in_params(method: &str, fields: Value, pins: Value) -> Value {
+pub(crate) fn sign_in_params(method: &str, fields: &Value, pins: &Value) -> Value {
     json!({"method": method, "fields": fields, "pins": pins, "requirements": []})
 }
 
 /// The `az-*` sign-in directories in `state`.
-pub fn sign_in_dirs(state: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+pub(crate) fn sign_in_dirs(state: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     let mut dirs = Vec::new();
     for entry in fs::read_dir(state)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
@@ -172,10 +194,11 @@ pub fn sign_in_dirs(state: &Path) -> Result<Vec<String>, Box<dyn Error>> {
 }
 
 /// An env result's value for `name`, if it set one.
-pub fn env_value<'a>(env: &'a Value, name: &str) -> Option<&'a str> {
-    env["values"]
+pub(crate) fn env_value<'a>(env: &'a Value, name: &str) -> Option<&'a str> {
+    env.pointer("/values")?
         .as_array()?
         .iter()
-        .find(|value| value["name"] == name)?["value"]
+        .find(|value| value.get("name").is_some_and(|n| n == name))?
+        .get("value")?
         .as_str()
 }

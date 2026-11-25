@@ -7,19 +7,19 @@ use runbooks_plugin_protocol::credential::{
 
 use crate::session::SignInMethod;
 
-pub const TENANT_LEVEL: &str = "tenant";
-pub const SUBSCRIPTION_LEVEL: &str = "subscription";
+pub(crate) const TENANT_LEVEL: &str = "tenant";
+pub(crate) const SUBSCRIPTION_LEVEL: &str = "subscription";
 
 /// The one detection source the plugin names itself: the person's own `az` login.
-pub const CLI_SOURCE: &str = "cli";
+pub(crate) const CLI_SOURCE: &str = "cli";
 
 /// The optional tenant field of an interactive sign-in.
-pub const TENANT_FIELD: &str = "tenantId";
+pub(crate) const TENANT_FIELD: &str = "tenantId";
 
 /// Every env and output name the plugin may set. The base environment
 /// strips them all, so a value from the app's own environment or an earlier
 /// block never leaks into a run that this sign-in does not set it for.
-pub const NAMES: [&str; 19] = [
+pub(crate) const NAMES: [&str; 19] = [
     "AZURE_CONFIG_DIR",
     "AZURE_EXTENSION_DIR",
     "AZURE_TENANT_ID",
@@ -76,7 +76,7 @@ fn level(name: &str, label: &str) -> Level {
     }
 }
 
-pub fn configure_result() -> ConfigureResult {
+pub(crate) fn configure_result() -> ConfigureResult {
     ConfigureResult {
         cloud: Some(ConfigureResultCloud::Azure),
         driver_version: env!("CARGO_PKG_VERSION").to_owned(),

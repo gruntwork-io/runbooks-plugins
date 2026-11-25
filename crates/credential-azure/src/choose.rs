@@ -9,7 +9,7 @@ use crate::ids::{SubscriptionId, TenantId};
 
 /// The block's pins, with a tenant domain already resolved to its id.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Pins {
+pub(crate) struct Pins {
     /// The pinned tenant.
     pub tenant: Option<TenantPin>,
     /// A subscription's id or name, matched without case.
@@ -18,7 +18,7 @@ pub struct Pins {
 
 /// A pinned tenant.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TenantPin {
+pub(crate) struct TenantPin {
     /// Its id.
     pub id: TenantId,
     /// As the block wrote it, for messages: an id or a domain.
@@ -27,7 +27,7 @@ pub struct TenantPin {
 
 /// What the pins and the login leave to choose.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Resolution {
+pub(crate) enum Resolution {
     /// Nothing is left to choose.
     Chosen {
         /// The tenant.
@@ -46,7 +46,7 @@ pub enum Resolution {
 /// The tenants a login can see: those Azure lists, then those `az` holds,
 /// then the one it signed in to, each once.
 #[must_use]
-pub fn visible_tenants(
+pub(crate) fn visible_tenants(
     listed: Vec<Tenant>,
     accounts: &Accounts,
     signed_in: &TenantId,
@@ -76,7 +76,7 @@ fn matches_pin(subscription: &Subscription, pin: &str) -> bool {
 ///
 /// Kind `pinMismatch` when the login cannot see a pinned tenant or
 /// subscription.
-pub fn resolve(
+pub(crate) fn resolve(
     tenants: &[Tenant],
     subscriptions: &[Subscription],
     pins: &Pins,
@@ -137,7 +137,7 @@ pub fn resolve(
 
 /// `tenant` as a target, named by its id when it has no name.
 #[must_use]
-pub fn tenant_target(tenant: &Tenant) -> Target {
+pub(crate) fn tenant_target(tenant: &Tenant) -> Target {
     Target {
         id: tenant.id.to_string(),
         name: tenant.name.clone().unwrap_or_else(|| tenant.id.to_string()),
@@ -146,7 +146,7 @@ pub fn tenant_target(tenant: &Tenant) -> Target {
 
 /// `subscription` as a target.
 #[must_use]
-pub fn subscription_target(subscription: &Subscription) -> Target {
+pub(crate) fn subscription_target(subscription: &Subscription) -> Target {
     Target {
         id: subscription.id.to_string(),
         name: subscription.name.clone(),
@@ -154,7 +154,7 @@ pub fn subscription_target(subscription: &Subscription) -> Target {
 }
 
 /// The tenants the person may choose: the pinned one, or all of them.
-pub fn tenant_targets(tenants: &[Tenant], pins: &Pins) -> Vec<Target> {
+pub(crate) fn tenant_targets(tenants: &[Tenant], pins: &Pins) -> Vec<Target> {
     tenants
         .iter()
         .filter(|tenant| pins.tenant.as_ref().is_none_or(|pin| pin.id == tenant.id))
@@ -163,7 +163,7 @@ pub fn tenant_targets(tenants: &[Tenant], pins: &Pins) -> Vec<Target> {
 }
 
 /// The subscriptions in `tenant` the person may choose.
-pub fn subscription_targets(
+pub(crate) fn subscription_targets(
     subscriptions: &[Subscription],
     tenant: &TenantId,
     pins: &Pins,
@@ -186,7 +186,7 @@ pub fn subscription_targets(
 ///
 /// `invalidParams` for a tenant or subscription the login cannot see, and
 /// `pinMismatch` for one the block's pins rule out.
-pub fn check_choice(
+pub(crate) fn check_choice(
     tenants: &[Tenant],
     subscriptions: &[Subscription],
     pins: &Pins,

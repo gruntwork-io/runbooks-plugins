@@ -14,29 +14,29 @@ use crate::roles::RoleRequirement;
 
 /// A sign-in method: one tab in the auth view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignInMethod {
+pub(crate) enum SignInMethod {
     /// `az login` in a browser, or the person's own `az` login, detected.
     Cli,
     DeviceCode,
 }
 
 impl SignInMethod {
-    pub const ALL: [Self; 2] = [Self::Cli, Self::DeviceCode];
+    pub(crate) const ALL: [Self; 2] = [Self::Cli, Self::DeviceCode];
 
     /// Its name in the protocol, and the value of `AZURE_AUTH_TYPE`.
-    pub fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Cli => "cli",
             Self::DeviceCode => "device_code",
         }
     }
 
-    pub fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|method| method.name() == name)
     }
 }
 
-pub struct Session {
+pub(crate) struct Session {
     pub method: SignInMethod,
     pub dir: AzDir,
     /// Who signed in, in the tenant `az` signed in to.
@@ -48,7 +48,7 @@ pub struct Session {
     pub stage: Stage,
 }
 
-pub enum Stage {
+pub(crate) enum Stage {
     /// The person chooses. `tenant` is set when the pins fixed it.
     Choosing {
         tenant: Option<TenantId>,
@@ -57,7 +57,7 @@ pub enum Stage {
 }
 
 /// A choice that has been checked: the principal holds the required roles.
-pub struct Chosen {
+pub(crate) struct Chosen {
     pub tenant: Tenant,
     pub subscription: Option<Subscription>,
     /// Who the sign-in is in the chosen tenant: a guest has an object id there.
@@ -65,7 +65,7 @@ pub struct Chosen {
 }
 
 impl Session {
-    pub fn identity(&self) -> Identity {
+    pub(crate) fn identity(&self) -> Identity {
         let mut targets = HashMap::new();
         let principal = match &self.stage {
             Stage::Ready(chosen) => {
@@ -98,13 +98,13 @@ impl Session {
         }
     }
 
-    pub fn tenant(&self, id: &TenantId) -> Option<&Tenant> {
+    pub(crate) fn tenant(&self, id: &TenantId) -> Option<&Tenant> {
         self.tenants.iter().find(|tenant| &tenant.id == id)
     }
 
     /// What a run gets once `chosen` is ready. `azurerm`, `azuread` and
     /// `azapi` use the sign-in in `AZURE_CONFIG_DIR` through `ARM_USE_CLI`.
-    pub fn env(&self, chosen: &Chosen) -> Vec<EnvValue> {
+    pub(crate) fn env(&self, chosen: &Chosen) -> Vec<EnvValue> {
         let mut values = Values::default();
         values.both("AZURE_CONFIG_DIR", path(&self.dir.config));
         values.both(

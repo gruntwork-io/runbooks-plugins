@@ -33,7 +33,9 @@ pub struct InstalledAz {
 }
 
 impl InstalledAz {
-    pub fn new(program: Option<PathBuf>, env: Vec<(OsString, OsString)>) -> Self {
+    /// `program`, if `main` found one, run with `env`.
+    #[must_use]
+    pub const fn new(program: Option<PathBuf>, env: Vec<(OsString, OsString)>) -> Self {
         Self { program, env }
     }
 }

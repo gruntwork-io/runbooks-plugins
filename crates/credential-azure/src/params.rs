@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 
-use runbooks_plugin_protocol::credential::{ErrorKind, Pins as WirePins, Requirement};
+use runbooks_plugin_protocol::credential::{
+    ErrorKind, Pins as WirePins, Requirement, RequirementRolesItem,
+};
 use runbooks_plugin_transport::PluginError;
 
 use crate::describe::{SUBSCRIPTION_LEVEL, TENANT_FIELD, TENANT_LEVEL};
@@ -13,7 +15,7 @@ use crate::roles::RoleRequirement;
 /// What `detect` and `signIn` check a credential against, before a tenant
 /// domain is resolved.
 #[derive(Clone, Debug, Default)]
-pub struct Constraints {
+pub(crate) struct Constraints {
     pub tenant: Option<TenantRef>,
     pub subscription: Option<String>,
     pub roles: Vec<RoleRequirement>,
@@ -21,15 +23,15 @@ pub struct Constraints {
 
 /// Problems with one call's params, collected so all are reported together.
 #[derive(Default)]
-pub struct Problems(Vec<String>);
+pub(crate) struct Problems(Vec<String>);
 
 impl Problems {
-    pub fn add(&mut self, problem: String) {
+    pub(crate) fn add(&mut self, problem: String) {
         self.0.push(problem);
     }
 
     /// `Ok` if nothing was added, else one `invalidParams` naming each problem.
-    pub fn check(self, call: &str) -> Result<(), PluginError> {
+    pub(crate) fn check(self, call: &str) -> Result<(), PluginError> {
         if self.0.is_empty() {
             return Ok(());
         }
@@ -47,7 +49,7 @@ fn given(value: &str) -> Option<&str> {
     Some(value.trim()).filter(|value| !value.is_empty())
 }
 
-pub fn tenant(value: &str, key: &str, problems: &mut Problems) -> Option<TenantRef> {
+pub(crate) fn tenant(value: &str, key: &str, problems: &mut Problems) -> Option<TenantRef> {
     let value = given(value)?;
     let parsed = TenantRef::parse(value);
     if parsed.is_none() {
@@ -60,7 +62,7 @@ pub fn tenant(value: &str, key: &str, problems: &mut Problems) -> Option<TenantR
 ///
 /// `invalidParams` for a pin on a level the plugin does not declare, a
 /// tenant pin that is not a tenant, or a requirement kind other than roles.
-pub fn constraints(
+pub(crate) fn constraints(
     call: &str,
     pins: &WirePins,
     requirements: &[Requirement],
@@ -83,17 +85,7 @@ pub fn constraints(
     }
     for requirement in requirements {
         match requirement {
-            Requirement::Roles { roles } => {
-                for item in roles {
-                    if given(&item.role).is_none() {
-                        problems.add("a required role has no name".to_owned());
-                    } else {
-                        constraints
-                            .roles
-                            .push(RoleRequirement::new(&item.role, item.scope.as_deref()));
-                    }
-                }
-            }
+            Requirement::Roles { roles } => add_roles(roles, &mut constraints.roles, &mut problems),
             Requirement::Scopes { .. } => problems.add(
                 "requirements of kind scopes are not supported: Azure checks roles".to_owned(),
             ),
@@ -103,6 +95,21 @@ pub fn constraints(
     Ok(constraints)
 }
 
+/// Adds each role in `roles` to `required`, and a problem for each with no name.
+fn add_roles(
+    roles: &[RequirementRolesItem],
+    required: &mut Vec<RoleRequirement>,
+    problems: &mut Problems,
+) {
+    for item in roles {
+        if given(&item.role).is_none() {
+            problems.add("a required role has no name".to_owned());
+        } else {
+            required.push(RoleRequirement::new(&item.role, item.scope.as_deref()));
+        }
+    }
+}
+
 /// The tenant an interactive sign-in goes to: the pinned one, or the one
 /// typed into the `tenantId` field.
 ///
@@ -110,7 +117,7 @@ pub fn constraints(
 ///
 /// `invalidParams` for a field that is not a tenant, and `pinMismatch` for
 /// a field that names another tenant than the pin.
-pub fn login_tenant(
+pub(crate) fn login_tenant(
     fields: &HashMap<String, String>,
     constraints: &Constraints,
 ) -> Result<Option<TenantRef>, PluginError> {
@@ -136,7 +143,7 @@ pub fn login_tenant(
 ///
 /// `invalidParams` for a level the plugin does not declare, a missing
 /// tenant, or an id that is not a GUID.
-pub fn choice(
+pub(crate) fn choice(
     targets: &HashMap<String, String>,
 ) -> Result<(TenantId, Option<SubscriptionId>), PluginError> {
     let mut problems = Problems::default();
@@ -149,12 +156,14 @@ pub fn choice(
             ));
         }
     }
-    let tenant = match targets.get(TENANT_LEVEL) {
-        None => Err(format!("targets.{TENANT_LEVEL} is required")),
-        Some(id) => TenantId::parse(id).ok_or_else(|| {
-            format!("targets.{TENANT_LEVEL} must be a tenant id from targets, not {id:?}")
-        }),
-    };
+    let tenant = targets.get(TENANT_LEVEL).map_or_else(
+        || Err(format!("targets.{TENANT_LEVEL} is required")),
+        |id| {
+            TenantId::parse(id).ok_or_else(|| {
+                format!("targets.{TENANT_LEVEL} must be a tenant id from targets, not {id:?}")
+            })
+        },
+    );
     if let Err(problem) = &tenant {
         problems.add(problem.clone());
     }
@@ -203,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn every_problem_is_reported_with_its_key() {
+    fn every_problem_is_reported_with_its_key() -> Result<(), Box<dyn std::error::Error>> {
         let error = constraints(
             "signIn",
             &Pins(map(&[("tenant", "not a tenant"), ("account", "1")])),
@@ -219,12 +228,10 @@ mod tests {
                 },
             ],
         )
-        .err();
-        assert_eq!(
-            error.as_ref().map(|e| e.kind()),
-            Some(ErrorKind::InvalidParams)
-        );
-        let message = error.map(|e| e.message().to_owned()).unwrap_or_default();
+        .err()
+        .ok_or("the params were accepted")?;
+        assert_eq!(error.kind(), ErrorKind::InvalidParams);
+        let message = error.message();
         for part in [
             "pins.account",
             "pins.tenant",
@@ -234,6 +241,7 @@ mod tests {
         ] {
             assert!(message.contains(part), "{part} in {message}");
         }
+        Ok(())
     }
 
     #[test]
@@ -263,9 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn a_choice_needs_a_tenant_and_declared_levels() {
-        let error = choice(&map(&[("subscription", "x"), ("role", "y")])).err();
-        let message = error.map(|e| e.message().to_owned()).unwrap_or_default();
+    fn a_choice_needs_a_tenant_and_declared_levels() -> Result<(), Box<dyn std::error::Error>> {
+        let error = choice(&map(&[("subscription", "x"), ("role", "y")]))
+            .err()
+            .ok_or("the choice was accepted")?;
+        let message = error.message();
         for part in [
             "targets.role",
             "targets.tenant is required",
@@ -273,6 +283,7 @@ mod tests {
         ] {
             assert!(message.contains(part), "{part} in {message}");
         }
-        assert!(choice(&map(&[("tenant", "72f988bf-86f1-41af-91ab-2d7cd011db47")])).is_ok());
+        choice(&map(&[("tenant", "72f988bf-86f1-41af-91ab-2d7cd011db47")]))?;
+        Ok(())
     }
 }

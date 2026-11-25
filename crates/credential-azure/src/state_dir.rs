@@ -40,18 +40,18 @@ const MAX_LOGIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The block's state directory, which holds its sign-in directories.
 #[derive(Clone, Debug)]
-pub struct StateDir(PathBuf);
+pub(crate) struct StateDir(PathBuf);
 
 impl StateDir {
     /// The state directory at `path`.
     #[must_use]
-    pub const fn new(path: PathBuf) -> Self {
+    pub(crate) const fn new(path: PathBuf) -> Self {
         Self(path)
     }
 
     /// Where the state directory is.
     #[must_use]
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 
@@ -61,7 +61,7 @@ impl StateDir {
     ///
     /// `internal` when it cannot be created, or the state directory already
     /// holds too many sign-in directories.
-    pub async fn create(&self) -> Result<PathBuf, PluginError> {
+    pub(crate) async fn create(&self) -> Result<PathBuf, PluginError> {
         let state = self.0.clone();
         blocking(move || create_private_dir(&state)).await
     }
@@ -73,7 +73,7 @@ impl StateDir {
     ///
     /// `internal` when the sign-in directory cannot be created or the login
     /// cannot be copied.
-    pub async fn copy_login(&self, from: &Path) -> Result<Option<PathBuf>, PluginError> {
+    pub(crate) async fn copy_login(&self, from: &Path) -> Result<Option<PathBuf>, PluginError> {
         let (state, from) = (self.0.clone(), from.to_owned());
         blocking(move || {
             if !from.join(PROFILE).is_file() {
@@ -100,7 +100,7 @@ impl StateDir {
     /// # Errors
     ///
     /// `internal` when the directory cannot be deleted.
-    pub async fn remove(&self, dir: &Path) -> Result<(), PluginError> {
+    pub(crate) async fn remove(&self, dir: &Path) -> Result<(), PluginError> {
         let dir = dir.to_owned();
         blocking(move || remove_dir(&dir)).await
     }
@@ -111,7 +111,7 @@ impl StateDir {
     ///
     /// `internal` when the state directory cannot be read or a sign-in
     /// directory cannot be deleted.
-    pub async fn remove_all(&self) -> Result<(), PluginError> {
+    pub(crate) async fn remove_all(&self) -> Result<(), PluginError> {
         let state = self.0.clone();
         blocking(move || remove_sign_in_dirs(&state)).await
     }

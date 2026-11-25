@@ -10,6 +10,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::future::{self, Future};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -36,6 +38,7 @@ use crate::state_dir::StateDir;
 /// The app's network settings from `configure`.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Network {
+    /// The CA bundle `configure` gave, for `az` to trust.
     pub ca_bundle_file: Option<PathBuf>,
     /// May carry a proxy password, so `Debug` does not show it.
     pub proxy: Option<String>,
@@ -53,6 +56,7 @@ impl fmt::Debug for Network {
 /// Builds the plugin's clients once `configure` has given the network
 /// settings they need.
 pub trait Connect: Send + Sync + 'static {
+    /// The [`Az`] the plugin's calls go through.
     type Az: Az;
 
     /// # Errors
@@ -69,6 +73,16 @@ pub struct AzurePlugin<C: Connect> {
     /// The block's sign-in. Every call but the interactive part of `signIn`
     /// holds it, so calls change it one at a time.
     session: Mutex<Option<Session>>,
+}
+
+/// Shows only whether `configure` has succeeded: the session is behind an
+/// async lock.
+impl<C: Connect> fmt::Debug for AzurePlugin<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzurePlugin")
+            .field("configured", &self.configured.get().is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 struct Configured<A> {
@@ -92,6 +106,43 @@ impl<C: Connect> AzurePlugin<C> {
         self.configured.get().ok_or_else(|| {
             PluginError::new(ErrorKind::NotConfigured, "configure has not succeeded")
         })
+    }
+
+    /// `configure`, which awaits nothing.
+    fn configure_now(&self, params: ConfigureParams) -> Result<ConfigureResult, PluginError> {
+        let state_dir = PathBuf::from(&params.state_dir);
+        if !state_dir.is_absolute() {
+            return Err(PluginError::new(
+                ErrorKind::InvalidParams,
+                format!(
+                    "configure: stateDir must be an absolute path, not {:?}",
+                    params.state_dir
+                ),
+            ));
+        }
+        let network = Network {
+            ca_bundle_file: params.ca_bundle_file.map(PathBuf::from),
+            proxy: params.proxy,
+        };
+        if let Some(configured) = self.configured.get() {
+            return if configured.state.path() == state_dir && configured.network == network {
+                Ok(describe::configure_result())
+            } else {
+                Err(PluginError::new(
+                    ErrorKind::InvalidParams,
+                    "configure: this plugin is already configured with another stateDir or network: start a new process for another block",
+                ))
+            };
+        }
+        let az = self.connect.connect(&network)?;
+        // Two configures at once both reach here; the second one's clients
+        // are dropped and it answers as the first did.
+        let _first = self.configured.set(Configured {
+            az,
+            state: StateDir::new(state_dir),
+            network,
+        });
+        Ok(describe::configure_result())
     }
 
     /// Makes `session` the block's sign-in, deleting the directory of the
@@ -168,8 +219,13 @@ async fn establish<A: Az>(
     };
     let accounts = az.accounts(&dir).await?;
     // Azure's tenant list adds only names and tenants with no subscription:
-    // the sign-in works without it, as it does today.
-    let listed = az.tenants(&dir).await.unwrap_or_default();
+    // the sign-in works without it, as it does today, and logs why.
+    let listed = az.tenants(&dir).await.unwrap_or_else(|error| {
+        log(format_args!(
+            "signing in without Azure's tenant list: {error}"
+        ));
+        Vec::new()
+    });
     let tenants = choose::visible_tenants(listed, &accounts, &home.tenant_id);
     let pins = Pins {
         tenant,
@@ -214,7 +270,7 @@ async fn commit<A: Az>(
     let tenant = session
         .tenant(tenant)
         .cloned()
-        .unwrap_or(crate::az::Tenant {
+        .unwrap_or_else(|| crate::az::Tenant {
             id: tenant.clone(),
             name: None,
         });
@@ -308,41 +364,20 @@ fn not_signed_in() -> PluginError {
     )
 }
 
+/// Writes `message` to standard error, the protocol's log.
+fn log(message: fmt::Arguments<'_>) {
+    match writeln!(io::stderr().lock(), "runbooks-credential-azure: {message}") {
+        // A log line standard error cannot take has nowhere else to go.
+        Ok(()) | Err(_) => {}
+    }
+}
+
 impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
-    async fn configure(&self, params: ConfigureParams) -> Result<ConfigureResult, PluginError> {
-        let state_dir = PathBuf::from(&params.state_dir);
-        if !state_dir.is_absolute() {
-            return Err(PluginError::new(
-                ErrorKind::InvalidParams,
-                format!(
-                    "configure: stateDir must be an absolute path, not {:?}",
-                    params.state_dir
-                ),
-            ));
-        }
-        let network = Network {
-            ca_bundle_file: params.ca_bundle_file.map(PathBuf::from),
-            proxy: params.proxy,
-        };
-        if let Some(configured) = self.configured.get() {
-            return if configured.state.path() == state_dir && configured.network == network {
-                Ok(describe::configure_result())
-            } else {
-                Err(PluginError::new(
-                    ErrorKind::InvalidParams,
-                    "configure: this plugin is already configured with another stateDir or network: start a new process for another block",
-                ))
-            };
-        }
-        let az = self.connect.connect(&network)?;
-        // Two configures at once both reach here; the second one's clients
-        // are dropped and it answers as the first did.
-        let _first = self.configured.set(Configured {
-            az,
-            state: StateDir::new(state_dir),
-            network,
-        });
-        Ok(describe::configure_result())
+    fn configure(
+        &self,
+        params: ConfigureParams,
+    ) -> impl Future<Output = Result<ConfigureResult, PluginError>> + Send {
+        future::ready(self.configure_now(params))
     }
 
     async fn detect(&self, params: DetectParams) -> Result<DetectResult, PluginError> {
@@ -425,8 +460,8 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
     }
 
     async fn targets(&self, params: TargetsParams) -> Result<TargetsResult, PluginError> {
-        let session = self.session.lock().await;
-        let session = session.as_ref().ok_or_else(not_signed_in)?;
+        let held = self.session.lock().await;
+        let session = held.as_ref().ok_or_else(not_signed_in)?;
         let targets = match params.level.as_str() {
             TENANT_LEVEL => choose::tenant_targets(&session.tenants, &session.pins),
             SUBSCRIPTION_LEVEL => {
@@ -450,14 +485,15 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
                 ));
             }
         };
+        drop(held);
         Ok(TargetsResult { targets })
     }
 
     async fn select(&self, params: SelectParams) -> Result<SelectResult, PluginError> {
         let configured = self.configured()?;
         let (tenant, subscription) = params::choice(&params.targets)?;
-        let mut session = self.session.lock().await;
-        let session = session.as_mut().ok_or_else(not_signed_in)?;
+        let mut held = self.session.lock().await;
+        let session = held.as_mut().ok_or_else(not_signed_in)?;
         choose::check_choice(
             &session.tenants,
             &session.subscriptions,
@@ -467,21 +503,25 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
         )?;
         let chosen = commit(&configured.az, session, &tenant, subscription.as_ref()).await?;
         session.stage = Stage::Ready(chosen);
-        Ok(SelectResult(session.identity()))
+        let identity = session.identity();
+        drop(held);
+        Ok(SelectResult(identity))
     }
 
     async fn env(&self) -> Result<EnvResult, PluginError> {
-        let session = self.session.lock().await;
-        let session = session.as_ref().ok_or_else(not_signed_in)?;
+        let held = self.session.lock().await;
+        let session = held.as_ref().ok_or_else(not_signed_in)?;
         let Stage::Ready(chosen) = &session.stage else {
             return Err(PluginError::new(
                 ErrorKind::NotSignedIn,
                 "Choose a tenant and subscription first.",
             ));
         };
+        let values = session.env(chosen);
+        drop(held);
         Ok(EnvResult {
             expires_at: None,
-            values: session.env(chosen),
+            values,
         })
     }
 
@@ -490,6 +530,7 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
         let mut session = self.session.lock().await;
         *session = None;
         configured.state.remove_all().await?;
+        drop(session);
         Ok(SignOutResult(Map::new()))
     }
 }

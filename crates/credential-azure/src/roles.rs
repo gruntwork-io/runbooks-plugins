@@ -6,11 +6,11 @@ use runbooks_plugin_transport::PluginError;
 use crate::ids::SubscriptionId;
 
 /// The scope a role defaults to: the chosen subscription.
-pub const SUBSCRIPTION_SCOPE: &str = "subscription";
+pub(crate) const SUBSCRIPTION_SCOPE: &str = "subscription";
 
 /// A role the block requires, and where.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RoleRequirement {
+pub(crate) struct RoleRequirement {
     /// The role's name.
     pub role: String,
     /// An ARM scope such as `/` or a management group, or
@@ -22,7 +22,7 @@ impl RoleRequirement {
     /// `role` at `scope`, both trimmed; a missing or blank scope is
     /// [`SUBSCRIPTION_SCOPE`].
     #[must_use]
-    pub fn new(role: &str, scope: Option<&str>) -> Self {
+    pub(crate) fn new(role: &str, scope: Option<&str>) -> Self {
         let scope = scope.map(str::trim).filter(|scope| !scope.is_empty());
         Self {
             role: role.trim().to_owned(),
@@ -33,7 +33,7 @@ impl RoleRequirement {
     /// The ARM scope to check: `None` for the subscription scope when no
     /// subscription is chosen.
     #[must_use]
-    pub fn arm_scope(&self, subscription: Option<&SubscriptionId>) -> Option<String> {
+    pub(crate) fn arm_scope(&self, subscription: Option<&SubscriptionId>) -> Option<String> {
         if self.scope == SUBSCRIPTION_SCOPE {
             return subscription.map(|id| format!("/subscriptions/{id}"));
         }
@@ -48,7 +48,7 @@ impl RoleRequirement {
 /// A role the principal lacks, at the scope it was checked at, or at
 /// [`SUBSCRIPTION_SCOPE`] when no subscription was chosen.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MissingRole {
+pub(crate) struct MissingRole {
     /// The role's name.
     pub role: String,
     /// The ARM scope it was checked at, or [`SUBSCRIPTION_SCOPE`].
@@ -57,7 +57,7 @@ pub struct MissingRole {
 
 /// Kind `requirementNotMet`, naming each missing role and what to do.
 #[must_use]
-pub fn unmet(missing: &[MissingRole], principal: &str) -> PluginError {
+pub(crate) fn unmet(missing: &[MissingRole], principal: &str) -> PluginError {
     let list: Vec<String> = missing
         .iter()
         .map(|m| match m.scope.as_str() {
