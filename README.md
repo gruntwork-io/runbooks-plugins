@@ -20,6 +20,8 @@ Being built as track A of the Runbooks rebuild (gruntwork-io/runbooks, PR stack 
 - `configure` is the first call. Closing standard input stops the plugin, and cancels a sign-in.
 - A credential plugin answers `configure`, `detect`, `signIn`, `targets`, `select`, `env` and `signOut`. Only `env` returns secret values.
 
+Each binary runs the loop in [`runbooks-plugin-transport`](crates/transport), so none writes its own JSON-RPC.
+
 The protocol's JSON Schemas, [`schema/base.schema.json`](schema/base.schema.json) and [`schema/credential.schema.json`](schema/credential.schema.json), live in this repository and are released with the binaries under the protocol version, `PROTOCOL_VERSION` in [`runbooks-plugin-protocol`](crates/protocol). That crate's Rust types, and the TypeScript types in Runbooks, are generated from them.
 
 Runbooks pins each release by version and SHA-256 per binary, OS and architecture, and checks the hash before it starts a binary.

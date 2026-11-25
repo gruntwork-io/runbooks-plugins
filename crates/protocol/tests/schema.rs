@@ -233,3 +233,35 @@ fn detect_results_round_trip() -> TestResult {
         &json!({"found":false}),
     )
 }
+
+#[test]
+fn the_named_error_codes_are_the_schemas() -> TestResult {
+    for code in [
+        base::RpcErrorCode::SERVER_ERROR,
+        base::RpcErrorCode::INVALID_PARAMS,
+        base::RpcErrorCode::INVALID_REQUEST,
+        base::RpcErrorCode::METHOD_NOT_FOUND,
+        base::RpcErrorCode::PARSE_ERROR,
+    ] {
+        let error = json!({"code": code, "message": "m", "data": {"kind": "internal"}});
+        round_trip::<base::RpcError>("base.schema.json#/$defs/rpcError", &error)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn constructed_detect_results_are_valid() -> TestResult {
+    let identity: credential::Identity =
+        serde_json::from_value(sign_in_response()["result"].take())?;
+    for result in [
+        credential::DetectResult::found(identity, "env"),
+        credential::DetectResult::not_found(),
+    ] {
+        let value = serde_json::to_value(&result)?;
+        round_trip::<credential::DetectResult>(
+            "credential.schema.json#/$defs/detectResult",
+            &value,
+        )?;
+    }
+    Ok(())
+}

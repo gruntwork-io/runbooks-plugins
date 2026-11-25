@@ -1,0 +1,23 @@
+[package]
+name = "runbooks-plugin-transport"
+description = "The plugin's side of the Runbooks plugin transport: the JSON-RPC loop over standard input and output that every credential binary runs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+runbooks-plugin-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "sync"] }
+
+[dev-dependencies]
+jsonschema.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[lints]
+workspace = true
