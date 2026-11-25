@@ -58,7 +58,7 @@
       "required": ["code", "message", "data"],
       "properties": {
         "code": {
-          "description": "-32000 for every kind below except invalidParams (-32602); the JSON-RPC codes for a malformed request.",
+          "description": "-32000 for every kind below except invalidParams (-32602). A request the plugin cannot read gets its JSON-RPC code with kind invalidParams: -32700 for a line that is not JSON, -32600 for one that is not a request, -32601 for an unknown method.",
           "type": "integer",
           "enum": [-32000, -32602, -32600, -32601, -32700]
         },
