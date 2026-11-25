@@ -9,10 +9,19 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+runbooks-plugin-protocol.workspace = true
+runbooks-plugin-transport.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "time"] }
+
+[dev-dependencies]
+jsonschema.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 
 [lints]
 workspace = true
