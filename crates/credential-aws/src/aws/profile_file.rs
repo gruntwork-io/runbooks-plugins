@@ -12,12 +12,14 @@ use std::error::Error as _;
 use std::fmt;
 
 use aws_config::profile::{self, ProfileSet};
+use aws_runtime::env_config::file::EnvConfigFiles;
+use aws_types::os_shim_internal::Fs;
 
 use crate::secret::Secret;
 
 /// What says where the files are: the two overrides, and the home directory
 /// `~` stands for (`USERPROFILE`, or `HOMEDRIVE` and `HOMEPATH`, on Windows).
-pub const PROFILE_FILE_VARIABLES: [&str; 6] = [
+pub(crate) const PROFILE_FILE_VARIABLES: [&str; 6] = [
     "AWS_CONFIG_FILE",
     "AWS_SHARED_CREDENTIALS_FILE",
     "HOME",
@@ -29,7 +31,7 @@ pub const PROFILE_FILE_VARIABLES: [&str; 6] = [
 /// The settings of one profile that the plugin acts on. An empty value
 /// counts as unset.
 #[derive(Clone, Debug, Default)]
-pub struct ProfileSettings {
+pub(crate) struct ProfileSettings {
     pub region: Option<String>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<Secret>,
@@ -57,16 +59,16 @@ const UNSUPPORTED: [&str; 3] = [
 
 /// Every profile, by name. Prints only the names.
 #[derive(Clone, Default)]
-pub struct Profiles {
+pub(crate) struct Profiles {
     by_name: BTreeMap<String, ProfileSettings>,
 }
 
 impl Profiles {
-    pub fn get(&self, name: &str) -> Option<&ProfileSettings> {
+    pub(crate) fn get(&self, name: &str) -> Option<&ProfileSettings> {
         self.by_name.get(name)
     }
 
-    pub fn names(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
         self.by_name.keys().map(String::as_str)
     }
 
@@ -113,7 +115,7 @@ impl fmt::Debug for Profiles {
 /// what is wrong with it, never what the line holds.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("an AWS profile file is invalid ({reason})")]
-pub struct InvalidProfileFile {
+pub(crate) struct InvalidProfileFile {
     pub reason: String,
 }
 
@@ -123,23 +125,30 @@ pub struct InvalidProfileFile {
 /// # Errors
 ///
 /// [`InvalidProfileFile`] for a file that does not parse.
-pub async fn read_profiles(env: HashMap<String, String>) -> Result<Profiles, InvalidProfileFile> {
+pub(crate) async fn read_profiles(
+    env: HashMap<String, String>,
+) -> Result<Profiles, InvalidProfileFile> {
     // The default file set is the two files above. The real filesystem, and
     // no AWS_PROFILE in `env`: the plugin names the profile itself.
-    profile::load(&Default::default(), &env.into(), &Default::default(), None)
-        .await
-        .map(|set| Profiles::from_set(&set))
-        .map_err(|error| {
-            // The file and the line are in the source: "error parsing <path>
-            // on line <n>: <what is wrong>".
-            let mut reason = error.to_string();
-            let mut next = error.source();
-            while let Some(source) = next {
-                reason = format!("{reason}: {source}");
-                next = source.source();
-            }
-            InvalidProfileFile {
-                reason: reason.split_whitespace().collect::<Vec<_>>().join(" "),
-            }
-        })
+    profile::load(
+        &Fs::default(),
+        &env.into(),
+        &EnvConfigFiles::default(),
+        None,
+    )
+    .await
+    .map(|set| Profiles::from_set(&set))
+    .map_err(|error| {
+        // The file and the line are in the source: "error parsing <path>
+        // on line <n>: <what is wrong>".
+        let mut reason = error.to_string();
+        let mut next = error.source();
+        while let Some(source) = next {
+            reason = format!("{reason}: {source}");
+            next = source.source();
+        }
+        InvalidProfileFile {
+            reason: reason.split_whitespace().collect::<Vec<_>>().join(" "),
+        }
+    })
 }

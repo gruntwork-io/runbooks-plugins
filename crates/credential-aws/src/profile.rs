@@ -4,6 +4,7 @@
 //! and `credential_source = Environment`.
 
 use std::collections::HashMap;
+use std::num::ParseIntError;
 use std::time::Duration;
 
 use time::OffsetDateTime;
@@ -13,11 +14,11 @@ use crate::detect::{AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
 use crate::secret::Secret;
 
 /// The method a profile's identity names.
-pub const METHOD: &str = "profile";
+pub(crate) const METHOD: &str = "profile";
 
 /// How a profile's keys are got.
 #[derive(Clone, Debug)]
-pub struct Plan {
+pub(crate) struct Plan {
     pub base: AwsCredentials,
     /// The roles to assume, each with the keys the one before it gave,
     /// starting from `base`.
@@ -29,7 +30,7 @@ pub struct Plan {
 /// A profile the block cannot sign in with. Names profiles and settings,
 /// never a value from the files.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ProfileError {
+pub(crate) enum ProfileError {
     #[error("there is no AWS profile {name:?} in {files}: {}", listed(profiles))]
     Missing {
         name: String,
@@ -75,7 +76,11 @@ pub enum ProfileError {
     #[error("profile {name:?}'s source_profile chain comes back to itself: break the loop")]
     Cycle { name: String },
     #[error("profile {name:?}'s duration_seconds is not a whole number of seconds")]
-    Duration { name: String },
+    Duration {
+        name: String,
+        #[source]
+        source: ParseIntError,
+    },
 }
 
 fn listed(profiles: &[String]) -> String {
@@ -87,7 +92,7 @@ fn listed(profiles: &[String]) -> String {
 }
 
 /// The variables of `env` that say where the files are.
-pub fn file_env(env: &Environment) -> HashMap<String, String> {
+pub(crate) fn file_env(env: &Environment) -> HashMap<String, String> {
     PROFILE_FILE_VARIABLES
         .into_iter()
         .filter_map(|name| Some((name.to_owned(), env.get(name)?.to_owned())))
@@ -110,7 +115,7 @@ fn files(env: &Environment) -> String {
 ///
 /// [`ProfileError`] for a profile that is missing or that the block cannot
 /// sign in with.
-pub fn plan<'a>(
+pub(crate) fn plan<'a>(
     profiles: &'a Profiles,
     name: &'a str,
     env: &Environment,
@@ -154,7 +159,7 @@ pub fn plan<'a>(
             .as_deref()
             .map(|seconds| seconds.parse().map(Duration::from_secs))
             .transpose()
-            .map_err(|_| ProfileError::Duration { name: at() })?;
+            .map_err(|source| ProfileError::Duration { name: at(), source })?;
         roles.push(AssumeRole {
             role_arn: role_arn.clone(),
             session_name: settings

@@ -10,10 +10,12 @@ publish.workspace = true
 
 [dependencies]
 aws-config.workspace = true
+aws-runtime.workspace = true
 aws-sdk-iam.workspace = true
 aws-sdk-sso.workspace = true
 aws-sdk-ssooidc.workspace = true
 aws-sdk-sts.workspace = true
+aws-types.workspace = true
 runbooks-plugin-protocol.workspace = true
 runbooks-plugin-transport.workspace = true
 serde_json.workspace = true

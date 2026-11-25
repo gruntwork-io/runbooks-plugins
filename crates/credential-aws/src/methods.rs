@@ -32,7 +32,7 @@ pub(crate) const DEFAULT_REGION: &str = "defaultRegion";
 pub(crate) const SSO_START_URL: &str = "ssoStartUrl";
 pub(crate) const SSO_REGION: &str = "ssoRegion";
 /// A profile in the shared AWS config and credentials files.
-pub const PROFILE: &str = "profile";
+pub(crate) const PROFILE: &str = "profile";
 
 /// The sign-in methods: the block's tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

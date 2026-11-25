@@ -23,7 +23,7 @@ fn home(
 ) -> Result<(TempDir, Environment), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let aws = dir.path().join(".aws");
-    fs::create_dir(&aws)?;
+    fs::create_dir_all(&aws)?;
     fs::write(aws.join("config"), config)?;
     fs::write(aws.join("credentials"), credentials)?;
     let home = dir.path().to_str().ok_or("a UTF-8 temporary directory")?;
@@ -33,21 +33,24 @@ fn home(
     Ok((dir, env))
 }
 
-fn profile_sign_in(profile: &str, extra: &[(&str, &str)]) -> Value {
+fn profile_sign_in(profile: &str, extra: &[(&str, &str)]) -> Result<Value, Box<dyn Error>> {
     let mut fields = json!({"profile": profile});
     for (name, value) in extra {
-        fields[*name] = json!(value);
+        fields
+            .as_object_mut()
+            .ok_or("not an object")?
+            .insert((*name).to_owned(), json!(value));
     }
-    json!({"method": "profile", "fields": fields, "pins": {}, "requirements": []})
+    Ok(json!({"method": "profile", "fields": fields, "pins": {}, "requirements": []}))
 }
 
-fn assumed(access_key_id: &str, expires_at: &str) -> KeysAnswer {
-    Ok(AwsCredentials {
+fn assumed(access_key_id: &str, expires_at: &str) -> AwsCredentials {
+    AwsCredentials {
         access_key_id: access_key_id.to_owned(),
         secret_access_key: Secret::new(ASSUMED_SECRET),
         session_token: Some(Secret::new(ASSUMED_TOKEN)),
         expires_at: OffsetDateTime::parse(expires_at, &Rfc3339).ok(),
-    })
+    }
 }
 
 fn message(error: &Value) -> Result<&str, Box<dyn Error>> {
@@ -71,10 +74,10 @@ async fn a_profile_with_keys_signs_in_and_a_run_gets_its_region() -> TestResult 
     let aws = FakeAws::default().caller("AKIADEV", OTHER_ACCOUNT, USER_ARN)?;
     let mut app = App::start(aws.clone(), env).await?;
     let identity = app
-        .ok("signIn", profile_sign_in("dev", &[]), "signInResult")
+        .ok("signIn", profile_sign_in("dev", &[])?, "signInResult")
         .await?;
-    assert_eq!(identity["method"], "profile");
-    assert_eq!(identity["principal"], USER_ARN);
+    assert_eq!(at(&identity, "/method"), "profile");
+    assert_eq!(at(&identity, "/principal"), USER_ARN);
     // The config file's region, with the credentials file's keys: one profile.
     assert_eq!(
         aws.calls(),
@@ -84,10 +87,16 @@ async fn a_profile_with_keys_signs_in_and_a_run_gets_its_region() -> TestResult 
         }]
     );
     let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
-    assert_eq!(values["AWS_ACCESS_KEY_ID"].0, "AKIADEV");
-    assert_eq!(values["AWS_SECRET_ACCESS_KEY"].0, SECRET);
-    assert_eq!(values["AWS_SESSION_TOKEN"].0, TOKEN);
-    assert_eq!(values["AWS_REGION"].0, "eu-west-2");
+    assert_eq!(
+        values.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "AKIADEV"
+    );
+    assert_eq!(
+        values.get("AWS_SECRET_ACCESS_KEY").ok_or("no secret")?.0,
+        SECRET
+    );
+    assert_eq!(values.get("AWS_SESSION_TOKEN").ok_or("no token")?.0, TOKEN);
+    assert_eq!(values.get("AWS_REGION").ok_or("no region")?.0, "eu-west-2");
     Ok(())
 }
 
@@ -98,17 +107,20 @@ async fn without_a_region_of_its_own_a_profile_takes_the_default_region() -> Tes
     let mut app = App::start(aws, env).await?;
     app.ok(
         "signIn",
-        profile_sign_in("default", &[("defaultRegion", "ca-central-1")]),
+        profile_sign_in("default", &[("defaultRegion", "ca-central-1")])?,
         "signInResult",
     )
     .await?;
     let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
-    assert_eq!(values["AWS_REGION"].0, "ca-central-1");
+    assert_eq!(
+        values.get("AWS_REGION").ok_or("no region")?.0,
+        "ca-central-1"
+    );
 
-    app.ok("signIn", profile_sign_in("default", &[]), "signInResult")
+    app.ok("signIn", profile_sign_in("default", &[])?, "signInResult")
         .await?;
     let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
-    assert_eq!(values["AWS_REGION"].0, "us-east-1");
+    assert_eq!(values.get("AWS_REGION").ok_or("no region")?.0, "us-east-1");
     Ok(())
 }
 
@@ -133,12 +145,12 @@ region = us-gov-east-1
     let credentials = "[base]\naws_access_key_id = AKIABASE\naws_secret_access_key = test-secret-access-key-value\n";
     let (_home, env) = home(config, credentials, &[])?;
     let aws = FakeAws::default()
-        .assumes(OPS_ROLE, vec![assumed("ASIAOPS", IN_AN_HOUR)])
-        .assumes(DEPLOY_ROLE, vec![assumed("ASIADEPLOY", IN_AN_HOUR)])
+        .assumes(OPS_ROLE, vec![Ok(assumed("ASIAOPS", IN_AN_HOUR))])
+        .assumes(DEPLOY_ROLE, vec![Ok(assumed("ASIADEPLOY", IN_AN_HOUR))])
         .caller("ASIADEPLOY", ACCOUNT, DEPLOY_ARN)?;
     let mut app = App::start(aws.clone(), env).await?;
     let identity = app
-        .ok("signIn", profile_sign_in("deploy", &[]), "signInResult")
+        .ok("signIn", profile_sign_in("deploy", &[])?, "signInResult")
         .await?;
     let now = OffsetDateTime::parse(NOW, &Rfc3339)?.unix_timestamp();
     // Innermost first, each signed with the keys before it, all in the
@@ -152,14 +164,26 @@ region = us-gov-east-1
             ),
         ]
     );
-    assert_eq!(aws.calls()[0].region, "us-gov-west-1");
-    assert_eq!(identity["kind"], "role");
-    assert_eq!(identity["targets"]["role"]["id"], "deploy");
-    assert_eq!(identity["expiresAt"], IN_AN_HOUR);
+    assert_eq!(
+        aws.calls().first().ok_or("no call")?.region,
+        "us-gov-west-1"
+    );
+    assert_eq!(at(&identity, "/kind"), "role");
+    assert_eq!(at(&identity, "/targets/role/id"), "deploy");
+    assert_eq!(at(&identity, "/expiresAt"), IN_AN_HOUR);
     let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
-    assert_eq!(values["AWS_ACCESS_KEY_ID"].0, "ASIADEPLOY");
-    assert_eq!(values["AWS_SECRET_ACCESS_KEY"].0, ASSUMED_SECRET);
-    assert_eq!(values["AWS_REGION"].0, "us-gov-east-1");
+    assert_eq!(
+        values.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "ASIADEPLOY"
+    );
+    assert_eq!(
+        values.get("AWS_SECRET_ACCESS_KEY").ok_or("no secret")?.0,
+        ASSUMED_SECRET
+    );
+    assert_eq!(
+        values.get("AWS_REGION").ok_or("no region")?.0,
+        "us-gov-east-1"
+    );
     Ok(())
 }
 
@@ -185,14 +209,14 @@ aws_secret_access_key = test-secret-access-key-value
         ],
     )?;
     let aws = FakeAws::default()
-        .assumes(DEPLOY_ROLE, vec![assumed("ASIADEPLOY", IN_AN_HOUR)])
-        .assumes(OPS_ROLE, vec![assumed("ASIAOPS", IN_AN_HOUR)])
+        .assumes(DEPLOY_ROLE, vec![Ok(assumed("ASIADEPLOY", IN_AN_HOUR))])
+        .assumes(OPS_ROLE, vec![Ok(assumed("ASIAOPS", IN_AN_HOUR))])
         .caller("ASIADEPLOY", ACCOUNT, DEPLOY_ARN)?
         .caller("ASIAOPS", ACCOUNT, ROLE_ARN)?;
     let mut app = App::start(aws.clone(), env).await?;
-    app.ok("signIn", profile_sign_in("ci", &[]), "signInResult")
+    app.ok("signIn", profile_sign_in("ci", &[])?, "signInResult")
         .await?;
-    app.ok("signIn", profile_sign_in("itself", &[]), "signInResult")
+    app.ok("signIn", profile_sign_in("itself", &[])?, "signInResult")
         .await?;
     let signers: Vec<String> = aws
         .sso_log()
@@ -207,7 +231,7 @@ aws_secret_access_key = test-secret-access-key-value
 async fn the_overrides_name_the_files_and_tilde_is_the_home_directory() -> TestResult {
     let (home_dir, _) = home("", "", &[])?;
     let custom = home_dir.path().join("custom");
-    fs::create_dir(&custom)?;
+    fs::create_dir_all(&custom)?;
     fs::write(
         custom.join("config"),
         "[profile elsewhere]\nregion = ap-south-1\n",
@@ -231,10 +255,10 @@ async fn the_overrides_name_the_files_and_tilde_is_the_home_directory() -> TestR
     ]);
     let aws = FakeAws::default().caller("AKIAELSEWHERE", OTHER_ACCOUNT, USER_ARN)?;
     let mut app = App::start(aws, env).await?;
-    app.ok("signIn", profile_sign_in("elsewhere", &[]), "signInResult")
+    app.ok("signIn", profile_sign_in("elsewhere", &[])?, "signInResult")
         .await?;
     let values = values_of(&app.ok("env", json!({}), "envResult").await?)?;
-    assert_eq!(values["AWS_REGION"].0, "ap-south-1");
+    assert_eq!(values.get("AWS_REGION").ok_or("no region")?.0, "ap-south-1");
     Ok(())
 }
 
@@ -314,7 +338,7 @@ region = eu-west-1
         ),
     ] {
         let error = app
-            .fails("signIn", profile_sign_in(profile, &[]), "invalidParams")
+            .fails("signIn", profile_sign_in(profile, &[])?, "invalidParams")
             .await?;
         assert!(message(&error)?.contains(says), "{profile}: {error}");
     }
@@ -332,7 +356,7 @@ async fn a_file_that_does_not_parse_names_its_line_and_never_its_values() -> Tes
     )?;
     let mut app = App::start(FakeAws::default(), env).await?;
     let error = app
-        .fails("signIn", profile_sign_in("dev", &[]), "invalidParams")
+        .fails("signIn", profile_sign_in("dev", &[])?, "invalidParams")
         .await?;
     let message = message(&error)?;
     assert!(message.contains("credentials on line 2"), "{message}");
@@ -353,18 +377,21 @@ region = us-gov-east-1
         .assumes(
             DEPLOY_ROLE,
             vec![
-                assumed("ASIAOLD", IN_TWO_MINUTES),
-                assumed("ASIANEW", IN_AN_HOUR),
+                Ok(assumed("ASIAOLD", IN_TWO_MINUTES)),
+                Ok(assumed("ASIANEW", IN_AN_HOUR)),
             ],
         )
         .caller("ASIAOLD", ACCOUNT, DEPLOY_ARN)?
         .caller("ASIANEW", ACCOUNT, DEPLOY_ARN)?;
     let mut app = App::start(aws.clone(), env).await?;
-    app.ok("signIn", profile_sign_in("deploy", &[]), "signInResult")
+    app.ok("signIn", profile_sign_in("deploy", &[])?, "signInResult")
         .await?;
     let env = app.ok("env", json!({}), "envResult").await?;
-    assert_eq!(values_of(&env)?["AWS_ACCESS_KEY_ID"].0, "ASIANEW");
-    assert_eq!(env["expiresAt"], IN_AN_HOUR);
+    assert_eq!(
+        values_of(&env)?.get("AWS_ACCESS_KEY_ID").ok_or("no key")?.0,
+        "ASIANEW"
+    );
+    assert_eq!(at(&env, "/expiresAt"), IN_AN_HOUR);
     assert_eq!(aws.sso_log().len(), 2);
     // The fresh keys were checked against the pins like the first.
     assert_eq!(aws.calls().len(), 2);
@@ -386,15 +413,15 @@ mfa_serial = arn:aws:iam::123456789012:mfa/alice
     let credentials = format!("{KEYS}\n[broken]\naws_secret_access_key = {SECRET}\n");
     let (_home, env) = home(config, &credentials, &[])?;
     let aws = FakeAws::default()
-        .assumes(DEPLOY_ROLE, vec![assumed("ASIADEPLOY", IN_AN_HOUR)])
+        .assumes(DEPLOY_ROLE, vec![Ok(assumed("ASIADEPLOY", IN_AN_HOUR))])
         .caller("ASIADEPLOY", ACCOUNT, DEPLOY_ARN)?;
     let mut app = App::start(aws, env).await?;
     // Every profile path: keys AWS refuses, a refusal before AWS, a profile
     // with only a secret, and a role it gives.
-    app.call("signIn", profile_sign_in("dev", &[])).await?;
-    app.call("signIn", profile_sign_in("mfa", &[])).await?;
-    app.call("signIn", profile_sign_in("broken", &[])).await?;
-    app.call("signIn", profile_sign_in("deploy", &[])).await?;
+    app.call("signIn", profile_sign_in("dev", &[])?).await?;
+    app.call("signIn", profile_sign_in("mfa", &[])?).await?;
+    app.call("signIn", profile_sign_in("broken", &[])?).await?;
+    app.call("signIn", profile_sign_in("deploy", &[])?).await?;
     app.call("env", json!({})).await?;
 
     let mut env_lines = 0;

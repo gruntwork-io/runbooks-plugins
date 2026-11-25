@@ -1820,10 +1820,12 @@ name = "runbooks-credential-aws"
 version = "0.1.0"
 dependencies = [
  "aws-config",
+ "aws-runtime",
  "aws-sdk-iam",
  "aws-sdk-sso",
  "aws-sdk-ssooidc",
  "aws-sdk-sts",
+ "aws-types",
  "jsonschema",
  "runbooks-plugin-protocol",
  "runbooks-plugin-transport",

@@ -88,7 +88,7 @@ fn at(value: &Value, pointer: &str) -> Value {
 struct FakeAws {
     callers: HashMap<String, Result<CallerIdentity, AwsError>>,
     calls: Arc<Mutex<Vec<Call>>>,
-    /// AssumeRole's answers by role ARN, in order; the last repeats.
+    /// `AssumeRole`'s answers by role ARN, in order; the last repeats.
     assumed: Arc<Mutex<HashMap<String, VecDeque<KeysAnswer>>>>,
     sso: FakeSso,
 }
@@ -107,7 +107,7 @@ struct FakeSso {
     keys: Arc<Mutex<HashMap<String, VecDeque<KeysAnswer>>>>,
     /// Holds the next `GetRoleCredentials` until it is sent.
     gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
-    /// Every call but GetCallerIdentity, as "<call> <detail> in <region>".
+    /// Every call but `GetCallerIdentity`, as "<call> <detail> in <region>".
     log: Arc<Mutex<Vec<String>>>,
     started: Arc<Mutex<Option<Instant>>>,
 }
@@ -154,7 +154,7 @@ impl FakeAws {
             .clone()
     }
 
-    /// AssumeRole for `role_arn` answers these, in order.
+    /// `AssumeRole` for `role_arn` answers these, in order.
     fn assumes(self, role_arn: &str, keys: Vec<KeysAnswer>) -> Self {
         lock(&self.assumed).insert(role_arn.to_owned(), keys.into());
         self
@@ -271,30 +271,34 @@ impl Aws for FakeAws {
         )
     }
 
-    async fn assume_role(
+    fn assume_role(
         &self,
         credentials: &AwsCredentials,
         request: &AssumeRole,
         region: &Region,
-    ) -> Result<AwsCredentials, AwsError> {
-        let mut entry = format!(
-            "assume {} as {} with {} in {region}",
+    ) -> impl Future<Output = Result<AwsCredentials, AwsError>> + Send {
+        let external = request
+            .external_id
+            .as_ref()
+            .map_or_else(String::new, |external_id| {
+                format!(" external {external_id}")
+            });
+        let duration = request.duration.map_or_else(String::new, |duration| {
+            format!(" for {}s", duration.as_secs())
+        });
+        self.record(format!(
+            "assume {} as {} with {} in {region}{external}{duration}",
             request.role_arn, request.session_name, credentials.access_key_id
-        );
-        if let Some(external_id) = &request.external_id {
-            entry.push_str(&format!(" external {external_id}"));
-        }
-        if let Some(duration) = request.duration {
-            entry.push_str(&format!(" for {}s", duration.as_secs()));
-        }
-        self.record(entry);
-        next_answer(lock(&self.assumed).get_mut(&request.role_arn)).unwrap_or_else(|| {
-            Err(AwsError::new(
-                Service::Sts,
-                AwsErrorKind::Refused,
-                "AccessDenied: not authorized to perform sts:AssumeRole",
-            ))
-        })
+        ));
+        future::ready(
+            next_answer(lock(&self.assumed).get_mut(&request.role_arn)).unwrap_or_else(|| {
+                Err(AwsError::new(
+                    Service::Sts,
+                    AwsErrorKind::Refused,
+                    "AccessDenied: not authorized to perform sts:AssumeRole",
+                ))
+            }),
+        )
     }
 
     fn start_device_authorization(

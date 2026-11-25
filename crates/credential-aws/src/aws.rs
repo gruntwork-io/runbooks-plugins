@@ -15,7 +15,7 @@ use crate::identity::AccountId;
 use crate::region::Region;
 use crate::secret::Secret;
 
-pub use profile_file::{PROFILE_FILE_VARIABLES, ProfileSettings, Profiles, read_profiles};
+pub(crate) use profile_file::{PROFILE_FILE_VARIABLES, ProfileSettings, Profiles, read_profiles};
 pub use sdk::SdkAws;
 
 /// Keys that sign AWS requests.
@@ -43,11 +43,14 @@ pub struct CallerIdentity {
     pub alias: Option<String>,
 }
 
-/// An STS AssumeRole request, as a profile's `role_arn` and its settings make it.
+/// An STS `AssumeRole` request, as a profile's `role_arn` and its settings make it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssumeRole {
+    /// The ARN of the role to assume.
     pub role_arn: String,
+    /// The session's name, which the assumed role's ARN ends with.
     pub session_name: String,
+    /// The external ID the role's trust policy may ask for.
     pub external_id: Option<String>,
     /// AWS's default, an hour, when `None`.
     pub duration: Option<Duration>,
@@ -116,7 +119,7 @@ pub trait Aws: Send + Sync + 'static {
         region: &Region,
     ) -> impl Future<Output = Result<CallerIdentity, AwsError>> + Send;
 
-    /// STS AssumeRole, signed with `credentials`: the role's temporary keys.
+    /// STS `AssumeRole`, signed with `credentials`: the role's temporary keys.
     fn assume_role(
         &self,
         credentials: &AwsCredentials,
