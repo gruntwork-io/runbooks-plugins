@@ -1,12 +1,11 @@
 use serde_json::{Value, json};
 
-use crate::support::{App, FakeCrypto, Google, SA_KEY, TestResult, USER_ADC, google, sign_in};
+use crate::support::{App, FakeCrypto, Google, SA_KEY, TestResult, USER_ADC, at, google, sign_in};
 
 fn ids(result: &Value) -> Vec<&str> {
     result["targets"]
         .as_array()
-        .map(|targets| targets.iter().filter_map(|t| t["id"].as_str()).collect())
-        .unwrap_or_default()
+        .map_or_default(|targets| targets.iter().filter_map(|t| t["id"].as_str()).collect())
 }
 
 #[tokio::test]
@@ -63,7 +62,7 @@ async fn select_names_a_listed_project_and_env_follows_it() -> TestResult {
     app.ok(
         "signIn",
         "signInResult",
-        sign_in("service_account", json!({"key": SA_KEY})),
+        sign_in("service_account", &json!({"key": SA_KEY})),
     )
     .await?;
     app.ok("targets", "targetsResult", json!({"level": "project"}))
@@ -77,7 +76,7 @@ async fn select_names_a_listed_project_and_env_follows_it() -> TestResult {
         )
         .await?;
     assert_eq!(
-        identity["targets"]["project"],
+        at(&identity, "/targets/project"),
         json!({"id": "quota-5678", "name": "Quota"})
     );
     let env = app.ok("env", "envResult", json!({})).await?;
@@ -95,7 +94,7 @@ async fn select_names_a_listed_project_and_env_follows_it() -> TestResult {
         )
         .await?;
     assert_eq!(
-        identity["targets"]["project"],
+        at(&identity, "/targets/project"),
         json!({"id": "typed-0001", "name": "typed-0001"})
     );
     Ok(())
@@ -116,7 +115,7 @@ async fn a_pinned_project_cannot_be_changed_or_reached_without_access() -> TestR
     let identity = app
         .ok("signIn", "signInResult", pinned("unknown-0002"))
         .await?;
-    assert_eq!(identity["targets"]["project"]["id"], "unknown-0002");
+    assert_eq!(at(&identity, "/targets/project/id"), "unknown-0002");
 
     app.error(
         "select",
@@ -131,7 +130,7 @@ async fn a_pinned_project_cannot_be_changed_or_reached_without_access() -> TestR
             json!({"targets": {"project": "unknown-0002"}}),
         )
         .await?;
-    assert_eq!(same["targets"]["project"]["id"], "unknown-0002");
+    assert_eq!(at(&same, "/targets/project/id"), "unknown-0002");
     Ok(())
 }
 

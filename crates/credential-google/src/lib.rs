@@ -1,5 +1,5 @@
 //! `runbooks-credential-google`: the Runbooks credential plugin for Google
-//! Cloud. It ports the app's GoogleAuth block: a service account key or any
+//! Cloud. It ports the app's `GoogleAuth` block: a service account key or any
 //! Google credentials document, detection from the environment and an earlier
 //! block's outputs, the project picker, and the variables a run gets.
 //!

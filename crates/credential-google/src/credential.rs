@@ -55,7 +55,7 @@ pub(crate) enum CredentialType {
 }
 
 impl CredentialType {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::ServiceAccount => "service_account",
             Self::AuthorizedUser => "authorized_user",
@@ -65,7 +65,7 @@ impl CredentialType {
 
     /// A service account's tokens are minted for cloud-platform alone, so
     /// they are exempt from the `scopes` requirement.
-    pub(crate) fn is_service_account(self) -> bool {
+    pub(crate) const fn is_service_account(self) -> bool {
         match self {
             Self::ServiceAccount => true,
             Self::AuthorizedUser | Self::AccessToken => false,
@@ -74,7 +74,7 @@ impl CredentialType {
 }
 
 impl Credential {
-    pub(crate) fn credential_type(&self) -> CredentialType {
+    pub(crate) const fn credential_type(&self) -> CredentialType {
         match self {
             Self::AccessToken(_) => CredentialType::AccessToken,
             Self::Document(document) => match document.kind {
@@ -195,7 +195,7 @@ pub(crate) enum Origin {
 }
 
 impl Origin {
-    pub(crate) fn of(credential: &Credential) -> Self {
+    pub(crate) const fn of(credential: &Credential) -> Self {
         match credential.credential_type() {
             CredentialType::ServiceAccount => Self::ServiceAccountKey,
             CredentialType::AuthorizedUser => Self::Adc,
@@ -228,7 +228,7 @@ pub(crate) async fn access_token<A: GoogleApi, C: Crypto>(
                 };
                 let assertion = crypto
                     .sign_jwt(&claims, private_key)
-                    .map_err(crypto_error)?;
+                    .map_err(|error| crypto_error(&error))?;
                 TokenRequest::JwtBearer { assertion }
             }
             DocumentKind::AuthorizedUser {
@@ -246,11 +246,11 @@ pub(crate) async fn access_token<A: GoogleApi, C: Crypto>(
     let token = api
         .token(request)
         .await
-        .map_err(|error| api_error(error, Origin::of(credential)))?;
+        .map_err(|error| api_error(&error, Origin::of(credential)))?;
     Ok(token.access_token)
 }
 
-fn crypto_error(error: CryptoError) -> PluginError {
+fn crypto_error(error: &CryptoError) -> PluginError {
     match error {
         CryptoError::Unavailable(_) => PluginError::new(ErrorKind::Internal, error.to_string()),
         CryptoError::InvalidKey => PluginError::new(
@@ -262,9 +262,9 @@ fn crypto_error(error: CryptoError) -> PluginError {
 
 /// The one place a failed Google call becomes an error kind and the copy a
 /// person acts on.
-pub(crate) fn api_error(error: ApiError, origin: Origin) -> PluginError {
+pub(crate) fn api_error(error: &ApiError, origin: Origin) -> PluginError {
     const RELOGIN: &str = "Run `gcloud auth application-default login` to refresh them.";
-    let (kind, message) = match (&error, origin) {
+    let (kind, message) = match (error, origin) {
         (ApiError::Refused(OAuthError::ReauthRequired), Origin::Adc) => (
             ErrorKind::Expired,
             format!("Your Application Default Credentials need reauthentication. {RELOGIN}"),
@@ -373,7 +373,7 @@ mod tests {
     fn a_document_error_never_quotes_the_document() {
         let pasted = r#"{"type": "-----BEGIN PRIVATE KEY----- hunter2", "private_key": "x"}"#;
         let error = parse_document(pasted.to_owned()).err();
-        let message = error.map(|e| e.to_string()).unwrap_or_default();
+        let message = error.map_or_default(|e| e.to_string());
         assert!(message.contains("an unrecognized value"), "{message}");
         assert!(!message.contains("hunter2"), "{message}");
 

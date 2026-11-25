@@ -1,8 +1,8 @@
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::support::{
-    App, BARE_TOKEN, FakeCrypto, TestResult, USER_ADC, USER_EMAIL, detect, env_value, gcloud_root,
-    google, sign_in,
+    App, BARE_TOKEN, FakeCrypto, TestResult, USER_ADC, USER_EMAIL, at, detect, env_value,
+    gcloud_root, google, sign_in,
 };
 
 #[tokio::test]
@@ -10,9 +10,9 @@ async fn configure_offers_the_gcloud_method_and_named_sources() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut app = App::start(&[], &google(), FakeCrypto::default())?;
     let offered = app.configure(dir.path()).await?;
-    assert_eq!(offered["sources"], json!(["adc", "gcloud"]));
+    assert_eq!(at(&offered, "/sources"), json!(["adc", "gcloud"]));
     assert_eq!(
-        offered["methods"][1],
+        at(&offered, "/methods/1"),
         json!({
             "name": "gcloud",
             "label": "gcloud Config",
@@ -38,17 +38,18 @@ async fn the_adc_source_reads_gclouds_file_and_env_hands_a_run_a_copy() -> TestR
         .ok(
             "detect",
             "detectResult",
-            detect(json!([{"kind": "named", "name": "adc"}])),
+            detect(&json!([{"kind": "named", "name": "adc"}])),
         )
         .await?;
-    assert_eq!(found["source"], "adc");
-    let identity = &found["identity"];
+    assert_eq!(at(&found, "/source"), "adc");
+    let identity = at(&found, "/identity");
     assert_eq!(
-        (&identity["method"], &identity["principal"]),
-        (&json!("adc"), &json!(USER_EMAIL))
+        (at(&identity, "/method"), at(&identity, "/principal")),
+        (json!("adc"), json!(USER_EMAIL))
     );
     assert_eq!(
-        identity["targets"]["project"]["id"], "quota-5678",
+        at(&identity, "/targets/project/id"),
+        "quota-5678",
         "the quota project"
     );
 
@@ -80,14 +81,9 @@ async fn the_gcloud_source_uses_the_active_configurations_settings() -> TestResu
     )?;
     app.configure(&dir.path().join("state")).await?;
 
-    let found = app
-        .ok("detect", "detectResult", detect(gcloud.clone()))
-        .await?;
-    assert_eq!(found["source"], "gcloud");
-    assert_eq!(
-        found["identity"]["targets"]["project"]["id"],
-        "sandbox-1234"
-    );
+    let found = app.ok("detect", "detectResult", detect(&gcloud)).await?;
+    assert_eq!(at(&found, "/source"), "gcloud");
+    assert_eq!(at(&found, "/identity/targets/project/id"), "sandbox-1234");
     let env = app.ok("env", "envResult", json!({})).await?;
     let configuration = env_value(&env, "CLOUDSDK_ACTIVE_CONFIG_NAME").ok_or("no configuration")?;
     assert_eq!((configuration.0, configuration.2), ("dev", &json!(["env"])));
@@ -108,8 +104,8 @@ async fn the_gcloud_source_uses_the_active_configurations_settings() -> TestResu
     ];
     let mut app = App::start(&env, &google(), FakeCrypto::default())?;
     app.configure(&dir.path().join("state2")).await?;
-    let found = app.ok("detect", "detectResult", detect(gcloud)).await?;
-    assert_eq!(found["identity"]["targets"]["project"]["id"], "quota-5678");
+    let found = app.ok("detect", "detectResult", detect(&gcloud)).await?;
+    assert_eq!(at(&found, "/identity/targets/project/id"), "quota-5678");
     let env = app.ok("env", "envResult", json!({})).await?;
     assert_eq!(
         env_value(&env, "CLOUDSDK_ACTIVE_CONFIG_NAME").map(|v| v.0),
@@ -131,9 +127,7 @@ async fn gcloud_without_application_default_credentials_finds_nothing() -> TestR
         FakeCrypto::default(),
     )?;
     app.configure(&dir.path().join("state")).await?;
-    let result = app
-        .ok("detect", "detectResult", detect(both.clone()))
-        .await?;
+    let result = app.ok("detect", "detectResult", detect(&both)).await?;
     assert_eq!(result, json!({"found": false}));
 
     // The default directory is under the home directory the plugin is given:
@@ -145,10 +139,8 @@ async fn gcloud_without_application_default_credentials_finds_nothing() -> TestR
     let defaults = [("HOME", home), ("APPDATA", app_data.as_str())];
     let mut app = App::start(&defaults, &google(), FakeCrypto::default())?;
     app.configure(&dir.path().join("state")).await?;
-    let found = app
-        .ok("detect", "detectResult", detect(both.clone()))
-        .await?;
-    assert_eq!(found["source"], "adc");
+    let found = app.ok("detect", "detectResult", detect(&both)).await?;
+    assert_eq!(at(&found, "/source"), "adc");
 
     // CLOUDSDK_CONFIG set to nothing turns gcloud's configuration off.
     let off = [
@@ -158,7 +150,7 @@ async fn gcloud_without_application_default_credentials_finds_nothing() -> TestR
     ];
     let mut app = App::start(&off, &google(), FakeCrypto::default())?;
     app.configure(&dir.path().join("state")).await?;
-    let result = app.ok("detect", "detectResult", detect(both)).await?;
+    let result = app.ok("detect", "detectResult", detect(&both)).await?;
     assert_eq!(result, json!({"found": false}));
     Ok(())
 }
@@ -175,17 +167,20 @@ async fn a_broken_adc_file_is_skipped_for_the_next_source() -> TestResult {
     app.configure(&dir.path().join("state")).await?;
 
     let sources = json!([{"kind": "named", "name": "adc"}, {"kind": "env"}]);
-    let found = app.ok("detect", "detectResult", detect(sources)).await?;
-    assert_eq!(found["source"], "env");
+    let found = app.ok("detect", "detectResult", detect(&sources)).await?;
+    assert_eq!(at(&found, "/source"), "env");
 
     let error = app
         .error(
             "detect",
-            detect(json!([{"kind": "named", "name": "gcloud"}])),
+            detect(&json!([{"kind": "named", "name": "gcloud"}])),
             "invalidParams",
         )
         .await?;
-    let message = error["message"].as_str().unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     assert!(message.contains("is not JSON"), "{message}");
     assert!(
         message.contains("gcloud auth application-default login"),
@@ -202,12 +197,12 @@ async fn a_broken_adc_file_is_skipped_for_the_next_source() -> TestResult {
     let error = app
         .error(
             "detect",
-            detect(json!([{"kind": "named", "name": "gcloud"}])),
+            detect(&json!([{"kind": "named", "name": "gcloud"}])),
             "invalidParams",
         )
         .await?;
     assert!(
-        !error["message"]
+        !at(&error, "/message")
             .as_str()
             .unwrap_or_default()
             .contains("../dev"),
@@ -228,30 +223,34 @@ async fn the_gcloud_method_signs_in_with_the_active_or_a_named_configuration() -
     app.configure(&dir.path().join("state")).await?;
 
     let identity = app
-        .ok("signIn", "signInResult", sign_in("gcloud", json!({})))
+        .ok("signIn", "signInResult", sign_in("gcloud", &json!({})))
         .await?;
-    assert_eq!(identity["method"], "gcloud");
-    assert_eq!(identity["targets"]["project"]["id"], "sandbox-1234");
+    assert_eq!(at(&identity, "/method"), "gcloud");
+    assert_eq!(at(&identity, "/targets/project/id"), "sandbox-1234");
 
-    let named = sign_in("gcloud", json!({"configuration": "default"}));
+    let named = sign_in("gcloud", &json!({"configuration": "default"}));
     let identity = app.ok("signIn", "signInResult", named).await?;
-    assert_eq!(identity["targets"]["project"]["id"], "quota-5678");
+    assert_eq!(at(&identity, "/targets/project/id"), "quota-5678");
 
     let pinned = json!({"method": "gcloud", "fields": {"configuration": "default"}, "pins": {"project": "sandbox-1234"}, "requirements": []});
     let identity = app.ok("signIn", "signInResult", pinned).await?;
     assert_eq!(
-        identity["targets"]["project"]["id"], "sandbox-1234",
+        at(&identity, "/targets/project/id"),
+        "sandbox-1234",
         "the pin wins"
     );
 
     let error = app
         .error(
             "signIn",
-            sign_in("gcloud", json!({"configuration": "prod"})),
+            sign_in("gcloud", &json!({"configuration": "prod"})),
             "invalidParams",
         )
         .await?;
-    let message = error["message"].as_str().unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     assert!(
         message.contains("its configurations are default, dev"),
         "{message}"
@@ -259,11 +258,14 @@ async fn the_gcloud_method_signs_in_with_the_active_or_a_named_configuration() -
     let error = app
         .error(
             "signIn",
-            sign_in("gcloud", json!({"configuration": "Prod/../x"})),
+            sign_in("gcloud", &json!({"configuration": "Prod/../x"})),
             "invalidParams",
         )
         .await?;
-    let message = error["message"].as_str().unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     assert!(
         message.contains("lower case") && !message.contains("Prod"),
         "{message}"
@@ -279,10 +281,10 @@ async fn the_gcloud_method_says_what_to_run_when_gcloud_has_nothing() -> TestRes
     let mut app = App::start(&[], &google(), FakeCrypto::default())?;
     app.configure(&state).await?;
     let error = app
-        .error("signIn", sign_in("gcloud", json!({})), "notSignedIn")
+        .error("signIn", sign_in("gcloud", &json!({})), "notSignedIn")
         .await?;
     assert!(
-        error["message"]
+        at(&error, "/message")
             .as_str()
             .is_some_and(|m| m.contains("gcloud init")),
         "{error}"
@@ -296,9 +298,12 @@ async fn the_gcloud_method_says_what_to_run_when_gcloud_has_nothing() -> TestRes
     )?;
     app.configure(&state).await?;
     let error = app
-        .error("signIn", sign_in("gcloud", json!({})), "notSignedIn")
+        .error("signIn", sign_in("gcloud", &json!({})), "notSignedIn")
         .await?;
-    let message = error["message"].as_str().unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     assert!(
         message.contains("gcloud auth application-default login"),
         "{message}"
@@ -311,9 +316,12 @@ async fn the_gcloud_method_says_what_to_run_when_gcloud_has_nothing() -> TestRes
     let mut app = App::start(&env, &google(), FakeCrypto::default())?;
     app.configure(&state).await?;
     let error = app
-        .error("signIn", sign_in("gcloud", json!({})), "notSignedIn")
+        .error("signIn", sign_in("gcloud", &json!({})), "notSignedIn")
         .await?;
-    let message = error["message"].as_str().unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     assert!(message.contains("staging doesn't exist"), "{message}");
     Ok(())
 }

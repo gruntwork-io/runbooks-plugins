@@ -2,7 +2,8 @@ use runbooks_credential_google::{NoCrypto, TOKEN_URL, TokenRequest};
 use serde_json::{Value, json};
 
 use crate::support::{
-    App, CLOUD_PLATFORM, FakeCrypto, NOW, SA_EMAIL, SA_KEY, TestResult, env_value, google, sign_in,
+    App, CLOUD_PLATFORM, FakeCrypto, NOW, SA_EMAIL, SA_KEY, TestResult, at, env_value, google,
+    sign_in,
 };
 
 #[tokio::test]
@@ -10,19 +11,22 @@ async fn configure_offers_the_methods_project_level_scopes_and_every_name() -> T
     let dir = tempfile::tempdir()?;
     let mut app = App::start(&[], &google(), FakeCrypto::default())?;
     let offered = app.configure(dir.path()).await?;
-    assert_eq!(offered["cloud"], "gcp");
-    assert_eq!(offered["methods"][0]["name"], "service_account");
-    let key = &offered["methods"][0]["fields"][0];
+    assert_eq!(at(&offered, "/cloud"), "gcp");
+    assert_eq!(at(&offered, "/methods/0/name"), "service_account");
+    let key = at(&offered, "/methods/0/fields/0");
     assert_eq!(
-        (&key["name"], &key["secret"]),
-        (&json!("key"), &json!(true))
+        (at(&key, "/name"), at(&key, "/secret")),
+        (json!("key"), json!(true))
     );
     assert_eq!(
-        offered["levels"],
+        at(&offered, "/levels"),
         json!([{"name": "project", "label": "Project", "chosen": "afterSignIn"}])
     );
-    assert_eq!(offered["requirements"], json!(["scopes"]));
-    let names = offered["names"].as_array().ok_or("no names")?;
+    assert_eq!(at(&offered, "/requirements"), json!(["scopes"]));
+    let names = offered
+        .get("names")
+        .and_then(Value::as_array)
+        .ok_or("no names")?;
     for name in [
         "GOOGLE_APPLICATION_CREDENTIALS",
         "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
@@ -42,7 +46,7 @@ async fn configure_refuses_a_relative_state_dir() -> TestResult {
         json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "state/block"});
     let error = app.error("configure", params, "invalidParams").await?;
     assert!(
-        error["message"]
+        at(&error, "/message")
             .as_str()
             .is_some_and(|m| m.contains("stateDir")),
         "{error}"
@@ -62,28 +66,31 @@ async fn a_pasted_key_signs_in_as_its_service_account_in_its_project() -> TestRe
         .ok(
             "signIn",
             "signInResult",
-            sign_in("service_account", json!({"key": SA_KEY})),
+            sign_in("service_account", &json!({"key": SA_KEY})),
         )
         .await?;
-    assert_eq!(identity["principal"], SA_EMAIL);
-    assert_eq!(identity["kind"], "serviceAccount");
-    assert_eq!(identity["method"], "service_account");
+    assert_eq!(at(&identity, "/principal"), SA_EMAIL);
+    assert_eq!(at(&identity, "/kind"), "serviceAccount");
+    assert_eq!(at(&identity, "/method"), "service_account");
     assert_eq!(
-        identity["targets"]["project"],
+        at(&identity, "/targets/project"),
         json!({"id": "sandbox-1234", "name": "Sandbox"})
     );
     assert!(identity.get("expiresAt").is_none(), "{identity}");
 
     // The assertion is for Google's own token endpoint, whatever the key says.
-    let claims = crypto.claims.lock().map_err(|_| "poisoned")?.clone();
-    assert_eq!(claims.len(), 1);
-    assert_eq!(claims[0].issuer, SA_EMAIL);
-    assert_eq!(claims[0].audience, TOKEN_URL);
-    assert_eq!(claims[0].scope, CLOUD_PLATFORM);
-    assert_eq!(
-        (claims[0].issued_at, claims[0].expires_at),
-        (NOW, NOW + 3600)
-    );
+    let claims = crypto
+        .claims
+        .lock()
+        .map_err(|_poisoned| "poisoned")?
+        .clone();
+    let [claim] = claims.as_slice() else {
+        return Err(format!("{} assertions signed", claims.len()).into());
+    };
+    assert_eq!(claim.issuer, SA_EMAIL);
+    assert_eq!(claim.audience, TOKEN_URL);
+    assert_eq!(claim.scope, CLOUD_PLATFORM);
+    assert_eq!((claim.issued_at, claim.expires_at), (NOW, NOW + 3600));
     assert!(matches!(
         google.token_requests().as_slice(),
         [TokenRequest::JwtBearer { assertion }] if assertion.expose() == format!("header.{SA_EMAIL}.signature")
@@ -99,7 +106,7 @@ async fn env_points_a_run_at_a_private_copy_of_the_key_and_sign_out_deletes_it()
     app.ok(
         "signIn",
         "signInResult",
-        sign_in("service_account", json!({"key": SA_KEY})),
+        sign_in("service_account", &json!({"key": SA_KEY})),
     )
     .await?;
 
@@ -164,19 +171,28 @@ async fn a_key_file_is_read_from_its_absolute_path() -> TestResult {
 
     let fields = json!({"keyFile": key_file.to_str().ok_or("utf-8")?, "project": "quota-5678"});
     let identity = app
-        .ok("signIn", "signInResult", sign_in("service_account", fields))
+        .ok(
+            "signIn",
+            "signInResult",
+            sign_in("service_account", &fields),
+        )
         .await?;
     assert_eq!(
-        identity["targets"]["project"]["id"], "quota-5678",
+        at(&identity, "/targets/project/id"),
+        "quota-5678",
         "the field wins"
     );
 
     let missing = json!({"keyFile": dir.path().join("gone.json").to_str().ok_or("utf-8")?});
     let error = app
-        .error("signIn", sign_in("service_account", missing), "notSignedIn")
+        .error(
+            "signIn",
+            sign_in("service_account", &missing),
+            "notSignedIn",
+        )
         .await?;
     assert!(
-        error["message"]
+        at(&error, "/message")
             .as_str()
             .is_some_and(|m| m.contains("gone.json")),
         "{error}"
@@ -209,14 +225,17 @@ async fn service_account_fields_are_checked_before_anything_is_read() -> TestRes
         let error = app
             .error(
                 "signIn",
-                sign_in("service_account", fields.clone()),
+                sign_in("service_account", &fields),
                 "invalidParams",
             )
             .await?;
-        let message = error["message"].as_str().unwrap_or_default();
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(message.contains(expect), "{fields}: {message}");
     }
-    app.error("signIn", sign_in("sso", json!({})), "invalidParams")
+    app.error("signIn", sign_in("sso", &json!({})), "invalidParams")
         .await?;
     Ok(())
 }
@@ -229,11 +248,14 @@ async fn without_a_signer_a_service_account_sign_in_says_what_is_missing() -> Te
     let error = app
         .error(
             "signIn",
-            sign_in("service_account", json!({"key": SA_KEY})),
+            sign_in("service_account", &json!({"key": SA_KEY})),
             "internal",
         )
         .await?;
-    let message = error["message"].as_str().unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     assert!(message.contains("cannot sign"), "{message}");
     Ok(())
 }
@@ -251,11 +273,11 @@ async fn a_revoked_key_is_expired_with_what_to_do() -> TestResult {
     let error = app
         .error(
             "signIn",
-            sign_in("service_account", json!({"key": SA_KEY})),
+            sign_in("service_account", &json!({"key": SA_KEY})),
             "expired",
         )
         .await?;
-    let message: &Value = &error["message"];
+    let message = at(&error, "/message");
     assert!(
         message
             .as_str()

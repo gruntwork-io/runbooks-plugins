@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
+use std::future::{self, Future};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -13,7 +15,7 @@ use serde_json::Map;
 use time::OffsetDateTime;
 
 use crate::Secret;
-use crate::api::{GoogleApi, Network, NetworkError};
+use crate::api::{GoogleApi, Network, NetworkError, Project};
 use crate::credential::{Credential, MAX_DOCUMENT_BYTES, Origin, api_error, parse_document};
 use crate::crypto::Crypto;
 use crate::files::{self, CREDENTIALS_FILE, ReadError};
@@ -35,10 +37,22 @@ const CONFIGURATION_NAME_RULE: &str =
 
 /// What `main` found in the process: its environment, read once, and the
 /// clock. The plugin reads no other global state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Host {
+    /// The process environment.
     pub env: HashMap<String, String>,
+    /// The clock.
     pub now: fn() -> OffsetDateTime,
+}
+
+/// The variables' names only: their values may hold the person's secrets.
+impl fmt::Debug for Host {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Host")
+            .field("env", &self.env.keys().collect::<BTreeSet<_>>())
+            .field("now", &self.now)
+            .finish()
+    }
 }
 
 /// Builds the API client once `configure` says how to reach Google.
@@ -59,12 +73,56 @@ struct State<A> {
     project_names: HashMap<String, String>,
 }
 
+impl<A> State<A> {
+    fn select(&mut self, params: SelectParams) -> Result<SelectResult, PluginError> {
+        let mut targets = params.targets;
+        let project = targets.remove(PROJECT);
+        if let Some(level) = targets.keys().next() {
+            return Err(invalid_params(format!(
+                "targets has level {level:?}; this plugin's only level is \"project\""
+            )));
+        }
+        let Some(project) = project.filter(|project| !project.is_empty()) else {
+            return Err(invalid_params("select needs targets.project"));
+        };
+        let names = self.project_names.get(&project).cloned();
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| PluginError::new(ErrorKind::NotSignedIn, "Sign in first."))?;
+        if let Some(pinned) = session
+            .pinned_project
+            .as_ref()
+            .filter(|pinned| **pinned != project)
+        {
+            return Err(PluginError::new(
+                ErrorKind::PinMismatch,
+                format!("The block pins project {pinned}, so {project} can't be selected."),
+            ));
+        }
+        session.project = Some(Target {
+            name: names.unwrap_or_else(|| project.clone()),
+            id: project,
+        });
+        Ok(SelectResult(session.identity()))
+    }
+}
+
 struct Configured<A> {
     api: Arc<A>,
     state_dir: PathBuf,
 }
 
+// The host's environment and the session hold secrets.
+impl<A, C> fmt::Debug for GooglePlugin<A, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GooglePlugin").finish_non_exhaustive()
+    }
+}
+
 impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
+    /// A plugin that reads `host`, reaches Google through what `connect`
+    /// builds, and signs with `crypto`.
     pub fn new(host: Host, connect: Connect<A>, crypto: C) -> Self {
         Self {
             host,
@@ -85,11 +143,13 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
     }
 
     fn configured(&self) -> Result<(Arc<A>, PathBuf), PluginError> {
-        let state = self.state();
-        let configured = state.configured.as_ref().ok_or_else(|| {
-            PluginError::new(ErrorKind::NotConfigured, "configure has not succeeded")
-        })?;
-        Ok((Arc::clone(&configured.api), configured.state_dir.clone()))
+        self.state()
+            .configured
+            .as_ref()
+            .map(|configured| (Arc::clone(&configured.api), configured.state_dir.clone()))
+            .ok_or_else(|| {
+                PluginError::new(ErrorKind::NotConfigured, "configure has not succeeded")
+            })
     }
 
     fn session(&self) -> Result<Session, PluginError> {
@@ -412,6 +472,19 @@ fn methods() -> Vec<Method> {
     ]
 }
 
+/// `project` as a target, unless it is pending deletion. Google lists those
+/// too; gcloud hides them.
+fn live_target(project: Project) -> Option<Target> {
+    project
+        .state
+        .as_deref()
+        .is_none_or(|state| state == "ACTIVE")
+        .then(|| Target {
+            name: project.display_name.unwrap_or_else(|| project.id.clone()),
+            id: project.id,
+        })
+}
+
 /// A detection source, checked before any is read.
 enum Lookup {
     Vars {
@@ -537,9 +610,9 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                 Err(error) => failures.push(error),
             }
         }
-        match failures.first() {
-            None => Ok(DetectResult::not_found()),
-            Some(first) => {
+        failures.first().map_or_else(
+            || Ok(DetectResult::not_found()),
+            |first| {
                 let messages: Vec<&str> = failures.iter().map(PluginError::message).collect();
                 Err(PluginError::new(
                     first.kind(),
@@ -548,8 +621,8 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                         messages.join("; ")
                     ),
                 ))
-            }
-        }
+            },
+        )
     }
 
     async fn sign_in(
@@ -595,20 +668,8 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                     u32::try_from(size).unwrap_or(1),
                 )
                 .await
-                .map_err(|error| api_error(error, origin))?;
-            // Projects pending deletion are listed too; gcloud hides them.
-            for project in page.projects {
-                if project
-                    .state
-                    .as_deref()
-                    .is_none_or(|state| state == "ACTIVE")
-                {
-                    targets.push(Target {
-                        name: project.display_name.unwrap_or_else(|| project.id.clone()),
-                        id: project.id,
-                    });
-                }
-            }
+                .map_err(|error| api_error(&error, origin))?;
+            targets.extend(page.projects.into_iter().filter_map(live_target));
             page_token = page.next_page_token;
             if page_token.is_none() || targets.len() >= MAX_PROJECTS {
                 break;
@@ -622,38 +683,11 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
         Ok(TargetsResult { targets })
     }
 
-    async fn select(&self, params: SelectParams) -> Result<SelectResult, PluginError> {
-        let mut targets = params.targets;
-        let project = targets.remove(PROJECT);
-        if let Some(level) = targets.keys().next() {
-            return Err(invalid_params(format!(
-                "targets has level {level:?}; this plugin's only level is \"project\""
-            )));
-        }
-        let Some(project) = project.filter(|project| !project.is_empty()) else {
-            return Err(invalid_params("select needs targets.project"));
-        };
-        let mut state = self.state();
-        let names = state.project_names.get(&project).cloned();
-        let session = state
-            .session
-            .as_mut()
-            .ok_or_else(|| PluginError::new(ErrorKind::NotSignedIn, "Sign in first."))?;
-        if let Some(pinned) = session
-            .pinned_project
-            .as_ref()
-            .filter(|pinned| **pinned != project)
-        {
-            return Err(PluginError::new(
-                ErrorKind::PinMismatch,
-                format!("The block pins project {pinned}, so {project} can't be selected."),
-            ));
-        }
-        session.project = Some(Target {
-            name: names.unwrap_or_else(|| project.clone()),
-            id: project,
-        });
-        Ok(SelectResult(session.identity()))
+    fn select(
+        &self,
+        params: SelectParams,
+    ) -> impl Future<Output = Result<SelectResult, PluginError>> + Send {
+        future::ready(self.state().select(params))
     }
 
     async fn env(&self) -> Result<EnvResult, PluginError> {

@@ -3,18 +3,23 @@ use std::fmt;
 use serde::Deserialize;
 
 /// A credential value: a private key, a refresh token, an access token, a
-/// client secret, a whole credentials document. `Debug` prints a placeholder,
-/// there is no `Display` or `Serialize`, and only [`Secret::expose`] reads it,
-/// so a secret reaches output only where code asks for it by name.
+/// client secret, a whole credentials document.
+///
+/// `Debug` prints a placeholder, there is no `Display` or `Serialize`, and only
+/// [`Secret::expose`] reads it, so a secret reaches output only where code asks
+/// for it by name.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
 
 impl Secret {
+    /// Wraps `value`.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
+    /// The value.
+    #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
     }

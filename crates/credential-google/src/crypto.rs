@@ -12,9 +12,12 @@ use crate::Secret;
 /// endpoint exchanges for an access token.
 #[derive(Clone, Debug, Serialize)]
 pub struct JwtClaims {
+    /// The service account's email.
     #[serde(rename = "iss")]
     pub issuer: String,
+    /// The scopes asked for, separated by spaces.
     pub scope: String,
+    /// The token endpoint.
     #[serde(rename = "aud")]
     pub audience: String,
     /// Seconds since the Unix epoch.
@@ -25,6 +28,7 @@ pub struct JwtClaims {
     pub expires_at: i64,
 }
 
+/// The signing the plugin does.
 pub trait Crypto: Send + Sync + 'static {
     /// The compact JWS of `claims`: `header.claims.signature`, each part
     /// base64url without padding, signed RS256 with `private_key`, a PKCS #8
@@ -36,10 +40,13 @@ pub trait Crypto: Send + Sync + 'static {
     fn sign_jwt(&self, claims: &JwtClaims, private_key: &Secret) -> Result<Secret, CryptoError>;
 }
 
+/// Why a [`Crypto`] call failed.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
+    /// This build cannot do the named operation.
     #[error("this build cannot {0} yet: it needs a cryptography crate that has not been approved")]
     Unavailable(&'static str),
+    /// The private key is not a PKCS #8 RSA key in PEM.
     #[error("the private key is not a PKCS #8 RSA key in PEM")]
     InvalidKey,
 }

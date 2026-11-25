@@ -171,7 +171,7 @@ impl<A: GoogleApi, C: Crypto> Prover<'_, A, C> {
             .api
             .token_info(&token)
             .await
-            .map_err(|error| api_error(error, origin))?;
+            .map_err(|error| api_error(&error, origin))?;
         let credential_type = credential.credential_type();
         let principal = info
             .email
@@ -297,6 +297,8 @@ impl Session {
     /// The values a run gets. `credentials_file` is where the document was
     /// written, for a credential that is one.
     pub(crate) fn env_values(&self, credentials_file: Option<&str>) -> Vec<EnvValue> {
+        const BOTH: &[EnvValueToItem] = &[EnvValueToItem::Env, EnvValueToItem::Output];
+        const ENV: &[EnvValueToItem] = &[EnvValueToItem::Env];
         let mut values = Vec::new();
         let mut set = |names: &[&str], value: &str, sensitive: bool, to: &[EnvValueToItem]| {
             for name in names {
@@ -308,11 +310,9 @@ impl Session {
                 });
             }
         };
-        const BOTH: &[EnvValueToItem] = &[EnvValueToItem::Env, EnvValueToItem::Output];
-        const ENV: &[EnvValueToItem] = &[EnvValueToItem::Env];
         match (&self.credential, credentials_file) {
             (Credential::AccessToken(token), _) => {
-                set(&ACCESS_TOKEN_VARS, token.expose(), true, ENV)
+                set(&ACCESS_TOKEN_VARS, token.expose(), true, ENV);
             }
             (Credential::Document(_), Some(path)) => set(&CREDENTIAL_FILE_VARS, path, false, BOTH),
             (Credential::Document(_), None) => {}
