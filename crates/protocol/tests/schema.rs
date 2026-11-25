@@ -328,3 +328,46 @@ fn a_setting_that_is_not_a_string_is_refused() -> TestResult {
         &configure_params(Some(json!({"defaultRegion": 7}))),
     )
 }
+
+/// Asserts the schema refuses `value`. The generated types don't check an
+/// array's `maxItems` or `minItems`, so a bound is the schema's alone: it
+/// holds what a plugin sends, and Runbooks checks it when decoding.
+fn assert_schema_refuses(def: &str, value: &Value) -> TestResult {
+    assert!(!validator(def)?.is_valid(value), "{def} accepted {value}");
+    Ok(())
+}
+
+/// `count` copies of `item`.
+fn items(item: &Value, count: usize) -> Value {
+    Value::Array(vec![item.clone(); count])
+}
+
+// Runbooks 3362bfd6 (draft PR #547): an identity can carry warnings.
+
+fn identity_with_warnings(warnings: Value) -> Result<Value, Box<dyn Error>> {
+    let mut identity = take_member(sign_in_response(), "result")?;
+    identity
+        .as_object_mut()
+        .ok_or("not an object")?
+        .insert("warnings".to_owned(), warnings);
+    Ok(identity)
+}
+
+#[test]
+fn an_identity_carries_up_to_ten_warnings() -> TestResult {
+    let def = "credential.schema.json#/$defs/identity";
+    let warning = json!({"message": "us-gov-east-1 is not enabled for this account"});
+    let identity = identity_with_warnings(items(&warning, 10))?;
+    round_trip::<credential::Identity>(def, &identity)?;
+    let typed: credential::Identity = serde_json::from_value(identity)?;
+    assert_eq!(typed.warnings.len(), 10);
+    assert_schema_refuses(def, &identity_with_warnings(items(&warning, 11))?)
+}
+
+#[test]
+fn a_warning_without_a_message_is_refused() -> TestResult {
+    assert_refused::<credential::Identity>(
+        "credential.schema.json#/$defs/identity",
+        &identity_with_warnings(json!([{"text": "no message"}]))?,
+    )
+}

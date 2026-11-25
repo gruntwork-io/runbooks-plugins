@@ -196,6 +196,7 @@ fn identity(method: &str) -> Identity {
         method: method.to_owned(),
         principal: "arn:aws:sts::123456789012:assumed-role/dev/someone".to_owned(),
         targets: HashMap::new(),
+        warnings: Vec::new(),
     }
 }
 

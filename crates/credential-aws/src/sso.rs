@@ -59,6 +59,7 @@ impl SsoLogin {
             method: METHOD.to_owned(),
             principal: self.start_url.clone(),
             targets,
+            warnings: Vec::new(),
         }
     }
 

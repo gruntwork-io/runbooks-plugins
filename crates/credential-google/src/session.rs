@@ -291,6 +291,7 @@ impl Session {
             method: self.method.clone(),
             principal: self.principal.clone(),
             targets,
+            warnings: Vec::new(),
         }
     }
 

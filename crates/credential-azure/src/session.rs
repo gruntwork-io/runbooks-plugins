@@ -102,6 +102,7 @@ impl Session {
             method: self.method.name().to_owned(),
             principal: principal.name.clone(),
             targets,
+            warnings: Vec::new(),
         }
     }
 

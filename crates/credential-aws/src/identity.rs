@@ -200,6 +200,7 @@ impl Principal {
             method: method.to_owned(),
             principal: self.arn.clone(),
             targets,
+            warnings: Vec::new(),
         }
     }
 }
