@@ -86,6 +86,7 @@ fn method(method: SignInMethod) -> Method {
         fields,
         label: label.to_owned(),
         name: method.name().to_owned(),
+        one_of: Vec::new(),
     }
 }
 

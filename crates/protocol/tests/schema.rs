@@ -402,3 +402,41 @@ fn a_choice_without_a_label_is_refused() -> TestResult {
         &field_with_choices(&json!([{"value": "dev"}])),
     )
 }
+
+// Runbooks 333e3840 (draft PR #547): a sign-in method can ask for one field
+// of a group.
+
+fn method_with_one_of(one_of: &Value) -> Value {
+    json!({"name":"servicePrincipal","label":"Service principal","fields":[],"oneOf":one_of})
+}
+
+#[test]
+fn a_method_asks_for_one_field_of_up_to_ten_groups_of_two_to_ten() -> TestResult {
+    let def = "credential.schema.json#/$defs/method";
+    let names: Vec<String> = (0..10).map(|n| format!("field{n}")).collect();
+    let method = method_with_one_of(&items(&json!(names), 10));
+    round_trip::<credential::Method>(def, &method)?;
+    let pair = method_with_one_of(&json!([["clientSecret", "certificate"]]));
+    round_trip::<credential::Method>(def, &pair)?;
+    let typed: credential::Method = serde_json::from_value(pair)?;
+    assert_eq!(typed.one_of, [["clientSecret", "certificate"]]);
+
+    let mut eleven = names;
+    eleven.push("field10".to_owned());
+    for refused in [
+        json!([["clientSecret"]]),
+        json!([eleven]),
+        items(&json!(["clientSecret", "certificate"]), 11),
+    ] {
+        assert_schema_refuses(def, &method_with_one_of(&refused))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_one_of_group_that_is_not_names_is_refused() -> TestResult {
+    assert_refused::<credential::Method>(
+        "credential.schema.json#/$defs/method",
+        &method_with_one_of(&json!([["clientSecret", 7]])),
+    )
+}
