@@ -26,11 +26,17 @@ pub(crate) const SESSION_TOKEN: &str = "sessionToken";
 /// The region a run gets as `AWS_REGION`, and that keys which name none are
 /// checked in. The block's `defaultRegion` fills it in.
 pub(crate) const DEFAULT_REGION: &str = "defaultRegion";
+/// The AWS access portal, like `https://my-org.awsapps.com/start`, and the
+/// region IAM Identity Center runs in. The block's `ssoStartUrl` and
+/// `ssoRegion` fill them in.
+pub const SSO_START_URL: &str = "ssoStartUrl";
+pub const SSO_REGION: &str = "ssoRegion";
 
 /// The sign-in methods: the block's tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SignInMethod {
     Credentials,
+    Sso,
 }
 
 /// One input of a sign-in method.
@@ -49,7 +55,7 @@ const DEFAULT_REGION_FIELD: FieldSpec = FieldSpec {
 };
 
 impl SignInMethod {
-    pub(crate) const ALL: [Self; 1] = [Self::Credentials];
+    pub(crate) const ALL: [Self; 2] = [Self::Credentials, Self::Sso];
 
     pub(crate) fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|method| method.name() == name)
@@ -58,12 +64,14 @@ impl SignInMethod {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Credentials => "credentials",
+            Self::Sso => "sso",
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
             Self::Credentials => "Static Credentials",
+            Self::Sso => "AWS SSO",
         }
     }
 
@@ -87,6 +95,21 @@ impl SignInMethod {
                     label: "Session Token",
                     required: false,
                     secret: true,
+                },
+                DEFAULT_REGION_FIELD,
+            ],
+            Self::Sso => &[
+                FieldSpec {
+                    name: SSO_START_URL,
+                    label: "SSO Start URL",
+                    required: true,
+                    secret: false,
+                },
+                FieldSpec {
+                    name: SSO_REGION,
+                    label: "SSO Region",
+                    required: false,
+                    secret: false,
                 },
                 DEFAULT_REGION_FIELD,
             ],
@@ -129,6 +152,9 @@ pub(crate) fn describe() -> ConfigureResult {
     }
 }
 
+/// Longer than any access portal URL.
+const MAX_URL_LEN: usize = 2048;
+
 /// A sign-in's fields, checked against its method's. An empty value counts as
 /// unset: the form sends one for an input left blank.
 #[derive(Clone, Copy)]
@@ -152,6 +178,10 @@ pub(crate) enum InvalidFields {
         #[source]
         source: InvalidRegion,
     },
+    #[error(
+        "the {SSO_START_URL} field should be your AWS access portal's https:// URL, like https://my-org.awsapps.com/start"
+    )]
+    StartUrl,
 }
 
 fn describe_fields(method: SignInMethod, missing: &[&str], unknown: &[String]) -> String {
@@ -218,6 +248,21 @@ impl<'a> Fields<'a> {
     /// A field `parse` checked is set.
     pub(crate) fn required(self, name: &str) -> &'a str {
         self.get(name).unwrap_or_default()
+    }
+
+    /// The access portal URL in [`SSO_START_URL`], which `parse` checked is set.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidFields::StartUrl`] for anything but an `https://` URL.
+    pub fn start_url(self) -> Result<&'a str, InvalidFields> {
+        let url = self.required(SSO_START_URL);
+        let host = url.strip_prefix("https://").unwrap_or_default();
+        if host.is_empty() || url.len() > MAX_URL_LEN || url.chars().any(char::is_whitespace) {
+            Err(InvalidFields::StartUrl)
+        } else {
+            Ok(url)
+        }
     }
 
     /// The region in `field`, or `None` when it is unset.

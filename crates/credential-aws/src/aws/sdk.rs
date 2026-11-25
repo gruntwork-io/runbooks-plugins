@@ -7,10 +7,15 @@ use std::time::{Duration, SystemTime};
 use aws_sdk_sts::config::timeout::TimeoutConfig;
 use aws_sdk_sts::config::{BehaviorVersion, Credentials, Region as SdkRegion};
 use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
+use time::OffsetDateTime;
 
-use super::{Aws, AwsCredentials, AwsError, AwsErrorKind, CallerIdentity, Service};
+use super::{
+    Aws, AwsCredentials, AwsError, AwsErrorKind, CallerIdentity, DeviceAuthorization, Service,
+    SsoAccount, SsoToken, TokenPoll,
+};
 use crate::identity::AccountId;
 use crate::region::Region;
+use crate::secret::Secret;
 
 /// The longest one AWS call may take, the SDK's retries included.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -18,6 +23,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The name the SDK gives the keys the plugin hands it.
 const PROVIDER_NAME: &str = "runbooks";
+
+/// What IAM Identity Center shows the person for the device authorization,
+/// as Runbooks main registered it.
+const CLIENT_NAME: &str = "gruntwork-runbooks";
+const CLIENT_TYPE: &str = "public";
+const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// RFC 8628's defaults, for an answer that gives no expiry or interval.
+const DEFAULT_EXPIRES_IN: Duration = Duration::from_secs(600);
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A guard against a listing that never ends: far more accounts or roles
+/// than anyone is given.
+const MAX_PAGES: usize = 1000;
 
 /// Calls AWS with the SDK's default HTTPS client: rustls, the platform's
 /// trusted roots, and `HTTPS_PROXY` / `NO_PROXY` from the environment.
@@ -87,6 +106,249 @@ impl Aws for SdkAws {
             alias,
         })
     }
+
+    async fn start_device_authorization(
+        &self,
+        start_url: &str,
+        region: &Region,
+    ) -> Result<DeviceAuthorization, AwsError> {
+        let oidc = oidc_client(region);
+        let client = oidc
+            .register_client()
+            .client_name(CLIENT_NAME)
+            .client_type(CLIENT_TYPE)
+            .send()
+            .await
+            .map_err(|error| classify(Service::SsoOidc, &error))?;
+        let missing = |operation: &str, what: &str| {
+            AwsError::new(
+                Service::SsoOidc,
+                AwsErrorKind::Unexpected,
+                format!("{operation} answered without {what}"),
+            )
+        };
+        let client_id = client
+            .client_id()
+            .ok_or_else(|| missing("RegisterClient", "a clientId"))?;
+        let client_secret = client
+            .client_secret()
+            .ok_or_else(|| missing("RegisterClient", "a clientSecret"))?;
+        let device = oidc
+            .start_device_authorization()
+            .client_id(client_id)
+            .client_secret(client_secret)
+            .start_url(start_url)
+            .send()
+            .await
+            .map_err(|error| classify(Service::SsoOidc, &error))?;
+        let verification_url = device
+            .verification_uri_complete()
+            .or(device.verification_uri())
+            .ok_or_else(|| missing("StartDeviceAuthorization", "a verificationUri"))?;
+        Ok(DeviceAuthorization {
+            client_id: client_id.to_owned(),
+            client_secret: Secret::new(client_secret),
+            device_code: Secret::new(
+                device
+                    .device_code()
+                    .ok_or_else(|| missing("StartDeviceAuthorization", "a deviceCode"))?,
+            ),
+            user_code: device
+                .user_code()
+                .ok_or_else(|| missing("StartDeviceAuthorization", "a userCode"))?
+                .to_owned(),
+            verification_url: verification_url.to_owned(),
+            expires_in: seconds(device.expires_in()).unwrap_or(DEFAULT_EXPIRES_IN),
+            interval: seconds(device.interval()).unwrap_or(DEFAULT_INTERVAL),
+        })
+    }
+
+    async fn create_token(
+        &self,
+        device: &DeviceAuthorization,
+        region: &Region,
+    ) -> Result<TokenPoll, AwsError> {
+        let answer = oidc_client(region)
+            .create_token()
+            .client_id(&device.client_id)
+            .client_secret(device.client_secret.expose())
+            .grant_type(DEVICE_CODE_GRANT)
+            .device_code(device.device_code.expose())
+            .send()
+            .await;
+        let token = match answer {
+            Ok(token) => token,
+            Err(error) => {
+                let service_error = error.as_service_error();
+                if service_error.is_some_and(|e| e.is_authorization_pending_exception()) {
+                    return Ok(TokenPoll::Pending);
+                }
+                if service_error.is_some_and(|e| e.is_slow_down_exception()) {
+                    return Ok(TokenPoll::SlowDown);
+                }
+                return Err(classify(Service::SsoOidc, &error));
+            }
+        };
+        let access_token = token.access_token().ok_or_else(|| {
+            AwsError::new(
+                Service::SsoOidc,
+                AwsErrorKind::Unexpected,
+                "CreateToken answered without an accessToken",
+            )
+        })?;
+        Ok(TokenPoll::Approved(SsoToken {
+            access_token: Secret::new(access_token),
+            expires_in: seconds(token.expires_in()),
+        }))
+    }
+
+    async fn sso_accounts(
+        &self,
+        token: &SsoToken,
+        region: &Region,
+    ) -> Result<Vec<SsoAccount>, AwsError> {
+        let sso = sso_client(region);
+        let mut accounts = Vec::new();
+        let mut next_token = None;
+        for _page in 0..MAX_PAGES {
+            let page = sso
+                .list_accounts()
+                .access_token(token.access_token.expose())
+                .set_next_token(next_token)
+                .send()
+                .await
+                .map_err(|error| classify(Service::Sso, &error))?;
+            accounts.extend(page.account_list().iter().filter_map(|account| {
+                let id = AccountId::parse(account.account_id()?).ok()?;
+                let name = account
+                    .account_name()
+                    .filter(|name| !name.is_empty())
+                    .map_or_else(|| id.to_string(), str::to_owned);
+                Some(SsoAccount { id, name })
+            }));
+            next_token = page.next_token().map(str::to_owned);
+            if next_token.is_none() {
+                return Ok(accounts);
+            }
+        }
+        Err(too_many_pages("ListAccounts"))
+    }
+
+    async fn sso_roles(
+        &self,
+        token: &SsoToken,
+        account: &AccountId,
+        region: &Region,
+    ) -> Result<Vec<String>, AwsError> {
+        let sso = sso_client(region);
+        let mut roles = Vec::new();
+        let mut next_token = None;
+        for _page in 0..MAX_PAGES {
+            let page = sso
+                .list_account_roles()
+                .access_token(token.access_token.expose())
+                .account_id(account.as_str())
+                .set_next_token(next_token)
+                .send()
+                .await
+                .map_err(|error| classify(Service::Sso, &error))?;
+            roles.extend(
+                page.role_list()
+                    .iter()
+                    .filter_map(|role| role.role_name())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned),
+            );
+            next_token = page.next_token().map(str::to_owned);
+            if next_token.is_none() {
+                return Ok(roles);
+            }
+        }
+        Err(too_many_pages("ListAccountRoles"))
+    }
+
+    async fn role_credentials(
+        &self,
+        token: &SsoToken,
+        account: &AccountId,
+        role: &str,
+        region: &Region,
+    ) -> Result<AwsCredentials, AwsError> {
+        let answer = sso_client(region)
+            .get_role_credentials()
+            .access_token(token.access_token.expose())
+            .account_id(account.as_str())
+            .role_name(role)
+            .send()
+            .await
+            .map_err(|error| classify(Service::Sso, &error))?;
+        let missing = |what: &str| {
+            AwsError::new(
+                Service::Sso,
+                AwsErrorKind::Unexpected,
+                format!("GetRoleCredentials answered without {what}"),
+            )
+        };
+        let keys = answer
+            .role_credentials()
+            .ok_or_else(|| missing("roleCredentials"))?;
+        Ok(AwsCredentials {
+            access_key_id: keys
+                .access_key_id()
+                .ok_or_else(|| missing("an accessKeyId"))?
+                .to_owned(),
+            secret_access_key: Secret::new(
+                keys.secret_access_key()
+                    .ok_or_else(|| missing("a secretAccessKey"))?,
+            ),
+            session_token: keys.session_token().map(Secret::new),
+            // Milliseconds since the epoch; 0 when AWS gives none.
+            expires_at: (keys.expiration() > 0)
+                .then(|| {
+                    OffsetDateTime::from_unix_timestamp_nanos(
+                        i128::from(keys.expiration()) * 1_000_000,
+                    )
+                    .ok()
+                })
+                .flatten(),
+        })
+    }
+}
+
+fn oidc_client(region: &Region) -> aws_sdk_ssooidc::Client {
+    aws_sdk_ssooidc::Client::from_conf(
+        aws_sdk_ssooidc::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(sdk_region(region))
+            .timeout_config(timeouts())
+            .build(),
+    )
+}
+
+fn sso_client(region: &Region) -> aws_sdk_sso::Client {
+    aws_sdk_sso::Client::from_conf(
+        aws_sdk_sso::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(sdk_region(region))
+            .timeout_config(timeouts())
+            .build(),
+    )
+}
+
+/// A positive count of seconds, as SSO-OIDC gives lifetimes and intervals.
+fn seconds(value: i32) -> Option<Duration> {
+    u64::try_from(value)
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+}
+
+fn too_many_pages(operation: &str) -> AwsError {
+    AwsError::new(
+        Service::Sso,
+        AwsErrorKind::Unexpected,
+        format!("{operation} kept paging past {MAX_PAGES} pages"),
+    )
 }
 
 fn sdk_region(region: &Region) -> SdkRegion {
@@ -141,9 +403,12 @@ where
         }
         SdkError::DispatchFailure(_) if is_tls_failure(error) => (AwsErrorKind::Tls, chain(error)),
         SdkError::DispatchFailure(_) => (AwsErrorKind::Network, chain(error)),
-        SdkError::ResponseError(_) | SdkError::ConstructionFailure(_) => {
-            (AwsErrorKind::Unexpected, chain(error))
-        }
+        // The answer may hold keys or a token: say only that it was unreadable.
+        SdkError::ResponseError(_) => (
+            AwsErrorKind::Unexpected,
+            "AWS's answer could not be read".to_owned(),
+        ),
+        SdkError::ConstructionFailure(_) => (AwsErrorKind::Unexpected, chain(error)),
         // SdkError is #[non_exhaustive]: a variant added after this was
         // written. What its text holds is unvetted and may be AWS's answer,
         // so say only that the SDK failed.
@@ -163,7 +428,13 @@ fn kind_of_code(code: &str, server_error: bool) -> AwsErrorKind {
         | "AccessDenied"
         | "AccessDeniedException"
         | "UnrecognizedClientException" => AwsErrorKind::Refused,
-        "ExpiredToken" | "ExpiredTokenException" | "RequestExpired" => AwsErrorKind::Expired,
+        "ForbiddenException" => AwsErrorKind::Refused,
+        // SSO answers UnauthorizedException for an access token that has
+        // expired or been revoked.
+        "ExpiredToken" | "ExpiredTokenException" | "RequestExpired" | "UnauthorizedException" => {
+            AwsErrorKind::Expired
+        }
+        "ResourceNotFoundException" => AwsErrorKind::NotFound,
         "Throttling" | "ThrottlingException" | "TooManyRequestsException" => {
             AwsErrorKind::Unavailable
         }
@@ -322,7 +593,7 @@ mod tests {
             ),
         );
         assert_eq!(error.kind, AwsErrorKind::Unexpected);
-        assert!(error.detail.ends_with(": the answer is not XML"), "{error}");
+        assert_eq!(error.detail, "AWS's answer could not be read", "{error}");
         let error = classify(Service::Sts, &StsError::construction_failure("no region"));
         assert_eq!(error.kind, AwsErrorKind::Unexpected);
         assert!(error.detail.ends_with(": no region"), "{error}");

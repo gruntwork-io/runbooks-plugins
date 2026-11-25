@@ -2,7 +2,9 @@
 //! pipes, a fake AWS, and every line the plugin writes checked against the
 //! protocol schema.
 
-use std::collections::HashMap;
+mod sso;
+
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fs;
 use std::future::{self, Future};
@@ -13,7 +15,7 @@ use std::time::Duration;
 use jsonschema::{Draft, Registry, Validator};
 use runbooks_credential_aws::{
     AccountId, Aws, AwsCredentials, AwsError, AwsErrorKind, AwsPlugin, CallerIdentity, Clock,
-    Environment, Region, Service,
+    DeviceAuthorization, Environment, Region, Secret, Service, SsoAccount, SsoToken, TokenPoll,
 };
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_protocol::credential::DetectParams;
@@ -22,8 +24,9 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, duplex};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -83,6 +86,30 @@ fn at(value: &Value, pointer: &str) -> Value {
 struct FakeAws {
     callers: HashMap<String, Result<CallerIdentity, AwsError>>,
     calls: Arc<Mutex<Vec<Call>>>,
+    sso: FakeSso,
+}
+
+type KeysAnswer = Result<AwsCredentials, AwsError>;
+
+/// IAM Identity Center, as the fake answers it.
+#[derive(Clone, Debug, Default)]
+struct FakeSso {
+    /// CreateToken's answers, in order. Pending once they run out.
+    polls: Arc<Mutex<VecDeque<Result<TokenPoll, AwsError>>>>,
+    accounts: Vec<SsoAccount>,
+    /// Role names by account id.
+    roles: HashMap<String, Vec<String>>,
+    /// GetRoleCredentials's answers by "account/role", in order; the last repeats.
+    keys: Arc<Mutex<HashMap<String, VecDeque<KeysAnswer>>>>,
+    /// Holds the next GetRoleCredentials until it is sent.
+    gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    /// Every SSO and SSO-OIDC call, as "<call> <detail> in <region>".
+    log: Arc<Mutex<Vec<String>>>,
+    started: Arc<Mutex<Option<Instant>>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// One `GetCallerIdentity`: the key it was signed with and the region it went to.
@@ -122,6 +149,80 @@ impl FakeAws {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+
+    /// CreateToken answers these, in order, then Pending.
+    fn polls(self, polls: Vec<Result<TokenPoll, AwsError>>) -> Self {
+        *lock(&self.sso.polls) = polls.into();
+        self
+    }
+
+    fn account(mut self, id: &str, name: &str, roles: &[&str]) -> Result<Self, Box<dyn Error>> {
+        self.sso.accounts.push(SsoAccount {
+            id: AccountId::parse(id)?,
+            name: name.to_owned(),
+        });
+        self.sso.roles.insert(
+            id.to_owned(),
+            roles.iter().map(|r| (*r).to_owned()).collect(),
+        );
+        Ok(self)
+    }
+
+    /// GetRoleCredentials for `role` in `account` answers these, in order.
+    fn role_keys(self, account: &str, role: &str, keys: Vec<KeysAnswer>) -> Self {
+        lock(&self.sso.keys).insert(format!("{account}/{role}"), keys.into());
+        self
+    }
+
+    /// The next GetRoleCredentials waits until the returned sender is used.
+    fn hold_next_keys(&self) -> oneshot::Sender<()> {
+        let (open, gate) = oneshot::channel();
+        *lock(&self.sso.gate) = Some(gate);
+        open
+    }
+
+    fn sso_log(&self) -> Vec<String> {
+        lock(&self.sso.log).clone()
+    }
+
+    fn record(&self, entry: String) {
+        lock(&self.sso.log).push(entry);
+    }
+}
+
+/// What every fake device authorization is.
+const START_URL: &str = "https://my-org.awsapps.com/start";
+const VERIFICATION_URL: &str = "https://device.sso.eu-west-1.amazonaws.com/?user_code=WDDD-HRQV";
+const USER_CODE: &str = "WDDD-HRQV";
+/// The secrets of the device flow: none may leave the plugin at all.
+const CLIENT_SECRET: &str = "test-sso-client-secret";
+const DEVICE_CODE: &str = "d3v1c3-c0d3-HrlZ8ptW0HgK";
+const ACCESS_TOKEN: &str = "test-sso-access-token";
+
+impl FakeSso {
+    fn device() -> DeviceAuthorization {
+        DeviceAuthorization {
+            client_id: "client-id".to_owned(),
+            client_secret: Secret::new(CLIENT_SECRET),
+            device_code: Secret::new(DEVICE_CODE),
+            user_code: USER_CODE.to_owned(),
+            verification_url: VERIFICATION_URL.to_owned(),
+            expires_in: Duration::from_secs(600),
+            interval: Duration::from_secs(5),
+        }
+    }
+}
+
+/// The token a person's approval gives, good for eight hours.
+fn approved() -> Result<TokenPoll, AwsError> {
+    Ok(TokenPoll::Approved(SsoToken {
+        access_token: Secret::new(ACCESS_TOKEN),
+        expires_in: Some(Duration::from_secs(8 * 3600)),
+    }))
+}
+
+fn sso_failure(kind: AwsErrorKind, detail: &str) -> AwsError {
+    AwsError::new(Service::Sso, kind, detail)
 }
 
 impl Aws for FakeAws {
@@ -149,6 +250,84 @@ impl Aws for FakeAws {
                     ))
                 }),
         )
+    }
+
+    async fn start_device_authorization(
+        &self,
+        start_url: &str,
+        region: &Region,
+    ) -> Result<DeviceAuthorization, AwsError> {
+        *lock(&self.sso.started) = Some(Instant::now());
+        self.record(format!("start {start_url} in {region}"));
+        Ok(FakeSso::device())
+    }
+
+    async fn create_token(
+        &self,
+        device: &DeviceAuthorization,
+        region: &Region,
+    ) -> Result<TokenPoll, AwsError> {
+        assert_eq!(device.device_code.expose(), DEVICE_CODE);
+        let started = (*lock(&self.sso.started)).ok_or("polled before starting");
+        let after = started.map_or(0, |at| at.elapsed().as_secs());
+        self.record(format!("poll at {after}s in {region}"));
+        lock(&self.sso.polls)
+            .pop_front()
+            .unwrap_or(Ok(TokenPoll::Pending))
+    }
+
+    async fn sso_accounts(
+        &self,
+        token: &SsoToken,
+        region: &Region,
+    ) -> Result<Vec<SsoAccount>, AwsError> {
+        assert_eq!(token.access_token.expose(), ACCESS_TOKEN);
+        self.record(format!("accounts in {region}"));
+        Ok(self.sso.accounts.clone())
+    }
+
+    async fn sso_roles(
+        &self,
+        token: &SsoToken,
+        account: &AccountId,
+        region: &Region,
+    ) -> Result<Vec<String>, AwsError> {
+        assert_eq!(token.access_token.expose(), ACCESS_TOKEN);
+        self.record(format!("roles {account} in {region}"));
+        Ok(self
+            .sso
+            .roles
+            .get(account.as_str())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn role_credentials(
+        &self,
+        token: &SsoToken,
+        account: &AccountId,
+        role: &str,
+        region: &Region,
+    ) -> Result<AwsCredentials, AwsError> {
+        assert_eq!(token.access_token.expose(), ACCESS_TOKEN);
+        self.record(format!("keys {account}/{role} in {region}"));
+        let gate = lock(&self.sso.gate).take();
+        if let Some(gate) = gate {
+            let _opened = gate.await;
+        }
+        let mut keys = lock(&self.sso.keys);
+        let queue = keys.get_mut(&format!("{account}/{role}"));
+        let answer = match queue {
+            Some(queue) if queue.len() > 1 => queue.pop_front(),
+            Some(queue) => queue.front().cloned(),
+            None => None,
+        };
+        answer.unwrap_or_else(|| {
+            Err(sso_failure(
+                AwsErrorKind::Refused,
+                "ForbiddenException: No access",
+            ))
+        })
     }
 }
 
@@ -178,8 +357,18 @@ struct App {
     _serve: JoinHandle<Result<(), ServeError>>,
     message: Validator,
     next_id: i64,
-    /// Every line the plugin wrote, with the method of the request it answers.
+    /// The method of each request sent, by id.
+    methods: HashMap<i64, String>,
+    /// Responses read while waiting for another, by id.
+    early: HashMap<i64, Value>,
+    /// Every notification's params, in order.
+    notifications: Vec<Value>,
+    /// Every line the plugin wrote, with the method of the request it
+    /// answers or the notification's method.
     written: Vec<(String, String)>,
+    /// How long to wait for a response. Tests with paused time wait for
+    /// longer than the sign-in they drive takes.
+    wait: Duration,
 }
 
 impl App {
@@ -199,7 +388,11 @@ impl App {
             _serve: tokio::spawn(serve(plugin, plugin_stdin, plugin_stdout)),
             message: validator(&message)?,
             next_id: 0,
+            methods: HashMap::new(),
+            early: HashMap::new(),
+            notifications: Vec::new(),
             written: Vec::new(),
+            wait: WAIT,
         };
         let configured = app
             .call(
@@ -211,28 +404,49 @@ impl App {
         Ok(app)
     }
 
-    async fn receive(&mut self, method: &str) -> Result<Value, Box<dyn Error>> {
-        let line = timeout(WAIT, self.stdout.next_line())
-            .await??
-            .ok_or("the plugin's output ended")?;
-        self.written.push((method.to_owned(), line.clone()));
-        let message: Value = serde_json::from_str(&line)?;
-        self.message
-            .validate(&message)
-            .map_err(|e| format!("{line}: {e}"))?;
-        Ok(message)
+    /// Sends a request without waiting for its response.
+    async fn send(&mut self, method: &str, params: Value) -> Result<i64, Box<dyn Error>> {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.methods.insert(id, method.to_owned());
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let stdin = self.stdin.as_mut().ok_or("the plugin's input is closed")?;
+        stdin.write_all(format!("{request}\n").as_bytes()).await?;
+        Ok(id)
+    }
+
+    /// The response to request `id`, valid for the schema. Lines before it
+    /// are kept: notifications, and responses to other requests.
+    async fn response(&mut self, id: i64) -> Result<Value, Box<dyn Error>> {
+        loop {
+            if let Some(response) = self.early.remove(&id) {
+                return Ok(response);
+            }
+            let line = timeout(self.wait, self.stdout.next_line())
+                .await??
+                .ok_or("the plugin's output ended")?;
+            let message: Value = serde_json::from_str(&line)?;
+            self.message
+                .validate(&message)
+                .map_err(|e| format!("{line}: {e}"))?;
+            if let Some(answered) = message["id"].as_i64() {
+                let method = self.methods.get(&answered).cloned().unwrap_or_default();
+                self.written.push((method, line));
+                self.early.insert(answered, message);
+            } else {
+                let method = message["method"].as_str().ok_or("method")?.to_owned();
+                assert_eq!(method, "signIn.prompt", "{line}");
+                assert_valid("signInPrompt", &message["params"])?;
+                self.written.push((method, line));
+                self.notifications.push(message["params"].clone());
+            }
+        }
     }
 
     /// Sends a request and returns its response, valid for the schema.
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, Box<dyn Error>> {
-        self.next_id += 1;
-        let request =
-            json!({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params});
-        let stdin = self.stdin.as_mut().ok_or("the plugin's input is closed")?;
-        stdin.write_all(format!("{request}\n").as_bytes()).await?;
-        let response = self.receive(method).await?;
-        assert_eq!(at(&response, "/id"), self.next_id, "{response}");
-        Ok(response)
+        let id = self.send(method, params).await?;
+        self.response(id).await
     }
 
     /// The result of a call that should succeed, valid for `def`.
@@ -360,6 +574,28 @@ async fn configure_offers_static_keys_the_levels_and_every_name_a_run_gets() -> 
         .filter_map(|f| f["name"].as_str())
         .collect();
     assert_eq!(secret_fields, ["secretAccessKey", "sessionToken"]);
+
+    let sso = result["methods"]
+        .as_array()
+        .ok_or("methods")?
+        .iter()
+        .find(|m| m["name"] == "sso")
+        .ok_or("an sso method")?;
+    assert_eq!(sso["label"], "AWS SSO");
+    let fields: Vec<(&str, bool)> = sso["fields"]
+        .as_array()
+        .ok_or("fields")?
+        .iter()
+        .filter_map(|f| Some((f["name"].as_str()?, f["required"].as_bool()?)))
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            ("ssoStartUrl", true),
+            ("ssoRegion", false),
+            ("defaultRegion", false)
+        ]
+    );
     Ok(())
 }
 
@@ -822,7 +1058,12 @@ async fn keys_past_their_expiration_are_expired() -> TestResult {
 
 #[tokio::test]
 async fn targets_and_select_have_nothing_to_choose_for_static_keys() -> TestResult {
-    let mut app = App::start(FakeAws::default(), Environment::default()).await?;
+    let aws = FakeAws::default().caller("AKIAKEYS", OTHER_ACCOUNT, USER_ARN)?;
+    let mut app = App::start(aws, Environment::default()).await?;
+    app.fails("targets", json!({"level": "account"}), "notSignedIn")
+        .await?;
+    app.ok("signIn", keys_sign_in("AKIAKEYS", &[])?, "signInResult")
+        .await?;
     app.fails("targets", json!({"level": "account"}), "invalidParams")
         .await?;
     let error = app
@@ -906,10 +1147,15 @@ async fn a_secret_leaves_the_plugin_only_in_envs_result() -> TestResult {
 }
 
 /// Each refusal says which it is: a level AWS has, fixed for these keys, or
-/// a level AWS does not have.
+/// a level AWS does not have. Before a sign-in there is nothing to choose.
 #[tokio::test]
 async fn targets_says_whether_aws_has_the_level() -> TestResult {
-    let mut app = App::start(FakeAws::default(), Environment::default()).await?;
+    let aws = FakeAws::default().caller("AKIAKEYS", OTHER_ACCOUNT, USER_ARN)?;
+    let mut app = App::start(aws, Environment::default()).await?;
+    app.fails("targets", json!({"level": "account"}), "notSignedIn")
+        .await?;
+    app.ok("signIn", keys_sign_in("AKIAKEYS", &[])?, "signInResult")
+        .await?;
     for (level, message) in [
         (
             "account",

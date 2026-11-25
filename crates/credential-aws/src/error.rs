@@ -31,6 +31,12 @@ pub(crate) fn aws(error: &AwsError, doing: &str) -> PluginError {
             ErrorKind::Expired,
             format!("the credentials have expired ({detail}): sign in again"),
         ),
+        AwsErrorKind::NotFound => (
+            ErrorKind::AccessDenied,
+            format!(
+                "AWS {service} has no such account or role for you while {doing} ({detail}): check that you are assigned it"
+            ),
+        ),
         AwsErrorKind::Unavailable => (
             ErrorKind::Network,
             format!(

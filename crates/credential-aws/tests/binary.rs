@@ -82,6 +82,19 @@ fn the_binary_answers_over_stdio_and_reports_an_unreachable_aws_as_network() -> 
         "{message}"
     );
 
+    // The SSO sign-in's first call takes the same route out.
+    let signed_in = call(
+        3,
+        "signIn",
+        json!({"method": "sso", "fields": {"ssoStartUrl": "https://my-org.awsapps.com/start", "ssoRegion": "eu-west-1"}, "pins": {}, "requirements": []}),
+    )?;
+    assert_eq!(signed_in["error"]["data"]["kind"], "network", "{signed_in}");
+    let message = signed_in["error"]["message"].as_str().ok_or("message")?;
+    assert!(
+        message.contains("SSO OIDC") && message.contains("eu-west-1"),
+        "{message}"
+    );
+
     // Closing standard input, which `call` owns, stops the plugin.
     drop(call);
     let (exited, status) = mpsc::channel();

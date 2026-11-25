@@ -5,7 +5,8 @@
 //!   `AWS_CREDENTIAL_EXPIRATION` from the environment, under a prefix when
 //!   the source has one, or the same names from an earlier block's outputs.
 //! - **Sign-in methods**: `credentials`, an access key with its secret and an
-//!   optional session token.
+//!   optional session token; `sso`, IAM Identity Center's device
+//!   authorization, approved in the browser, then an account and a role.
 //! - Every credential is checked with STS `GetCallerIdentity`, in the home
 //!   region of its region's partition, before it is used.
 //! - **Pins** are keyed by level: `account` (`ssoAccountId`) and `role`
@@ -24,8 +25,12 @@ mod methods;
 mod plugin;
 mod region;
 mod secret;
+mod sso;
 
-pub use aws::{Aws, AwsCredentials, AwsError, AwsErrorKind, CallerIdentity, SdkAws, Service};
+pub use aws::{
+    Aws, AwsCredentials, AwsError, AwsErrorKind, CallerIdentity, DeviceAuthorization, SdkAws,
+    Service, SsoAccount, SsoToken, TokenPoll,
+};
 pub use detect::Environment;
 pub use identity::{AccountId, InvalidAccountId};
 pub use plugin::{AwsPlugin, Clock, SystemClock};
