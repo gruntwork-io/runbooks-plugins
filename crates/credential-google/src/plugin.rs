@@ -501,6 +501,7 @@ fn methods() -> Vec<Method> {
             label: "Service Account Key".to_owned(),
             name: SERVICE_ACCOUNT.to_owned(),
             one_of: Vec::new(),
+            unavailable: None,
         },
         Method {
             fields: vec![
@@ -511,12 +512,14 @@ fn methods() -> Vec<Method> {
             label: "Google Sign-In".to_owned(),
             name: OAUTH.to_owned(),
             one_of: Vec::new(),
+            unavailable: None,
         },
         Method {
             fields: vec![field("configuration", "gcloud configuration", false)],
             label: "gcloud Config".to_owned(),
             name: GCLOUD.to_owned(),
             one_of: Vec::new(),
+            unavailable: None,
         },
     ]
 }

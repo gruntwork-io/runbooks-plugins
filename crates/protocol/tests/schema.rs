@@ -440,3 +440,40 @@ fn a_one_of_group_that_is_not_names_is_refused() -> TestResult {
         &method_with_one_of(&json!([["clientSecret", 7]])),
     )
 }
+
+// Runbooks cdd84ffa (draft PR #547): a sign-in method can be unavailable.
+
+fn method_unavailable(unavailable: &Value) -> Value {
+    json!({"name":"cli","label":"Azure CLI","fields":[],"unavailable":unavailable})
+}
+
+#[test]
+fn an_unavailable_method_says_why_with_an_error_kind() -> TestResult {
+    let def = "credential.schema.json#/$defs/method";
+    let method =
+        method_unavailable(&json!({"kind": "toolMissing", "message": "az is not installed"}));
+    round_trip::<credential::Method>(def, &method)?;
+    let typed: credential::Method = serde_json::from_value(method)?;
+    assert_eq!(
+        typed.unavailable.map(|why| (why.kind, why.message)),
+        Some((
+            credential::ErrorKind::ToolMissing,
+            "az is not installed".to_owned()
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unavailable_method_without_a_known_kind_or_a_message_is_refused() -> TestResult {
+    for unavailable in [
+        json!({"kind": "notInstalled", "message": "az is not installed"}),
+        json!({"kind": "toolMissing"}),
+    ] {
+        assert_refused::<credential::Method>(
+            "credential.schema.json#/$defs/method",
+            &method_unavailable(&unavailable),
+        )?;
+    }
+    Ok(())
+}

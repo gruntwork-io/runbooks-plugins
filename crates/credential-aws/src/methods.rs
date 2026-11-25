@@ -159,6 +159,7 @@ pub(crate) fn describe() -> ConfigureResult {
                 label: method.label().to_owned(),
                 name: method.name().to_owned(),
                 one_of: Vec::new(),
+                unavailable: None,
             })
             .collect(),
         names: NAMES.map(str::to_owned).to_vec(),
