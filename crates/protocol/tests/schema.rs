@@ -223,3 +223,13 @@ fn error_data_keeps_a_kinds_own_fields() -> TestResult {
     let response = json!({"jsonrpc":"2.0","id":"7","error":{"code":-32000,"message":"a scope is missing","data":data}});
     round_trip::<base::ErrorResponse>("base.schema.json#/$defs/errorResponse", &response)
 }
+
+#[test]
+fn detect_results_round_trip() -> TestResult {
+    let found = json!({"found":true,"identity":{"principal":"someone@example.com","kind":"user","method":"gcloud","targets":{"project":{"id":"sandbox-1234","name":"Sandbox"}}},"source":"gcloud"});
+    round_trip::<credential::DetectResult>("credential.schema.json#/$defs/detectResult", &found)?;
+    round_trip::<credential::DetectResult>(
+        "credential.schema.json#/$defs/detectResult",
+        &json!({"found":false}),
+    )
+}
