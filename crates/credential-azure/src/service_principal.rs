@@ -13,16 +13,21 @@ use crate::ids::{ClientId, TenantRef};
 pub struct Secret(String);
 
 impl Secret {
-    pub fn new(value: String) -> Self {
+    /// `value`, kept out of `Debug`.
+    #[must_use]
+    pub const fn new(value: String) -> Self {
         Self(value)
     }
 
+    /// The secret itself, for `az`'s standard input and `env`'s result.
+    #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
     }
 
     /// `text` with every copy of the secret replaced, for a message made
     /// from what another program printed.
+    #[must_use]
     pub fn redact(&self, text: &str) -> String {
         if self.0.is_empty() {
             text.to_owned()
@@ -38,24 +43,32 @@ impl fmt::Debug for Secret {
     }
 }
 
+/// What a service principal signs in with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Credential {
+    /// A client secret.
     Secret(Secret),
     /// A PEM file holding the certificate and its private key.
     Certificate(PathBuf),
 }
 
+/// An app that signs in as itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServicePrincipal {
+    /// The app's client id.
     pub client_id: ClientId,
+    /// The tenant it signs in to.
     pub tenant: TenantRef,
+    /// Its secret or certificate.
     pub credential: Credential,
 }
 
 /// A service principal read from variables, and the subscription they name.
 #[derive(Debug)]
 pub struct Found {
+    /// The service principal.
     pub principal: ServicePrincipal,
+    /// The subscription the variables name, trimmed: an id or a name.
     pub subscription: Option<String>,
 }
 
@@ -64,6 +77,7 @@ pub struct Found {
 const FAMILIES: [&str; 2] = ["ARM_", "AZURE_"];
 
 /// The Azure CLI reads only PEM certificates, not PKCS#12 files.
+#[must_use]
 pub fn is_pkcs12(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -71,6 +85,7 @@ pub fn is_pkcs12(path: &Path) -> bool {
 }
 
 /// What a PKCS#12 certificate's message says to do.
+#[must_use]
 pub fn pkcs12_message(path: &Path) -> String {
     format!(
         "The Azure CLI takes a PEM certificate, not {}. Convert it with openssl pkcs12 -in <file> -out <file>.pem -nodes.",
@@ -79,6 +94,7 @@ pub fn pkcs12_message(path: &Path) -> String {
 }
 
 /// A detection prefix: `CI_` reads `CI_ARM_CLIENT_ID` and so on.
+#[must_use]
 pub fn is_prefix(prefix: &str) -> bool {
     let mut bytes = prefix.bytes();
     bytes.next().is_some_and(|b| b.is_ascii_uppercase())
@@ -133,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_arm_first_then_azure_with_the_prefix() {
+    fn reads_arm_first_then_azure_with_the_prefix() -> Result<(), Box<dyn std::error::Error>> {
         let env = vars(&[
             ("CI_AZURE_CLIENT_ID", CLIENT),
             ("CI_AZURE_TENANT_ID", TENANT),
@@ -145,13 +161,14 @@ mod tests {
             ("ARM_CLIENT_SECRET", "unprefixed"),
         ]);
         let found = from_vars("CI_", |name| env.get(name).cloned());
-        let found = found.unwrap_or_else(|| unreachable!("CI_ARM_ is complete"));
+        let found = found.ok_or("CI_ARM_ is complete, yet nothing was found")?;
         assert_eq!(
             found.principal.credential,
             Credential::Secret(Secret::new("arm-secret".to_owned()))
         );
         assert_eq!(found.principal.tenant.as_str(), "contoso.onmicrosoft.com");
         assert_eq!(found.subscription.as_deref(), Some("Prod"));
+        Ok(())
     }
 
     #[test]

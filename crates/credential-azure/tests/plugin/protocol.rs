@@ -116,8 +116,9 @@ async fn configure_offers_the_methods_levels_and_every_name() -> TestResult {
         .map(|m| &m["name"])
         .collect();
     assert_eq!(methods, ["cli", "device_code", "service_principal"]);
-    let secret_fields: Vec<&Value> = result["methods"][2]["fields"]
-        .as_array()
+    let secret_fields: Vec<&Value> = result
+        .pointer("/methods/2/fields")
+        .and_then(Value::as_array)
         .ok_or("fields")?
         .iter()
         .filter(|field| field["secret"] == true)

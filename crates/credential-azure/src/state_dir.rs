@@ -110,7 +110,11 @@ impl StateDir {
     ///
     /// `invalidParams` when the file cannot be read or is not a PEM file's
     /// size.
-    pub async fn copy_certificate(&self, from: &Path, dir: &Path) -> Result<PathBuf, PluginError> {
+    pub(crate) async fn copy_certificate(
+        &self,
+        from: &Path,
+        dir: &Path,
+    ) -> Result<PathBuf, PluginError> {
         let (from, target) = (from.to_owned(), dir.join(CERTIFICATE));
         blocking(move || {
             File::open(&from)

@@ -295,7 +295,8 @@ async fn a_service_principal_secret_goes_to_az_on_stdin_and_back_only_in_env() -
         )
         .await?;
     assert_eq!(
-        identity["targets"]["subscription"]["id"], PROD,
+        at(&identity, "/targets/subscription/id"),
+        PROD,
         "{identity}"
     );
     assert_eq!(scripted.stdin()?, SECRET);

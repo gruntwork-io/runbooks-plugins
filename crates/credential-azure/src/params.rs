@@ -150,19 +150,23 @@ pub(crate) fn login_tenant(
 /// `invalidParams` naming each field that is missing or malformed, and
 /// `pinMismatch` for a tenant that is not the pinned one. No message
 /// repeats the secret.
-pub fn service_principal(
+pub(crate) fn service_principal(
     fields: &HashMap<String, String>,
     constraints: &Constraints,
 ) -> Result<ServicePrincipal, PluginError> {
     let tenant = login_tenant(fields, constraints)?
         .ok_or_else(|| format!("fields.{TENANT_FIELD} is required for a service principal"));
     let field = |name: &str| fields.get(name).and_then(|value| given(value));
-    let client_id = match field(CLIENT_ID_FIELD) {
-        None => Err(format!("fields.{CLIENT_ID_FIELD} is required")),
-        Some(value) => ClientId::parse(value).ok_or_else(|| {
-            format!("fields.{CLIENT_ID_FIELD} must be the app's client ID, a GUID, not {value:?}")
-        }),
-    };
+    let client_id = field(CLIENT_ID_FIELD).map_or_else(
+        || Err(format!("fields.{CLIENT_ID_FIELD} is required")),
+        |value| {
+            ClientId::parse(value).ok_or_else(|| {
+                format!(
+                    "fields.{CLIENT_ID_FIELD} must be the app's client ID, a GUID, not {value:?}"
+                )
+            })
+        },
+    );
     // The secret as typed: only a template's blank counts as unset.
     let secret = fields
         .get(CLIENT_SECRET_FIELD)
@@ -300,7 +304,8 @@ mod tests {
     }
 
     #[test]
-    fn a_service_principal_names_each_bad_field_and_never_the_secret() {
+    fn a_service_principal_names_each_bad_field_and_never_the_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
         for (fields, expected) in [
             (
                 map(&[("clientSecret", "s3cr3t")]),
@@ -342,7 +347,7 @@ mod tests {
         ] {
             let error = service_principal(&fields, &Constraints::default())
                 .err()
-                .unwrap_or_else(|| unreachable!("{:?} is refused", fields.keys()));
+                .ok_or_else(|| format!("{:?} was accepted", fields.keys()))?;
             assert_eq!(error.kind(), ErrorKind::InvalidParams);
             for part in expected {
                 assert!(
@@ -353,6 +358,7 @@ mod tests {
             }
             assert!(!error.message().contains("s3cr3t"), "{}", error.message());
         }
+        Ok(())
     }
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {

@@ -18,9 +18,9 @@ pub(crate) const CLI_SOURCE: &str = "cli";
 pub(crate) const TENANT_FIELD: &str = "tenantId";
 
 /// A service principal's fields. It takes a secret or a certificate.
-pub const CLIENT_ID_FIELD: &str = "clientId";
-pub const CLIENT_SECRET_FIELD: &str = "clientSecret";
-pub const CERTIFICATE_FIELD: &str = "clientCertificatePath";
+pub(crate) const CLIENT_ID_FIELD: &str = "clientId";
+pub(crate) const CLIENT_SECRET_FIELD: &str = "clientSecret";
+pub(crate) const CERTIFICATE_FIELD: &str = "clientCertificatePath";
 
 /// Every env and output name the plugin may set. The base environment
 /// strips them all, so a value from the app's own environment or an earlier

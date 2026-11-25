@@ -104,6 +104,8 @@ struct Configured<A> {
 }
 
 impl<C: Connect> AzurePlugin<C> {
+    /// `host` is the environment `main` read: the `cli` source copies its
+    /// `az` login, and the `env` source reads its variables.
     pub fn new(host: Host, connect: C) -> Self {
         Self {
             host,
@@ -186,6 +188,43 @@ impl<C: Connect> AzurePlugin<C> {
         let session = establish(&configured.az, method, dir.clone(), constraints, None).await;
         let session = keep_or_remove(&configured.state, &dir, session).await;
         unusable_is_none(session, &[ErrorKind::NotSignedIn, ErrorKind::Expired])
+    }
+
+    /// The `cli` source: a copy of the person's own `az` login, if they have
+    /// one the block can use.
+    async fn detect_local(
+        &self,
+        configured: &Configured<C::Az>,
+        constraints: &Constraints,
+    ) -> Result<Option<Session>, PluginError> {
+        let local = self.host.local_login();
+        let Some(from) = &local.config_dir else {
+            return Ok(None);
+        };
+        let extensions = local.extension_dir.as_deref();
+        self.detect_copy(configured, SignInMethod::Cli, from, extensions, constraints)
+            .await
+    }
+
+    /// The `env` source: a service principal in the variables whose names
+    /// start with `prefix`, if they hold a whole one.
+    async fn detect_env(
+        &self,
+        configured: &Configured<C::Az>,
+        prefix: Option<&str>,
+        constraints: &Constraints,
+    ) -> Result<Option<Session>, PluginError> {
+        let get = |name: &str| {
+            self.host
+                .var(name)
+                .and_then(|value| value.to_str())
+                .map(str::to_owned)
+        };
+        let Some(found) = service_principal::from_vars(prefix.unwrap_or_default(), get) else {
+            return Ok(None);
+        };
+        self.detect_service_principal(configured, found, constraints)
+            .await
     }
 
     /// A service principal from the environment or an earlier block, signed
@@ -322,7 +361,18 @@ fn unusable_is_none(
         Err(error) => match error.kind() {
             ErrorKind::PinMismatch | ErrorKind::ToolMissing => Ok(None),
             kind if unusable.contains(&kind) => Ok(None),
-            _ => Err(error),
+            ErrorKind::NotConfigured
+            | ErrorKind::UnsupportedProtocolVersion
+            | ErrorKind::InvalidParams
+            | ErrorKind::NotSignedIn
+            | ErrorKind::Expired
+            | ErrorKind::RequirementNotMet
+            | ErrorKind::AccessDenied
+            | ErrorKind::Cancelled
+            | ErrorKind::TimedOut
+            | ErrorKind::Network
+            | ErrorKind::TlsError
+            | ErrorKind::Internal => Err(error),
         },
     }
 }
@@ -536,36 +586,15 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
         let mut first_error = None;
         for source in &params.sources {
             let (found, name) = match source {
-                Source::Named { .. } => {
-                    let local = self.host.local_login();
-                    let found = match &local.config_dir {
-                        Some(from) => {
-                            let extensions = local.extension_dir.as_deref();
-                            let method = SignInMethod::Cli;
-                            self.detect_copy(configured, method, from, extensions, &constraints)
-                                .await
-                        }
-                        None => Ok(None),
-                    };
-                    (found, CLI_SOURCE)
-                }
-                Source::Env { prefix } => {
-                    let prefix = prefix.as_deref().unwrap_or_default();
-                    let get = |name: &str| {
-                        self.host
-                            .var(name)
-                            .and_then(|value| value.to_str())
-                            .map(str::to_owned)
-                    };
-                    let found = match service_principal::from_vars(prefix, get) {
-                        Some(found) => {
-                            self.detect_service_principal(configured, found, &constraints)
-                                .await
-                        }
-                        None => Ok(None),
-                    };
-                    (found, ENV_SOURCE)
-                }
+                Source::Named { .. } => (
+                    self.detect_local(configured, &constraints).await,
+                    CLI_SOURCE,
+                ),
+                Source::Env { prefix } => (
+                    self.detect_env(configured, prefix.as_deref(), &constraints)
+                        .await,
+                    ENV_SOURCE,
+                ),
                 Source::Values { values } => (
                     self.detect_values(configured, values, &constraints).await,
                     VALUES_SOURCE,

@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 use crate::fake_az::{CLIENT, CONTOSO, Call, DEV, FABRIKAM, FakeAz, PROD, World};
 use crate::support::{
-    App, TestResult, assert_valid, detect_params, env_value, error_kind, sign_in_dirs,
+    App, TestResult, assert_valid, at, detect_params, env_value, error_kind, sign_in_dirs,
     sign_in_params,
 };
 
@@ -108,7 +108,9 @@ async fn a_typed_secret_reaches_az_and_env_and_no_other_line() -> TestResult {
         .await?;
     assert_eq!(error_kind(&refused), Some("accessDenied"), "{refused}");
     let mut both = typed.clone();
-    both["clientCertificatePath"] = json!("/sp.pem");
+    both.as_object_mut()
+        .ok_or("not an object")?
+        .insert("clientCertificatePath".to_owned(), json!("/sp.pem"));
     let malformed = fixture
         .app
         .call(
@@ -117,7 +119,7 @@ async fn a_typed_secret_reaches_az_and_env_and_no_other_line() -> TestResult {
         )
         .await?;
     assert_eq!(error_kind(&malformed), Some("invalidParams"), "{malformed}");
-    assert!(sign_in_dirs(fixture.state.path())?.is_empty());
+    assert_eq!(sign_in_dirs(fixture.state.path())?, Vec::<String>::new());
 
     fixture.az.world().login_error = None;
     let identity = fixture
@@ -128,9 +130,9 @@ async fn a_typed_secret_reaches_az_and_env_and_no_other_line() -> TestResult {
         )
         .await?;
     assert_valid("signInResult", &identity)?;
-    assert_eq!(identity["kind"], "servicePrincipal");
-    assert_eq!(identity["principal"], CLIENT);
-    assert_eq!(identity["method"], "service_principal");
+    assert_eq!(at(&identity, "/kind"), "servicePrincipal");
+    assert_eq!(at(&identity, "/principal"), CLIENT);
+    assert_eq!(at(&identity, "/method"), "service_principal");
     fixture
         .app
         .result(
@@ -173,7 +175,7 @@ async fn a_typed_secret_reaches_az_and_env_and_no_other_line() -> TestResult {
     assert_eq!(carrying.len(), 1, "{carrying:?}");
     let line: Value = serde_json::from_str(carrying.first().ok_or("no env line")?)?;
     assert_eq!(
-        line["result"].to_string(),
+        at(&line, "/result").to_string(),
         env_line,
         "only env's result carries it"
     );
@@ -244,16 +246,13 @@ async fn detect_reads_a_service_principal_from_the_prefixed_environment() -> Tes
     let env_source = json!([{"kind": "env", "prefix": "CI_"}]);
     let detected = fixture
         .app
-        .result(
-            "detect",
-            detect_params(&env_source, &json!({}), &json!([])),
-        )
+        .result("detect", detect_params(&env_source, &json!({}), &json!([])))
         .await?;
     assert_valid("detectResult", &detected)?;
-    assert_eq!(detected["found"], true);
-    assert_eq!(detected["source"], "env");
-    assert_eq!(detected["identity"]["method"], "service_principal");
-    assert_eq!(detected["identity"]["targets"]["subscription"]["id"], DEV);
+    assert_eq!(at(&detected, "/found"), true);
+    assert_eq!(at(&detected, "/source"), "env");
+    assert_eq!(at(&detected, "/identity/method"), "service_principal");
+    assert_eq!(at(&detected, "/identity/targets/subscription/id"), DEV);
     assert!(!detected.to_string().contains(SECRET));
     let logins = fixture.logins();
     assert_eq!(logins.first().map(|login| login.1.as_str()), Some(CLIENT));
@@ -297,9 +296,9 @@ async fn detect_reuses_an_earlier_blocks_sign_in_and_its_choice() -> TestResult 
         .app
         .result("detect", detect_params(&values, &json!({}), &json!([])))
         .await?;
-    assert_eq!(detected["source"], "values", "{detected}");
-    assert_eq!(detected["identity"]["method"], "device_code");
-    assert_eq!(detected["identity"]["targets"]["subscription"]["id"], DEV);
+    assert_eq!(at(&detected, "/source"), "values", "{detected}");
+    assert_eq!(at(&detected, "/identity/method"), "device_code");
+    assert_eq!(at(&detected, "/identity/targets/subscription/id"), DEV);
     let env = fixture.env().await?;
     let config = PathBuf::from(env_value(&env, "AZURE_CONFIG_DIR").ok_or("no config dir")?);
     assert!(
@@ -310,7 +309,7 @@ async fn detect_reuses_an_earlier_blocks_sign_in_and_its_choice() -> TestResult 
         fs::read_to_string(config.join("msal_token_cache.json"))?,
         "earlier tokens"
     );
-    assert!(fixture.logins().is_empty());
+    assert_eq!(fixture.logins(), Vec::new());
 
     // Outputs that hold a service principal sign it in afresh.
     let values = json!([{"kind": "values", "values": {
@@ -324,7 +323,8 @@ async fn detect_reuses_an_earlier_blocks_sign_in_and_its_choice() -> TestResult 
         .result("detect", detect_params(&values, &json!({}), &json!([])))
         .await?;
     assert_eq!(
-        detected["identity"]["method"], "service_principal",
+        at(&detected, "/identity/method"),
+        "service_principal",
         "{detected}"
     );
     assert_eq!(fixture.logins().len(), 1);

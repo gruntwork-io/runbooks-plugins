@@ -120,7 +120,7 @@ impl ScriptedAz {
     }
 
     /// What the last `login` read on standard input, without line endings.
-    pub fn stdin(&self) -> Result<String, Box<dyn Error>> {
+    pub(crate) fn stdin(&self) -> Result<String, Box<dyn Error>> {
         let stdin = fs::read_to_string(self.dir.path().join("stdin"))?;
         Ok(stdin.trim_end_matches(['\r', '\n']).to_owned())
     }
