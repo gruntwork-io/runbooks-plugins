@@ -19,6 +19,7 @@ time = { version = "0.3.55", features = ["serde", "formatting", "parsing"] }
 tokio = "1.54.1"
 typify = "0.10.1"
 jsonschema = { version = "0.61.2", default-features = false }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
