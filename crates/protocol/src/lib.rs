@@ -49,6 +49,7 @@ pub mod credential {
         }
 
         /// No source held a credential that matches.
+        #[must_use]
         pub fn not_found() -> Self {
             Self::Variant1 {
                 found: false.into(),

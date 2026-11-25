@@ -61,13 +61,21 @@ fn round_trip<T: Serialize + DeserializeOwned>(def: &str, value: &Value) -> Test
 }
 
 /// Asserts both the schema and the type refuse `value`.
-fn assert_refused<T: DeserializeOwned>(def: &str, value: Value) -> TestResult {
-    assert!(!validator(def)?.is_valid(&value), "{def} accepted {value}");
+fn assert_refused<T: DeserializeOwned>(def: &str, value: &Value) -> TestResult {
+    assert!(!validator(def)?.is_valid(value), "{def} accepted {value}");
     assert!(
         serde_json::from_value::<T>(value.clone()).is_err(),
         "the type for {def} accepted {value}"
     );
     Ok(())
+}
+
+/// Takes the member `key` out of the object `value`.
+fn take_member(mut value: Value, key: &str) -> Result<Value, Box<dyn Error>> {
+    Ok(value
+        .as_object_mut()
+        .and_then(|object| object.remove(key))
+        .ok_or_else(|| format!("no `{key}` member"))?)
 }
 
 #[test]
@@ -116,7 +124,7 @@ fn sign_in_request_round_trips() -> TestResult {
     round_trip::<base::Request>("base.schema.json#/$defs/request", &request)?;
     round_trip::<credential::SignInParams>(
         "credential.schema.json#/$defs/signInParams",
-        &request["params"],
+        request.get("params").ok_or("no params")?,
     )
 }
 
@@ -124,11 +132,9 @@ fn sign_in_request_round_trips() -> TestResult {
 fn sign_in_prompt_round_trips_and_names_its_request() -> TestResult {
     let notification = sign_in_prompt();
     round_trip::<base::Notification>("base.schema.json#/$defs/notification", &notification)?;
-    round_trip::<credential::SignInPrompt>(
-        "credential.schema.json#/$defs/signInPrompt",
-        &notification["params"],
-    )?;
-    let prompt: credential::SignInPrompt = serde_json::from_value(notification["params"].clone())?;
+    let params = notification.get("params").ok_or("no params")?;
+    round_trip::<credential::SignInPrompt>("credential.schema.json#/$defs/signInPrompt", params)?;
+    let prompt: credential::SignInPrompt = serde_json::from_value(params.clone())?;
     let request: base::Request = serde_json::from_value(sign_in_request())?;
     assert_eq!(prompt.request, request.id);
     Ok(())
@@ -140,14 +146,17 @@ fn sign_in_result_round_trips() -> TestResult {
     round_trip::<base::ResultResponse>("base.schema.json#/$defs/resultResponse", &response)?;
     round_trip::<credential::SignInResult>(
         "credential.schema.json#/$defs/signInResult",
-        &response["result"],
+        response.get("result").ok_or("no result")?,
     )
 }
 
 #[test]
 fn unknown_fields_are_ignored() -> TestResult {
-    let mut params = sign_in_request()["params"].take();
-    params["addedInALaterVersion"] = json!(true);
+    let mut params = take_member(sign_in_request(), "params")?;
+    params
+        .as_object_mut()
+        .ok_or("not an object")?
+        .insert("addedInALaterVersion".to_owned(), json!(true));
     assert_valid("credential.schema.json#/$defs/signInParams", &params)?;
     let typed: credential::SignInParams = serde_json::from_value(params)?;
     assert_eq!(typed.method, "sso");
@@ -161,47 +170,68 @@ fn a_request_without_a_method_is_refused() -> TestResult {
         .as_object_mut()
         .ok_or("not an object")?
         .remove("method");
-    assert_refused::<base::Request>("base.schema.json#/$defs/request", request)
+    assert_refused::<base::Request>("base.schema.json#/$defs/request", &request)
 }
 
 #[test]
 fn a_request_id_that_is_not_an_integer_or_string_is_refused() -> TestResult {
     for id in [json!(1.5), json!(null), json!({"n": 1})] {
         let mut request = sign_in_request();
-        request["id"] = id;
-        assert_refused::<base::Request>("base.schema.json#/$defs/request", request)?;
+        request
+            .as_object_mut()
+            .ok_or("not an object")?
+            .insert("id".to_owned(), id);
+        assert_refused::<base::Request>("base.schema.json#/$defs/request", &request)?;
     }
     Ok(())
 }
 
 #[test]
 fn sign_in_params_without_a_method_are_refused() -> TestResult {
-    let mut params = sign_in_request()["params"].take();
+    let mut params = take_member(sign_in_request(), "params")?;
     params
         .as_object_mut()
         .ok_or("not an object")?
         .remove("method");
-    assert_refused::<credential::SignInParams>("credential.schema.json#/$defs/signInParams", params)
+    assert_refused::<credential::SignInParams>(
+        "credential.schema.json#/$defs/signInParams",
+        &params,
+    )
 }
 
 #[test]
 fn a_prompt_of_an_unknown_kind_is_refused() -> TestResult {
-    let mut params = sign_in_prompt()["params"].take();
-    params["kind"] = json!("openBrowser");
-    assert_refused::<credential::SignInPrompt>("credential.schema.json#/$defs/signInPrompt", params)
+    let mut params = take_member(sign_in_prompt(), "params")?;
+    params
+        .as_object_mut()
+        .ok_or("not an object")?
+        .insert("kind".to_owned(), json!("openBrowser"));
+    assert_refused::<credential::SignInPrompt>(
+        "credential.schema.json#/$defs/signInPrompt",
+        &params,
+    )
 }
 
 #[test]
 fn an_expiry_that_is_not_a_date_time_is_refused() -> TestResult {
-    let mut result = sign_in_response()["result"].take();
-    result["expiresAt"] = json!("tomorrow");
-    assert_refused::<credential::SignInResult>("credential.schema.json#/$defs/signInResult", result)
+    let mut result = take_member(sign_in_response(), "result")?;
+    result
+        .as_object_mut()
+        .ok_or("not an object")?
+        .insert("expiresAt".to_owned(), json!("tomorrow"));
+    assert_refused::<credential::SignInResult>(
+        "credential.schema.json#/$defs/signInResult",
+        &result,
+    )
 }
 
 #[test]
 fn a_detection_source_of_an_unknown_kind_is_refused() -> TestResult {
     let params = json!({"sources":[{"kind":"keychain"}],"pins":{},"requirements":[]});
-    assert_refused::<credential::DetectParams>("credential.schema.json#/$defs/detectParams", params)
+    assert_refused::<credential::DetectParams>(
+        "credential.schema.json#/$defs/detectParams",
+        &params,
+    )
 }
 
 #[test]
@@ -252,7 +282,7 @@ fn the_named_error_codes_are_the_schemas() -> TestResult {
 #[test]
 fn constructed_detect_results_are_valid() -> TestResult {
     let identity: credential::Identity =
-        serde_json::from_value(sign_in_response()["result"].take())?;
+        serde_json::from_value(take_member(sign_in_response(), "result")?)?;
     for result in [
         credential::DetectResult::found(identity, "env"),
         credential::DetectResult::not_found(),
