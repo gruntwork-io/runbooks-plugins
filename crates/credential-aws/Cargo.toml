@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 aws-sdk-iam.workspace = true
+aws-sdk-sso.workspace = true
+aws-sdk-ssooidc.workspace = true
 aws-sdk-sts.workspace = true
 runbooks-plugin-protocol.workspace = true
 runbooks-plugin-transport.workspace = true
@@ -20,7 +22,7 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
 jsonschema.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros"] }
+tokio = { workspace = true, features = ["io-util", "macros", "test-util"] }
 
 [lints]
 workspace = true
