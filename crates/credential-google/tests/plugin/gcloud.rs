@@ -12,7 +12,7 @@ async fn configure_offers_the_gcloud_method_and_named_sources() -> TestResult {
     let offered = app.configure(dir.path()).await?;
     assert_eq!(at(&offered, "/sources"), json!(["adc", "gcloud"]));
     assert_eq!(
-        at(&offered, "/methods/1"),
+        at(&offered, "/methods/2"),
         json!({
             "name": "gcloud",
             "label": "gcloud Config",

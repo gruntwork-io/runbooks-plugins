@@ -13,6 +13,7 @@ mod credential;
 mod crypto;
 mod files;
 mod gcloud;
+mod oauth;
 mod plugin;
 mod secret;
 mod session;
@@ -22,6 +23,6 @@ pub use api::{
     ApiError, GoogleApi, HttpApi, MAX_RESPONSE_BYTES, Network, NetworkError, OAuthError, Project,
     ProjectPage, TIMEOUT, TOKEN_URL, Token, TokenInfo, TokenRequest,
 };
-pub use crypto::{Crypto, CryptoError, JwtClaims, NoCrypto};
+pub use crypto::{Crypto, CryptoError, FlowSecrets, JwtClaims, NoCrypto};
 pub use plugin::{Connect, GooglePlugin, Host, MAX_PROJECTS};
 pub use secret::Secret;

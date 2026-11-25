@@ -250,7 +250,7 @@ pub(crate) async fn access_token<A: GoogleApi, C: Crypto>(
     Ok(token.access_token)
 }
 
-fn crypto_error(error: &CryptoError) -> PluginError {
+pub(crate) fn crypto_error(error: &CryptoError) -> PluginError {
     match error {
         CryptoError::Unavailable(_) => PluginError::new(ErrorKind::Internal, error.to_string()),
         CryptoError::InvalidKey => PluginError::new(

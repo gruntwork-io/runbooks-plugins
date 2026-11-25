@@ -4,15 +4,19 @@ use runbooks_credential_google::{GooglePlugin, Host, OAuthError};
 use serde_json::json;
 
 use crate::support::{
-    App, BARE_TOKEN, FakeCrypto, SA_KEY, SA_PRIVATE_KEY, TestResult, USER_ADC, USER_CLIENT_SECRET,
-    USER_REFRESH_TOKEN, detect, gcloud_root, google, now, sign_in,
+    App, BARE_TOKEN, FakeCrypto, OAUTH_CLIENT_ID, SA_KEY, SA_PRIVATE_KEY, STATE, TestResult,
+    USER_ADC, USER_CLIENT_SECRET, USER_REFRESH_TOKEN, VERIFIER, WAIT, detect, gcloud_root, google,
+    now, redirect, sign_in, start_oauth,
 };
 
-const SECRETS: [&str; 4] = [
+const CODE: &str = "SENTINEL-CODE";
+const SECRETS: [&str; 6] = [
     SA_PRIVATE_KEY,
     USER_REFRESH_TOKEN,
     USER_CLIENT_SECRET,
     BARE_TOKEN,
+    VERIFIER,
+    CODE,
 ];
 
 /// Every call, on its success and failure paths, with secrets in sign-in
@@ -22,6 +26,7 @@ const SECRETS: [&str; 4] = [
 async fn no_line_but_envs_result_carries_a_secret() -> TestResult {
     let dir = tempfile::tempdir()?;
     let google = google();
+    google.code(CODE, Ok(Some(USER_REFRESH_TOKEN)));
     let root = gcloud_root(dir.path(), Some(USER_ADC))?;
     let env = [
         ("GOOGLE_OAUTH_ACCESS_TOKEN", BARE_TOKEN),
@@ -59,7 +64,22 @@ async fn no_line_but_envs_result_carries_a_secret() -> TestResult {
     app.error("signIn", sign_in("gcloud", &typed), "invalidParams")
         .await?;
 
+    let half_client = json!({"clientSecret": USER_CLIENT_SECRET});
+    app.error("signIn", sign_in("oauth", &half_client), "invalidParams")
+        .await?;
+
     // The happy paths, ending in env.
+    let fields = json!({"clientId": OAUTH_CLIENT_ID, "clientSecret": USER_CLIENT_SECRET});
+    let (id, url) = start_oauth(&mut app, sign_in("oauth", &fields)).await?;
+    let page = redirect(&url, &format!("state={STATE}&code={CODE}")).await?;
+    for secret in SECRETS {
+        assert!(
+            !page.contains(secret),
+            "the browser was shown {secret}: {page}"
+        );
+    }
+    let response = app.response("signIn", id, WAIT).await?;
+    assert!(response.get("result").is_some(), "{response}");
     app.ok("detect", "detectResult", detect(&json!([{"kind": "env"}])))
         .await?;
     let gcloud = json!([{"kind": "named", "name": "adc"}, {"kind": "named", "name": "gcloud"}]);

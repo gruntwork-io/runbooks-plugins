@@ -9,21 +9,25 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use jsonschema::{Draft, Registry, Validator};
+use reqwest::Url;
 use runbooks_credential_google::{
-    ApiError, Crypto, CryptoError, GoogleApi, GooglePlugin, Host, JwtClaims, OAuthError, Project,
-    ProjectPage, Secret, Token, TokenInfo, TokenRequest,
+    ApiError, Crypto, CryptoError, FlowSecrets, GoogleApi, GooglePlugin, Host, JwtClaims,
+    OAuthError, Project, ProjectPage, Secret, Token, TokenInfo, TokenRequest,
 };
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_transport::{ServeError, serve};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, duplex};
+use tokio::io::{
+    AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, duplex,
+};
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-const WAIT: Duration = Duration::from_secs(10);
+pub const WAIT: Duration = Duration::from_secs(10);
 const SCHEMAS: [&str; 2] = ["base.schema.json", "credential.schema.json"];
 const ROOT: &str = "json-schema:///";
 
@@ -77,6 +81,8 @@ struct GoogleState {
     /// What the token endpoint answers, by refresh token, or `"jwt"` for any
     /// service account assertion.
     tokens: HashMap<String, Result<Grant, OAuthError>>,
+    /// What exchanging an authorization code answers: its refresh token.
+    codes: HashMap<String, Result<Option<&'static str>, OAuthError>>,
     projects: Vec<Project>,
     /// What `projects.get` answers when it isn't one of `projects`.
     denied: Vec<String>,
@@ -95,6 +101,15 @@ impl Google {
 
     pub(crate) fn grant(&self, refresh_token: &str, grant: Result<Grant, OAuthError>) -> &Self {
         self.with(|state| state.tokens.insert(refresh_token.to_owned(), grant));
+        self
+    }
+
+    pub(crate) fn code(
+        &self,
+        code: &str,
+        refresh_token: Result<Option<&'static str>, OAuthError>,
+    ) -> &Self {
+        self.with(|state| state.codes.insert(code.to_owned(), refresh_token));
         self
     }
 
@@ -188,6 +203,20 @@ impl GoogleApi for Google {
         let key = match &request {
             TokenRequest::Refresh { refresh_token, .. } => refresh_token.expose().to_owned(),
             TokenRequest::JwtBearer { .. } => "jwt".to_owned(),
+            TokenRequest::AuthorizationCode { code, .. } => {
+                let exchanged = self.with(|state| {
+                    state.token_requests.push(request.clone());
+                    state.codes.get(code.expose()).cloned()
+                });
+                return future::ready(match exchanged {
+                    Some(Ok(refresh_token)) => Ok(Token {
+                        access_token: Secret::new("ya29.from-code"),
+                        refresh_token: refresh_token.map(Secret::new),
+                    }),
+                    Some(Err(error)) => Err(ApiError::Refused(error)),
+                    None => Err(ApiError::Refused(OAuthError::InvalidGrant)),
+                });
+            }
         };
         let answer = self.with(|state| {
             state.token_requests.push(request);
@@ -196,6 +225,7 @@ impl GoogleApi for Google {
         future::ready(match answer {
             Some(Ok(grant)) => Ok(Token {
                 access_token: Secret::new(grant.access_token),
+                refresh_token: None,
             }),
             Some(Err(error)) => Err(ApiError::Refused(error)),
             None => Err(ApiError::Refused(OAuthError::InvalidGrant)),
@@ -258,7 +288,23 @@ impl Crypto for FakeCrypto {
             .push(claims.clone());
         Ok(Secret::new(format!("header.{}.signature", claims.issuer)))
     }
+
+    fn flow_secrets(&self) -> Result<FlowSecrets, CryptoError> {
+        Ok(FlowSecrets {
+            state: STATE.to_owned(),
+            verifier: Secret::new(VERIFIER),
+            challenge: CHALLENGE.to_owned(),
+        })
+    }
+
+    fn same(&self, left: &[u8], right: &[u8]) -> bool {
+        left == right
+    }
 }
+
+pub const STATE: &str = "state-4b1d";
+pub const VERIFIER: &str = "SENTINEL-VERIFIER";
+pub const CHALLENGE: &str = "challenge-of-the-verifier";
 
 /// The app: it writes the plugin's input and reads every line it writes.
 pub(crate) struct App {
@@ -305,20 +351,37 @@ impl App {
 
     /// Sends one request and returns its response, after any notifications.
     pub(crate) async fn call(&mut self, method: &str, params: Value) -> TestResult<Value> {
+        let id = self.send(method, params).await?;
+        self.response(method, id, WAIT).await
+    }
+
+    /// Sends one request and returns its id.
+    pub(crate) async fn send(&mut self, method: &str, params: Value) -> TestResult<u64> {
         self.next_id += 1;
         let id = self.next_id;
         let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let stdin = self.stdin.as_mut().ok_or("the plugin's input is closed")?;
         stdin.write_all(format!("{request}\n").as_bytes()).await?;
+        Ok(id)
+    }
+
+    /// The next line the plugin writes, recorded as written for `method`.
+    pub async fn next_message(&mut self, method: &str, wait: Duration) -> TestResult<Value> {
+        let line = timeout(wait, self.stdout.next_line())
+            .await??
+            .ok_or("the plugin's output ended")?;
+        let message: Value = serde_json::from_str(&line)?;
+        self.message
+            .validate(&message)
+            .map_err(|e| format!("{line}: {e}"))?;
+        self.transcript.push((method.to_owned(), line));
+        Ok(message)
+    }
+
+    /// The response to request `id`, after any notifications.
+    pub async fn response(&mut self, method: &str, id: u64, wait: Duration) -> TestResult<Value> {
         loop {
-            let line = timeout(WAIT, self.stdout.next_line())
-                .await??
-                .ok_or("the plugin's output ended")?;
-            let message: Value = serde_json::from_str(&line)?;
-            self.message
-                .validate(&message)
-                .map_err(|e| format!("{line}: {e}"))?;
-            self.transcript.push((method.to_owned(), line));
+            let message = self.next_message(method, wait).await?;
             if at(&message, "/id") == id {
                 return Ok(message);
             }
@@ -471,4 +534,52 @@ pub(crate) fn gcloud_root(dir: &Path, adc: Option<&str>) -> TestResult<String> {
         .to_str()
         .ok_or("the temporary directory isn't UTF-8")?
         .to_owned())
+}
+
+pub const OAUTH_CLIENT_ID: &str = "client.apps.googleusercontent.com";
+
+/// Starts an `oauth` sign-in and returns its request id and the URL the
+/// person is asked to open.
+pub async fn start_oauth(app: &mut App, params: Value) -> TestResult<(u64, Url)> {
+    let id = app.send("signIn", params).await?;
+    let prompt = app.next_message("signIn", WAIT).await?;
+    assert_eq!(prompt["method"], "signIn.prompt", "{prompt}");
+    assert_eq!(prompt["params"]["kind"], "openUrl", "{prompt}");
+    assert_eq!(prompt["params"]["request"], id, "{prompt}");
+    let url = prompt["params"]["url"].as_str().ok_or("no url")?;
+    Ok((id, Url::parse(url)?))
+}
+
+/// The value of the query parameter `name`.
+pub fn query(url: &Url, name: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
+/// The person's browser, sent back to the redirect URI in the sign-in URL
+/// with `query`, as Google's redirect does. Returns the plugin's response.
+pub async fn redirect(sign_in_url: &Url, query_string: &str) -> TestResult<String> {
+    let redirect_uri = query(sign_in_url, "redirect_uri").ok_or("no redirect_uri")?;
+    let redirect_uri = Url::parse(&redirect_uri)?;
+    let host = format!(
+        "{}:{}",
+        redirect_uri.host_str().ok_or("no host")?,
+        redirect_uri.port().ok_or("no port")?
+    );
+    let path = format!("{}?{query_string}", redirect_uri.path());
+    request(
+        &host,
+        &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\n\r\n"),
+    )
+    .await
+}
+
+/// Sends `head` to `host` and returns what comes back.
+pub async fn request(host: &str, head: &str) -> TestResult<String> {
+    let mut stream = TcpStream::connect(host).await?;
+    stream.write_all(head.as_bytes()).await?;
+    let mut response = String::new();
+    timeout(WAIT, stream.read_to_string(&mut response)).await??;
+    Ok(response)
 }

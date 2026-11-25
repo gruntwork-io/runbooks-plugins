@@ -1,5 +1,6 @@
 //! The cryptography the plugin needs and the approved crates don't provide:
-//! RS256 signing, SHA-256, base64url and a secure random source. Every use
+//! RS256 signing, SHA-256, base64url, a secure random source and a
+//! constant-time comparison. Every use
 //! goes through [`Crypto`], so filling it in later touches this module and
 //! `main` only. Until then the binary runs with [`NoCrypto`], and the sign-ins
 //! that need it fail with kind `internal`.
@@ -38,6 +39,30 @@ pub trait Crypto: Send + Sync + 'static {
     ///
     /// [`CryptoError::InvalidKey`] if `private_key` is not such a key.
     fn sign_jwt(&self, claims: &JwtClaims, private_key: &Secret) -> Result<Secret, CryptoError>;
+
+    /// Fresh secrets for one browser sign-in: a random `state` and PKCE code
+    /// verifier (RFC 7636: 43 to 128 unreserved characters, from at least
+    /// 32 random bytes), and the verifier's S256 challenge, the base64url
+    /// SHA-256 of it without padding.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Unavailable`] if there is no secure random source.
+    fn flow_secrets(&self) -> Result<FlowSecrets, CryptoError>;
+
+    /// Whether `left` and `right` are equal, taking time that depends on
+    /// their lengths only, not on where they differ.
+    fn same(&self, left: &[u8], right: &[u8]) -> bool;
+}
+
+/// The secrets of one browser sign-in.
+#[derive(Clone, Debug)]
+pub struct FlowSecrets {
+    /// Sent to Google in the sign-in URL and checked on the way back, so it
+    /// is shown to the person; it guards only this one sign-in.
+    pub state: String,
+    pub verifier: Secret,
+    pub challenge: String,
 }
 
 /// Why a [`Crypto`] call failed.
@@ -60,5 +85,14 @@ impl Crypto for NoCrypto {
         Err(CryptoError::Unavailable(
             "sign a service account key's token request",
         ))
+    }
+
+    fn flow_secrets(&self) -> Result<FlowSecrets, CryptoError> {
+        Err(CryptoError::Unavailable("start a browser sign-in"))
+    }
+
+    /// Never reached: without `flow_secrets` no sign-in starts.
+    fn same(&self, _left: &[u8], _right: &[u8]) -> bool {
+        false
     }
 }

@@ -20,6 +20,7 @@ use crate::credential::{Credential, MAX_DOCUMENT_BYTES, Origin, api_error, parse
 use crate::crypto::Crypto;
 use crate::files::{self, CREDENTIALS_FILE, ReadError};
 use crate::gcloud::{ADC_LOGIN, Configuration, ConfigurationName, Root};
+use crate::oauth::{self, ClientFields, DEFAULT_SCOPES};
 use crate::session::{self, Candidate, Constraints, PROJECT, Prover, Session, invalid_params};
 use crate::sources::{self, FoundVars, Prefix, VarCredential};
 
@@ -31,6 +32,7 @@ const MAX_CA_BUNDLE_BYTES: usize = 1024 * 1024;
 
 const SERVICE_ACCOUNT: &str = "service_account";
 const GCLOUD: &str = "gcloud";
+const OAUTH: &str = "oauth";
 const ADC: &str = "adc";
 const CONFIGURATION_NAME_RULE: &str =
     "a gcloud configuration name: lower case letters, digits and hyphens, starting with a letter";
@@ -215,6 +217,40 @@ impl<A: GoogleApi, C: Crypto> GooglePlugin<A, C> {
             credential: Credential::Document(document),
             method: SERVICE_ACCOUNT.to_owned(),
             project,
+            region: None,
+            zone: None,
+            configuration: None,
+        };
+        self.sign_in_with(candidate, constraints).await
+    }
+
+    /// Google sign-in in the browser, asking for the block's required scopes,
+    /// or the app's default ones if it requires none.
+    async fn sign_in_oauth(
+        &self,
+        fields: HashMap<String, String>,
+        constraints: &Constraints,
+        prompts: &Prompts,
+    ) -> Result<Session, PluginError> {
+        let mut fields =
+            MethodFields::new(OAUTH, fields, &["clientId", "clientSecret", "clientFile"])?;
+        let client = ClientFields {
+            id: fields.take("clientId"),
+            secret: fields.take("clientSecret").map(Secret::new),
+            file: fields.take("clientFile"),
+        };
+        let client = oauth::resolve_client(client, &self.host.env).await?;
+        let (api, _) = self.configured()?;
+        let scopes = if constraints.scopes.is_empty() {
+            DEFAULT_SCOPES.map(str::to_owned).to_vec()
+        } else {
+            constraints.scopes.clone()
+        };
+        let document = oauth::sign_in(&*api, &self.crypto, &client, &scopes, prompts).await?;
+        let candidate = Candidate {
+            credential: Credential::Document(document),
+            method: OAUTH.to_owned(),
+            project: None,
             region: None,
             zone: None,
             configuration: None,
@@ -465,6 +501,15 @@ fn methods() -> Vec<Method> {
             name: SERVICE_ACCOUNT.to_owned(),
         },
         Method {
+            fields: vec![
+                field("clientId", "OAuth client ID", false),
+                field("clientSecret", "OAuth client secret", true),
+                field("clientFile", "OAuth client file", false),
+            ],
+            label: "Google Sign-In".to_owned(),
+            name: OAUTH.to_owned(),
+        },
+        Method {
             fields: vec![field("configuration", "gcloud configuration", false)],
             label: "gcloud Config".to_owned(),
             name: GCLOUD.to_owned(),
@@ -628,7 +673,7 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
     async fn sign_in(
         &self,
         params: SignInParams,
-        _prompts: Prompts,
+        prompts: Prompts,
     ) -> Result<SignInResult, PluginError> {
         let constraints = Constraints::parse(&params.pins, &params.requirements)?;
         let session = match params.method.as_str() {
@@ -636,10 +681,14 @@ impl<A: GoogleApi, C: Crypto> CredentialPlugin for GooglePlugin<A, C> {
                 self.sign_in_service_account(params.fields, &constraints)
                     .await?
             }
+            OAUTH => {
+                self.sign_in_oauth(params.fields, &constraints, &prompts)
+                    .await?
+            }
             GCLOUD => self.sign_in_gcloud(params.fields, &constraints).await?,
             other => {
                 return Err(invalid_params(format!(
-                    "this plugin has no sign-in method {other:?}; its methods are {SERVICE_ACCOUNT} and {GCLOUD}"
+                    "this plugin has no sign-in method {other:?}; its methods are {SERVICE_ACCOUNT}, {OAUTH} and {GCLOUD}"
                 )));
             }
         };

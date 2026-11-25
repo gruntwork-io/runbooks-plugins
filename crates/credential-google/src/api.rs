@@ -43,6 +43,15 @@ pub enum TokenRequest {
         /// The compact JWS.
         assertion: Secret,
     },
+    /// The code Google's redirect brought back from a browser sign-in, with
+    /// its PKCE verifier.
+    AuthorizationCode {
+        client_id: String,
+        client_secret: Secret,
+        code: Secret,
+        code_verifier: Secret,
+        redirect_uri: String,
+    },
 }
 
 /// What the token endpoint grants.
@@ -50,6 +59,8 @@ pub enum TokenRequest {
 pub struct Token {
     /// The access token.
     pub access_token: Secret,
+    /// Only an authorization code's exchange returns one.
+    pub refresh_token: Option<Secret>,
 }
 
 /// What tokeninfo says about an access token.
@@ -258,6 +269,20 @@ impl GoogleApi for HttpApi {
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", assertion.expose()),
             ]),
+            TokenRequest::AuthorizationCode {
+                client_id,
+                client_secret,
+                code,
+                code_verifier,
+                redirect_uri,
+            } => form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code.expose()),
+                ("client_id", client_id),
+                ("client_secret", client_secret.expose()),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", code_verifier.expose()),
+            ]),
         }?;
         let response = self
             .client
@@ -270,6 +295,7 @@ impl GoogleApi for HttpApi {
         let token: TokenBody = parse(response).await?;
         Ok(Token {
             access_token: token.access_token,
+            refresh_token: token.refresh_token,
         })
     }
 
@@ -436,6 +462,8 @@ fn error_from(status: StatusCode, body: &[u8]) -> ApiError {
 #[derive(Deserialize)]
 struct TokenBody {
     access_token: Secret,
+    #[serde(default)]
+    refresh_token: Option<Secret>,
 }
 
 #[derive(Deserialize)]
