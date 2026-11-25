@@ -112,6 +112,20 @@ pub(crate) fn invalid_params(message: impl Into<String>) -> PluginError {
     PluginError::new(ErrorKind::InvalidParams, message)
 }
 
+/// `name` as an error may show it: a name that isn't an identifier could be
+/// pasted material.
+pub(crate) fn shown_name(name: &str) -> &str {
+    let identifier = name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if identifier {
+        name
+    } else {
+        "(a name that is not an identifier)"
+    }
+}
+
 /// A credential to prove, with what came with it.
 #[derive(Clone, Debug)]
 pub(crate) struct Candidate {

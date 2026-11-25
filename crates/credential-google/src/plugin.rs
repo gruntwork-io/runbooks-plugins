@@ -20,7 +20,9 @@ use crate::credential::{Credential, MAX_DOCUMENT_BYTES, Origin, api_error, parse
 use crate::files::{self, CREDENTIALS_FILE, ReadError};
 use crate::gcloud::{ADC_LOGIN, Configuration, ConfigurationName, Root};
 use crate::oauth::{self, ClientFields, DEFAULT_SCOPES};
-use crate::session::{self, Candidate, Constraints, PROJECT, Prover, Session, invalid_params};
+use crate::session::{
+    self, Candidate, Constraints, PROJECT, Prover, Session, invalid_params, shown_name,
+};
 use crate::sources::{self, FoundVars, Prefix, VarCredential};
 
 /// The most projects `targets` lists, as the app did.
@@ -426,22 +428,11 @@ impl MethodFields {
         fields: HashMap<String, String>,
         known: &[&str],
     ) -> Result<Self, PluginError> {
-        // A name that isn't an identifier could be pasted material.
         let mut unknown: Vec<&str> = fields
             .keys()
             .map(String::as_str)
             .filter(|name| !known.contains(name))
-            .map(|name| {
-                let identifier = name.len() <= 64
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-                if identifier {
-                    name
-                } else {
-                    "(a name that is not an identifier)"
-                }
-            })
+            .map(shown_name)
             .collect();
         if !unknown.is_empty() {
             unknown.sort_unstable();
