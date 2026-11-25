@@ -1,7 +1,8 @@
 //! The block's state directory: one `az` config directory per sign-in, each
-//! readable by its owner only. `az` writes its tokens there, so a block's
-//! sign-in never changes the person's own `~/.azure`, and two blocks never
-//! share one.
+//! readable by its owner only.
+//!
+//! `az` writes its tokens there, so a block's sign-in never changes the
+//! person's own `~/.azure`, and two blocks never share one.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -37,19 +38,29 @@ const LOGIN_FILES: [&str; 8] = [
 /// A login file larger than this is not one `az` wrote.
 const MAX_LOGIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The block's state directory, which holds its sign-in directories.
 #[derive(Clone, Debug)]
 pub struct StateDir(PathBuf);
 
 impl StateDir {
-    pub fn new(path: PathBuf) -> Self {
+    /// The state directory at `path`.
+    #[must_use]
+    pub const fn new(path: PathBuf) -> Self {
         Self(path)
     }
 
+    /// Where the state directory is.
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.0
     }
 
     /// A new, empty sign-in directory.
+    ///
+    /// # Errors
+    ///
+    /// `internal` when it cannot be created, or the state directory already
+    /// holds too many sign-in directories.
     pub async fn create(&self) -> Result<PathBuf, PluginError> {
         let state = self.0.clone();
         blocking(move || create_private_dir(&state)).await
@@ -57,6 +68,11 @@ impl StateDir {
 
     /// A new sign-in directory holding a copy of the login in `from`, or
     /// `None` if `from` holds no login.
+    ///
+    /// # Errors
+    ///
+    /// `internal` when the sign-in directory cannot be created or the login
+    /// cannot be copied.
     pub async fn copy_login(&self, from: &Path) -> Result<Option<PathBuf>, PluginError> {
         let (state, from) = (self.0.clone(), from.to_owned());
         blocking(move || {
@@ -80,30 +96,40 @@ impl StateDir {
     }
 
     /// Deletes one sign-in directory. A directory already gone is not an error.
+    ///
+    /// # Errors
+    ///
+    /// `internal` when the directory cannot be deleted.
     pub async fn remove(&self, dir: &Path) -> Result<(), PluginError> {
         let dir = dir.to_owned();
         blocking(move || remove_dir(&dir)).await
     }
 
     /// Deletes every sign-in directory in the state directory.
+    ///
+    /// # Errors
+    ///
+    /// `internal` when the state directory cannot be read or a sign-in
+    /// directory cannot be deleted.
     pub async fn remove_all(&self) -> Result<(), PluginError> {
         let state = self.0.clone();
-        blocking(move || {
-            let entries = match fs::read_dir(&state) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(state_error(&state, &error)),
-            };
-            for entry in entries {
-                let entry = entry.map_err(|error| state_error(&state, &error))?;
-                if entry.file_name().to_string_lossy().starts_with(PREFIX) {
-                    remove_dir(&entry.path())?;
-                }
-            }
-            Ok(())
-        })
-        .await
+        blocking(move || remove_sign_in_dirs(&state)).await
     }
+}
+
+fn remove_sign_in_dirs(state: &Path) -> Result<(), PluginError> {
+    let entries = match fs::read_dir(state) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(state_error(state, &error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| state_error(state, &error))?;
+        if entry.file_name().to_string_lossy().starts_with(PREFIX) {
+            remove_dir(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 async fn blocking<T: Send + 'static>(
