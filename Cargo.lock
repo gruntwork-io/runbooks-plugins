@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "runbooks-credential-aws"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-config",
  "aws-runtime",
@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "runbooks-credential-azure"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "jsonschema",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "runbooks-credential-google"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "jsonschema",
@@ -1897,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "runbooks-plugin-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jsonschema",
  "serde",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "runbooks-plugin-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jsonschema",
  "runbooks-plugin-protocol",

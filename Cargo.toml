@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.100"
 repository = "https://github.com/gruntwork-io/runbooks-plugins"
@@ -32,8 +32,8 @@ aws-types = "1.7.0"
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 jsonschema = { version = "0.61.2", default-features = false }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
-runbooks-plugin-protocol = { path = "crates/protocol", version = "0.1.0" }
-runbooks-plugin-transport = { path = "crates/transport", version = "0.1.0" }
+runbooks-plugin-protocol = { path = "crates/protocol", version = "0.2.0" }
+runbooks-plugin-transport = { path = "crates/transport", version = "0.2.0" }
 # Google: its aws-lc-rs provider's RSA signing, SHA-256 and random source.
 # AWS: reads a CA bundle as the SDK's HTTPS client will, which panics on
 # one it cannot read.
