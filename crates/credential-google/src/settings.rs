@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 
-use runbooks_plugin_transport::PluginError;
+use runbooks_plugin_transport::{PluginError, shown_name};
 
-use crate::session::{Candidate, invalid_params, shown_name};
+use crate::session::{Candidate, invalid_params};
 
 const DEFAULT_REGION: &str = "defaultRegion";
 const DEFAULT_ZONE: &str = "defaultZone";
