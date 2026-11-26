@@ -20,6 +20,10 @@ shellcheck = "0.11.0"
 shfmt = "3.14.1"
 jq = "1.8.2"
 gh = "2.104.0"
+# The Azure plugin's az: a contract run of the binary puts it on PATH.
+azure-cli = "2.93.0"
+# Installs azure-cli and locks its Python dependencies.
+uv = "0.13.9"
 
 [settings]
 lockfile = true
