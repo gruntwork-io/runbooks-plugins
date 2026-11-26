@@ -129,6 +129,12 @@ impl<C: Connect> AzurePlugin<C> {
                 ),
             ));
         }
+        if !params.settings.is_empty() {
+            return Err(PluginError::new(
+                ErrorKind::InvalidParams,
+                "configure: Azure has no settings, so the block can set none",
+            ));
+        }
         let network = Network {
             ca_bundle_file: params.ca_bundle_file.map(PathBuf::from),
             proxy: params.proxy,
