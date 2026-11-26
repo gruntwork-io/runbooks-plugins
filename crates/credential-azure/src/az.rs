@@ -692,15 +692,21 @@ fn error_line(stderr: &[String]) -> &str {
     if let Some(error) = lines.clone().find_map(|line| line.strip_prefix("ERROR:")) {
         return error.trim();
     }
-    if let Some(error) = lines
-        .clone()
-        .find(|line| line.split_whitespace().nth(1) == Some("ERROR"))
-    {
+    if let Some(error) = lines.clone().find(|line| is_wrapper_error(line)) {
         return error;
     }
     lines
         .rfind(|line| !line.starts_with("WARNING:") && !line.contains("Warning:"))
         .unwrap_or("az exited with an error")
+}
+
+/// `<name> ERROR <text>`, where `<name>` is ASCII letters, digits, `_` or `-`.
+fn is_wrapper_error(line: &str) -> bool {
+    line.split_once(' ').is_some_and(|(name, rest)| {
+        name.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            && rest.starts_with("ERROR ")
+    })
 }
 
 /// All of `stream`, or `None` once it is longer than [`MAX_STDOUT_BYTES`].
@@ -921,6 +927,22 @@ mod tests {
         assert_eq!(
             error.message(),
             "az login failed: mise ERROR No version is set for shim: az."
+        );
+    }
+
+    #[test]
+    fn a_wrappers_error_is_named_by_letters_digits_underscores_or_hyphens() {
+        let error = failure(
+            "az account list",
+            &stderr(&[
+                "WARNING: ERROR details are in the log file",
+                "az_wrap-2 ERROR No az installed",
+                "Subscription not found.",
+            ]),
+        );
+        assert_eq!(
+            error.message(),
+            "az account list failed: az_wrap-2 ERROR No az installed."
         );
     }
 
