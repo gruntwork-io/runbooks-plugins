@@ -16,7 +16,7 @@ use crate::fake_az::{
 };
 use crate::support::{
     App, TestResult, assert_valid, at, detect_params, env_value, error_kind, error_message,
-    sign_in_dirs, sign_in_params,
+    runbooks_limits, sign_in_dirs, sign_in_params,
 };
 
 struct Fixture {
@@ -856,7 +856,7 @@ async fn configure_again_with_another_state_dir_is_refused() -> TestResult {
         .app
         .call(
             "configure",
-            json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": other}),
+            json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": other, "callTimeoutsMillis": runbooks_limits()}),
         )
         .await?;
     assert_eq!(error_kind(&response), Some("invalidParams"), "{response}");
@@ -864,7 +864,7 @@ async fn configure_again_with_another_state_dir_is_refused() -> TestResult {
         .app
         .call(
             "configure",
-            json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "state"}),
+            json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "state", "callTimeoutsMillis": runbooks_limits()}),
         )
         .await?;
     assert_eq!(error_kind(&relative), Some("invalidParams"), "{relative}");

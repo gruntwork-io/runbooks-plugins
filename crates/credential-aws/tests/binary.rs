@@ -28,6 +28,11 @@ fn at(value: &Value, pointer: &str) -> Value {
     value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
+/// What Runbooks sends in `callTimeoutsMillis`.
+fn runbooks_limits() -> Value {
+    json!({"configure": 30_000, "detect": 120_000, "targets": 120_000, "select": 120_000, "env": 120_000, "signOut": 60_000, "signIn": 900_000})
+}
+
 /// A proxy on a loopback port that refuses every tunnel, and the first line
 /// of each request it got.
 fn refusing_proxy() -> std::io::Result<(String, Arc<Mutex<Vec<String>>>)> {
@@ -123,7 +128,7 @@ fn the_binary_answers_over_stdio_and_reports_an_unreachable_aws_as_network() -> 
         1,
         "configure",
         json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "/unused",
-            "caBundleFile": not_a_bundle, "proxy": proxy}),
+            "callTimeoutsMillis": runbooks_limits(), "caBundleFile": not_a_bundle, "proxy": proxy}),
     )?;
     assert_eq!(
         at(&refused, "/error/message"),
@@ -137,6 +142,7 @@ fn the_binary_answers_over_stdio_and_reports_an_unreachable_aws_as_network() -> 
         2,
         "configure",
         json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "/unused",
+            "callTimeoutsMillis": runbooks_limits(),
             "caBundleFile": bundle.to_str().ok_or("a UTF-8 path")?, "proxy": proxy}),
     )?;
     assert_eq!(at(&configured, "/result/cloud"), "aws", "{configured}");
@@ -205,7 +211,8 @@ fn the_binary_exits_with_failure_when_it_cannot_write_its_output_or_its_error() 
     drop(child.stderr.take());
     let mut stdin = child.stdin.take().ok_or("stdin")?;
     let request = json!({"jsonrpc": "2.0", "id": 1, "method": "configure", "params": {
-        "protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "/unused"}});
+        "protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "/unused",
+        "callTimeoutsMillis": runbooks_limits()}});
     writeln!(stdin, "{request}")?;
 
     let (exited, status) = mpsc::channel();

@@ -55,6 +55,11 @@ pub(crate) fn at(value: &Value, pointer: &str) -> Value {
     value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
+/// What Runbooks sends in `callTimeoutsMillis`.
+pub(crate) fn runbooks_limits() -> Value {
+    json!({"configure": 30_000, "detect": 120_000, "targets": 120_000, "select": 120_000, "env": 120_000, "signOut": 60_000, "signIn": 900_000})
+}
+
 /// The error kind of a response, or `None` for a result.
 pub(crate) fn error_kind(response: &Value) -> Option<&str> {
     response.pointer("/error/data/kind").and_then(Value::as_str)
@@ -156,7 +161,7 @@ impl App {
         let result = self
             .result(
                 "configure",
-                json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": state_dir}),
+                json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": state_dir, "callTimeoutsMillis": runbooks_limits()}),
             )
             .await?;
         assert_valid("configureResult", &result)?;

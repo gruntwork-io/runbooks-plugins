@@ -24,7 +24,7 @@ use crate::hanging_az::{self, HangingAz};
 use crate::scripted_az::{self, DEVICE_LINE, ScriptedAz, token};
 use crate::support::{
     App, TestResult, WAIT, assert_valid, at, detect_params, env_value, error_kind, error_message,
-    sign_in_dirs, sign_in_params,
+    runbooks_limits, sign_in_dirs, sign_in_params,
 };
 
 fn installed(scripted: &ScriptedAz) -> InstalledAz {
@@ -122,7 +122,7 @@ async fn the_binary_logs_a_tenant_list_az_refuses_and_signs_in_without_it() -> T
         (
             1,
             "configure",
-            json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": state_dir}),
+            json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": state_dir, "callTimeoutsMillis": runbooks_limits()}),
         ),
     )
     .await?;
@@ -174,7 +174,7 @@ async fn closing_the_input_during_a_sign_in_ends_az_and_what_it_started() -> Tes
         (
             1,
             "configure",
-            json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": state_dir}),
+            json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": state_dir, "callTimeoutsMillis": runbooks_limits()}),
         ),
     )
     .await?;

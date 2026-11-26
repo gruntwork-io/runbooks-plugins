@@ -71,6 +71,11 @@ pub(crate) fn at(value: &Value, pointer: &str) -> Value {
     value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
+/// What Runbooks sends in `callTimeoutsMillis`.
+pub(crate) fn runbooks_limits() -> Value {
+    json!({"configure": 30_000, "detect": 120_000, "targets": 120_000, "select": 120_000, "env": 120_000, "signOut": 60_000, "signIn": 900_000})
+}
+
 /// A token for the fake to hand out, and what tokeninfo says about it.
 #[derive(Clone)]
 pub(crate) struct Grant {
@@ -484,6 +489,7 @@ impl App {
             "protocolVersion": PROTOCOL_VERSION,
             "caller": "runbooks/0.31.0",
             "stateDir": state_dir.to_str().ok_or("a temp dir is UTF-8")?,
+            "callTimeoutsMillis": runbooks_limits(),
         });
         self.ok("configure", "configureResult", params).await
     }
@@ -512,6 +518,7 @@ pub(crate) fn configure_params(state_dir: &Path, settings: &Value) -> TestResult
         "protocolVersion": PROTOCOL_VERSION,
         "caller": "runbooks/0.31.0",
         "stateDir": state_dir.to_str().ok_or("a temp dir is UTF-8")?,
+        "callTimeoutsMillis": runbooks_limits(),
         "settings": settings,
     }))
 }
