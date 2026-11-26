@@ -147,20 +147,21 @@ async fn gcloud_without_application_default_credentials_finds_nothing() -> TestR
 async fn a_configuration_name_in_variables_must_be_one_gcloud_accepts() -> TestResult {
     let dir = tempfile::tempdir()?;
     let env = [
-        ("GOOGLE_OAUTH_ACCESS_TOKEN", BARE_TOKEN),
-        ("CLOUDSDK_ACTIVE_CONFIG_NAME", "My Config"),
+        ("PROD_GOOGLE_OAUTH_ACCESS_TOKEN", BARE_TOKEN),
+        ("PROD_CLOUDSDK_ACTIVE_CONFIG_NAME", "My Config"),
     ];
     let mut app = App::start(&env, &google())?;
     app.configure(dir.path()).await?;
+    let sources = json!([{"kind": "env", "prefix": "PROD_"}]);
     let error = app
-        .error("detect", detect(&json!([{"kind": "env"}])), "invalidParams")
+        .error("detect", detect(&sources), "invalidParams")
         .await?;
     let message = at(&error, "/message");
     assert!(
         message
             .as_str()
             .unwrap_or_default()
-            .contains("CLOUDSDK_ACTIVE_CONFIG_NAME must be a gcloud configuration name"),
+            .contains("PROD_CLOUDSDK_ACTIVE_CONFIG_NAME must be a gcloud configuration name"),
         "{error}"
     );
     Ok(())
