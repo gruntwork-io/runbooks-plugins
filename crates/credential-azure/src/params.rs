@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use runbooks_plugin_protocol::credential::{
     ErrorKind, Pins as WirePins, Requirement, RequirementRolesItem,
 };
-use runbooks_plugin_transport::PluginError;
+use runbooks_plugin_transport::{PluginError, shown_name};
 
 use std::path::PathBuf;
 
@@ -155,10 +155,10 @@ pub(crate) fn known_fields(
         .into_iter()
         .map(|field| field.name)
         .collect();
-    let mut unknown: Vec<String> = fields
+    let mut unknown: Vec<&str> = fields
         .keys()
         .filter(|name| !known.contains(name))
-        .map(|name| format!("{name:?}"))
+        .map(|name| shown_name(name))
         .collect();
     if unknown.is_empty() {
         return Ok(());
