@@ -608,17 +608,15 @@ async fn env_gets_a_role_fresh_keys_before_its_keys_expire() -> TestResult {
 }
 
 #[tokio::test(start_paused = true)]
-async fn keys_due_in_exactly_five_minutes_are_refreshed() -> TestResult {
+async fn keys_due_at_the_edge_of_the_schemas_refresh_window_are_refreshed() -> TestResult {
+    let due = (OffsetDateTime::parse(NOW, &Rfc3339)? + refresh_window()?).format(&Rfc3339)?;
     let aws = FakeAws::default()
         .polls(vec![Ok(approved())])
         .account(ACCOUNT, "Production", &["deploy"])?
         .role_keys(
             ACCOUNT,
             "deploy",
-            vec![
-                Ok(keys("ASIAOLD", "2026-11-24T18:05:00Z")),
-                Ok(keys("ASIANEW", IN_AN_HOUR)),
-            ],
+            vec![Ok(keys("ASIAOLD", &due)), Ok(keys("ASIANEW", IN_AN_HOUR))],
         )
         .caller("ASIAOLD", ACCOUNT, SSO_ARN)?;
     let mut app = paused(aws).await?;
