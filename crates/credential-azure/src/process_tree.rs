@@ -193,7 +193,7 @@ fn run_killer(program: &Path, args: &[String], wait: Duration) -> Result<(), Kil
         .spawn()
         .map_err(|error| KillerFailed::Start(error.kind()))?;
     let deadline = Instant::now() + wait;
-    while Instant::now() < deadline {
+    while deadline.checked_duration_since(Instant::now()).is_some() {
         match killer.try_wait() {
             Ok(Some(_status)) => return Ok(()),
             Ok(None) => thread::sleep(KILLER_POLL),
@@ -209,7 +209,7 @@ fn run_killer(program: &Path, args: &[String], wait: Duration) -> Result<(), Kil
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::{KILLER_WAIT, KillerFailed, Signal, kill_args, run_killer, taskkill_args};
 
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn a_killer_that_hangs_is_given_up_on_after_its_wait() {
         let wait = Duration::from_millis(50);
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let failed = run_killer(std::path::Path::new("/bin/sleep"), &["30".to_owned()], wait);
         assert_eq!(failed, Err(KillerFailed::TimedOut(wait)));
         assert!(
