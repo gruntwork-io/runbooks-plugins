@@ -10,7 +10,7 @@ use runbooks_plugin_protocol::credential::{
     ErrorKind, Field, Level, LevelChosen, Method, RequirementKind, SelectParams, SelectResult,
     SignInParams, SignInResult, SignOutResult, Source, Target, TargetsParams, TargetsResult,
 };
-use runbooks_plugin_transport::{CredentialPlugin, PluginError, Prompts};
+use runbooks_plugin_transport::{CredentialPlugin, PluginError, Prompts, shown_name};
 use serde_json::Map;
 use time::OffsetDateTime;
 
@@ -20,9 +20,7 @@ use crate::credential::{Credential, MAX_DOCUMENT_BYTES, Origin, api_error, parse
 use crate::files::{self, CREDENTIALS_FILE, ReadError};
 use crate::gcloud::{ADC_LOGIN, Configuration, ConfigurationName, Root};
 use crate::oauth::{self, ClientFields, DEFAULT_SCOPES};
-use crate::session::{
-    self, Candidate, Constraints, PROJECT, Prover, Session, invalid_params, shown_name,
-};
+use crate::session::{self, Candidate, Constraints, PROJECT, Prover, Session, invalid_params};
 use crate::settings::Settings;
 use crate::sources::{self, FoundVars, Prefix, VarCredential};
 

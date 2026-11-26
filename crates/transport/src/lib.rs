@@ -26,6 +26,6 @@ mod plugin;
 mod serve;
 mod wire;
 
-pub use error::{PluginError, ServeError};
+pub use error::{PluginError, ServeError, shown_name};
 pub use plugin::{CredentialPlugin, Prompts};
 pub use serve::{MAX_LINE_BYTES, serve, serve_stdio};

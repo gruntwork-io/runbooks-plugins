@@ -771,6 +771,29 @@ async fn bad_params_are_refused_before_anything_runs() -> TestResult {
         ),
         (
             "signIn",
+            sign_in_params("device_code", &json!({"noSuchField": "x"}), &json!({})),
+            "invalidParams",
+            "noSuchField",
+        ),
+        (
+            "signIn",
+            sign_in_params("device_code", &json!({"SENTINEL VALUE": "x"}), &json!({})),
+            "invalidParams",
+            "(a name that is not an identifier)",
+        ),
+        (
+            "signIn",
+            sign_in_params(
+                "service_principal",
+                &json!({"clientId": "00000000-0000-0000-0000-000000000001",
+                    "tenantId": CONTOSO, "clientSecret": "s", "noSuchField": "x"}),
+                &json!({}),
+            ),
+            "invalidParams",
+            "noSuchField",
+        ),
+        (
+            "signIn",
             sign_in_params(
                 "cli",
                 &json!({"tenantId": FABRIKAM}),
@@ -800,6 +823,7 @@ async fn bad_params_are_refused_before_anything_runs() -> TestResult {
         assert_eq!(error_kind(&response), Some(kind), "{response}");
         let message = error_message(&response).unwrap_or_default();
         assert!(message.contains(mentions), "{mentions} in {message}");
+        assert!(!message.contains("SENTINEL"), "{message}");
     }
     assert_eq!(fixture.calls(), Vec::<Call>::new());
     assert_eq!(sign_in_dirs(fixture.state.path())?, Vec::<String>::new());

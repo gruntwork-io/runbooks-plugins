@@ -93,6 +93,21 @@ impl PluginError {
     }
 }
 
+/// `name` as an error may show it: a name that isn't an identifier could be
+/// pasted material.
+#[must_use]
+pub fn shown_name(name: &str) -> &str {
+    let identifier = name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if identifier {
+        name
+    } else {
+        "(a name that is not an identifier)"
+    }
+}
+
 /// Why [`serve`](crate::serve) stopped before its input ended.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -106,4 +121,25 @@ pub enum ServeError {
     /// A bug: a generated protocol type failed to serialize.
     #[error("encoding a message")]
     Encode(#[from] serde_json::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shown_name;
+
+    #[test]
+    fn shown_name_shows_only_an_identifier_of_64_bytes_or_fewer() {
+        let longest = format!("a_{}", "9".repeat(62));
+        let too_long = format!("{longest}0");
+        let hidden = "(a name that is not an identifier)";
+        for (name, shown) in [
+            ("noSuchField", "noSuchField"),
+            (longest.as_str(), longest.as_str()),
+            (too_long.as_str(), hidden),
+            ("SENTINEL VALUE", hidden),
+            ("tenant-id", hidden),
+        ] {
+            assert_eq!(shown_name(name), shown, "{name}");
+        }
+    }
 }
