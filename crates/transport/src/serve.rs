@@ -191,10 +191,10 @@ impl<P: CredentialPlugin> Calls<P> {
     }
 }
 
-/// One call: its params parsed into the method's type, the plugin's answer
-/// within the app's limit, and that answer as the response's `result`. A
-/// `configure` answers within the limits it brings, and sets them for every
-/// later call once it succeeds.
+/// One call, within the app's limit on its method: its params parsed into
+/// the method's type, the plugin's answer, and that answer as the response's
+/// `result`. A `configure` is held to the limits it brings, and sets them for
+/// every later call once it succeeds.
 async fn call<P: CredentialPlugin>(
     plugin: Arc<P>,
     limits: Arc<OnceLock<Limits>>,
@@ -202,44 +202,37 @@ async fn call<P: CredentialPlugin>(
     params: Map<String, Value>,
     prompts: Prompts,
 ) -> Outcome {
-    let configured = limits.get();
-    match method {
-        RpcMethod::Configure => {
-            let params: ConfigureParams = parse(method, params)?;
-            if params.protocol_version != PROTOCOL_VERSION {
-                return Err(PluginError::new(
-                    ErrorKind::UnsupportedProtocolVersion,
-                    format!(
-                        "protocol version {:?} is not supported: this plugin speaks {PROTOCOL_VERSION:?}",
-                        params.protocol_version
-                    ),
-                ));
+    let answer = async {
+        match method {
+            RpcMethod::Configure => {
+                let params: ConfigureParams = parse(method, params)?;
+                if params.protocol_version != PROTOCOL_VERSION {
+                    return Err(PluginError::new(
+                        ErrorKind::UnsupportedProtocolVersion,
+                        format!(
+                            "protocol version {:?} is not supported: this plugin speaks {PROTOCOL_VERSION:?}",
+                            params.protocol_version
+                        ),
+                    ));
+                }
+                let asked = Limits(params.call_timeouts_millis.clone());
+                let answer = within(Some(&asked), method, plugin.configure(params)).await?;
+                let result = result(method, answer)?;
+                limits.get_or_init(|| asked);
+                Ok(result)
             }
-            let asked = Limits(params.call_timeouts_millis.clone());
-            let answer = within(Some(&asked), method, plugin.configure(params)).await?;
-            let result = result(method, answer)?;
-            limits.get_or_init(|| asked);
-            Ok(result)
+            RpcMethod::Detect => result(method, plugin.detect(parse(method, params)?).await?),
+            RpcMethod::SignIn => result(
+                method,
+                plugin.sign_in(parse(method, params)?, prompts).await?,
+            ),
+            RpcMethod::Targets => result(method, plugin.targets(parse(method, params)?).await?),
+            RpcMethod::Select => result(method, plugin.select(parse(method, params)?).await?),
+            RpcMethod::Env => result(method, plugin.env().await?),
+            RpcMethod::SignOut => result(method, plugin.sign_out().await?),
         }
-        RpcMethod::Detect => {
-            let answer = plugin.detect(parse(method, params)?);
-            result(method, within(configured, method, answer).await?)
-        }
-        RpcMethod::SignIn => {
-            let answer = plugin.sign_in(parse(method, params)?, prompts);
-            result(method, within(configured, method, answer).await?)
-        }
-        RpcMethod::Targets => {
-            let answer = plugin.targets(parse(method, params)?);
-            result(method, within(configured, method, answer).await?)
-        }
-        RpcMethod::Select => {
-            let answer = plugin.select(parse(method, params)?);
-            result(method, within(configured, method, answer).await?)
-        }
-        RpcMethod::Env => result(method, within(configured, method, plugin.env()).await?),
-        RpcMethod::SignOut => result(method, within(configured, method, plugin.sign_out()).await?),
-    }
+    };
+    within(limits.get(), method, answer).await
 }
 
 /// `answer`, or `timedOut` once it has run until a second before the app's
