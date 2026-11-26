@@ -8,6 +8,7 @@ mod fake_az;
 mod hanging_az;
 mod protocol;
 mod real_az;
+mod resume;
 #[path = "../common/scripted_az.rs"]
 mod scripted_az;
 mod service_principal;

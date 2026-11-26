@@ -4,8 +4,10 @@
 mod detect;
 mod gcloud;
 mod oauth;
+mod resume;
 mod secrets;
 mod settings;
 mod sign_in;
 mod support;
 mod targets;
+mod tls;

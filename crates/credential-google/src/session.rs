@@ -14,6 +14,7 @@ use crate::api::GoogleApi;
 use crate::credential::{
     Credential, CredentialType, Origin, access_token, api_error, denies_project,
 };
+use crate::gcloud::{CONFIGURATION_VAR, ConfigurationName};
 
 /// The one target level: the project commands operate on.
 pub(crate) const PROJECT: &str = "project";
@@ -38,7 +39,6 @@ const REGION_VARS: [&str; 3] = [
     "GOOGLE_REGION",
 ];
 const ZONE_VARS: [&str; 2] = ["CLOUDSDK_COMPUTE_ZONE", "GOOGLE_ZONE"];
-const CONFIGURATION_VAR: &str = "CLOUDSDK_ACTIVE_CONFIG_NAME";
 const AUTH_TYPE_OUTPUT: &str = "GOOGLE_AUTH_TYPE";
 /// Credential variables the plugin reads in detection but never sets. Named
 /// so the base environment strips them: Terraform's google provider prefers
@@ -137,7 +137,7 @@ pub(crate) struct Candidate {
     pub(crate) project: Option<String>,
     pub(crate) region: Option<String>,
     pub(crate) zone: Option<String>,
-    pub(crate) configuration: Option<String>,
+    pub(crate) configuration: Option<ConfigurationName>,
 }
 
 /// A proven credential: what `env` hands a run and what `identity` shows.
@@ -153,7 +153,7 @@ pub(crate) struct Session {
     pub(crate) expires_at: Option<OffsetDateTime>,
     pub(crate) region: Option<String>,
     pub(crate) zone: Option<String>,
-    pub(crate) configuration: Option<String>,
+    pub(crate) configuration: Option<ConfigurationName>,
 }
 
 /// What proving a credential needs from the plugin.
@@ -343,7 +343,7 @@ impl Session {
             set(&ZONE_VARS, zone, false, BOTH);
         }
         if let Some(configuration) = &self.configuration {
-            set(&[CONFIGURATION_VAR], configuration, false, ENV);
+            set(&[CONFIGURATION_VAR], configuration.as_str(), false, ENV);
         }
         set(
             &[AUTH_TYPE_OUTPUT],

@@ -89,6 +89,9 @@ fn at(value: &Value, pointer: &str) -> Value {
 #[derive(Clone, Debug, Default)]
 struct FakeAws {
     callers: HashMap<String, Result<CallerIdentity, AwsError>>,
+    /// The secret an access key signs with, where a test names one: STS
+    /// refuses a request signed with another.
+    secrets: HashMap<String, String>,
     calls: Arc<Mutex<Vec<Call>>>,
     /// `AssumeRole`'s answers by role ARN, in order; the last repeats.
     assumed: Arc<Mutex<HashMap<String, VecDeque<KeysAnswer>>>>,
@@ -155,6 +158,12 @@ impl FakeAws {
         };
         self.callers.insert(access_key_id.to_owned(), Ok(identity));
         Ok(self)
+    }
+
+    fn signed_with(mut self, access_key_id: &str, secret: &str) -> Self {
+        self.secrets
+            .insert(access_key_id.to_owned(), secret.to_owned());
+        self
     }
 
     fn failing(mut self, access_key_id: &str, kind: AwsErrorKind, detail: &str) -> Self {
@@ -289,6 +298,17 @@ impl Aws for FakeAws {
                 access_key_id: credentials.access_key_id.clone(),
                 region: region.to_string(),
             });
+        let signed_otherwise = self
+            .secrets
+            .get(&credentials.access_key_id)
+            .is_some_and(|secret| secret != credentials.secret_access_key.expose());
+        if signed_otherwise {
+            return future::ready(Err(AwsError::new(
+                Service::Sts,
+                AwsErrorKind::Refused,
+                "SignatureDoesNotMatch: The request signature we calculated does not match the signature you provided.",
+            )));
+        }
         future::ready(
             self.callers
                 .get(&credentials.access_key_id)
@@ -653,7 +673,8 @@ async fn configure_offers_static_keys_the_levels_and_every_name_a_run_gets() -> 
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
-            "AWS_REGION"
+            "AWS_REGION",
+            "AWS_CREDENTIAL_EXPIRATION"
         ])
     );
     let levels: Vec<&str> = result
@@ -1243,6 +1264,11 @@ async fn static_keys_sign_in_and_a_run_gets_them_with_the_chosen_region() -> Tes
     assert_eq!(
         values.get("AWS_SESSION_TOKEN"),
         Some(&(String::new(), true, vec!["output".to_owned()]))
+    );
+    assert_eq!(
+        values.get("AWS_CREDENTIAL_EXPIRATION"),
+        None,
+        "keys that never expire"
     );
     Ok(())
 }

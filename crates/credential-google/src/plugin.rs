@@ -335,8 +335,11 @@ impl<A: GoogleApi> GooglePlugin<A> {
             Lookup::Vars {
                 vars, prefix, name, ..
             } => match sources::find(&vars, &prefix) {
-                None => Ok(None),
-                Some(found) => candidate_from_vars(found, name).await.map(Some),
+                Ok(None) => Ok(None),
+                Ok(Some(found)) => candidate_from_vars(found, name).await.map(Some),
+                Err(var) => Err(invalid_params(format!(
+                    "{var} must be {CONFIGURATION_NAME_RULE}."
+                ))),
             },
             Lookup::Adc => {
                 let Some(root) = Root::resolve(&self.host.env) else {
@@ -427,7 +430,7 @@ async fn candidate_from_vars(found: FoundVars, source: &str) -> Result<Candidate
         project: found.project,
         region: found.region,
         zone: found.zone,
-        configuration: None,
+        configuration: found.configuration,
     })
 }
 

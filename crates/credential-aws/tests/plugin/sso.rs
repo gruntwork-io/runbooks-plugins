@@ -130,6 +130,14 @@ async fn sso_shows_the_url_and_code_polls_at_awss_pace_and_takes_the_only_role()
         "eu-central-1"
     );
     assert_eq!(at(&env, "/expiresAt"), IN_AN_HOUR);
+    assert_eq!(
+        values.get("AWS_CREDENTIAL_EXPIRATION"),
+        Some(&(
+            IN_AN_HOUR.to_owned(),
+            false,
+            vec!["env".to_owned(), "output".to_owned()]
+        ))
+    );
     Ok(())
 }
 
@@ -857,5 +865,99 @@ async fn the_device_flows_secrets_never_leave_and_a_roles_keys_leave_only_in_env
         }
     }
     assert_eq!(env_lines, 1);
+    Ok(())
+}
+
+// A resumed session: after the app restarts, a new plugin process detects
+// from the values the block's own `env` gave before, from the block's id.
+
+const BLOCK: &str = "aws-auth";
+
+/// AWS with a role in Production whose keys expire in an hour.
+fn role_aws() -> Result<FakeAws, Box<dyn Error>> {
+    Ok(FakeAws::default()
+        .polls(vec![Ok(approved())])
+        .account(ACCOUNT, "Production", &["deploy"])?
+        .role_keys(ACCOUNT, "deploy", vec![Ok(keys("ASIASSO", IN_AN_HOUR))])
+        .caller("ASIASSO", ACCOUNT, SSO_ARN)?
+        .signed_with("ASIASSO", ROLE_SECRET))
+}
+
+/// Signs in to the role: its identity, `env`'s result, and `env`'s values
+/// by name, as the engine saves them.
+async fn sign_in_and_save(
+    aws: &FakeAws,
+) -> Result<(Value, Value, serde_json::Map<String, Value>), Box<dyn Error>> {
+    let mut app = paused(aws.clone()).await?;
+    let identity = app
+        .ok("signIn", sso_sign_in(&json!({})), "signInResult")
+        .await?;
+    let env = app.ok("env", json!({}), "envResult").await?;
+    let values = values_of(&env)?
+        .into_iter()
+        .map(|(name, (value, _, _))| (name, json!(value)))
+        .collect();
+    Ok((identity, env, values))
+}
+
+fn own_values(values: &serde_json::Map<String, Value>) -> Value {
+    json!([{"kind": "values", "from": BLOCK, "values": values}])
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_process_takes_back_the_role_keys_the_block_saved() -> TestResult {
+    let aws = role_aws()?;
+    let (identity, given, values) = sign_in_and_save(&aws).await?;
+
+    let mut resumed = paused(aws).await?;
+    let response = resumed.detect(own_values(&values), json!({})).await?;
+    let found = at(&response, "/result");
+    assert_valid("detectResult", &found)?;
+    assert_eq!(at(&found, "/source"), BLOCK);
+    for field in [
+        "/principal",
+        "/kind",
+        "/expiresAt",
+        "/targets/account/id",
+        "/targets/role",
+    ] {
+        assert_eq!(
+            at(&found, &format!("/identity{field}")),
+            at(&identity, field),
+            "{field}"
+        );
+    }
+    assert_eq!(resumed.ok("env", json!({}), "envResult").await?, given);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_clouds_values_or_a_changed_secret_are_no_login() -> TestResult {
+    let aws = role_aws()?;
+    let (_, _, mut values) = sign_in_and_save(&aws).await?;
+
+    let mut resumed = paused(aws).await?;
+    let google = serde_json::Map::from_iter([
+        (
+            "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+            json!("/state/gcp-auth/credentials.json"),
+        ),
+        ("GOOGLE_CLOUD_PROJECT".to_owned(), json!("sandbox-1234")),
+    ]);
+    let response = resumed.detect(own_values(&google), json!({})).await?;
+    assert_eq!(at(&response, "/result"), json!({"found": false}));
+
+    let changed = "test-changed-secret-access-key";
+    values.insert("AWS_SECRET_ACCESS_KEY".to_owned(), json!(changed));
+    let response = resumed.detect(own_values(&values), json!({})).await?;
+    assert_eq!(
+        at(&response, "/error/data/kind"),
+        "accessDenied",
+        "{response}"
+    );
+    resumed.fails("env", json!({}), "notSignedIn").await?;
+    for (method, line) in &resumed.written {
+        assert!(!line.contains(changed), "{method}: {line}");
+    }
     Ok(())
 }

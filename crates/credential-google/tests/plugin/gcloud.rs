@@ -144,6 +144,30 @@ async fn gcloud_without_application_default_credentials_finds_nothing() -> TestR
 }
 
 #[tokio::test]
+async fn a_configuration_name_in_variables_must_be_one_gcloud_accepts() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let env = [
+        ("PROD_GOOGLE_OAUTH_ACCESS_TOKEN", BARE_TOKEN),
+        ("PROD_CLOUDSDK_ACTIVE_CONFIG_NAME", "My Config"),
+    ];
+    let mut app = App::start(&env, &google())?;
+    app.configure(dir.path()).await?;
+    let sources = json!([{"kind": "env", "prefix": "PROD_"}]);
+    let error = app
+        .error("detect", detect(&sources), "invalidParams")
+        .await?;
+    let message = at(&error, "/message");
+    assert!(
+        message
+            .as_str()
+            .unwrap_or_default()
+            .contains("PROD_CLOUDSDK_ACTIVE_CONFIG_NAME must be a gcloud configuration name"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_broken_adc_file_is_skipped_for_the_next_source() -> TestResult {
     let dir = tempfile::tempdir()?;
     let root = gcloud_root(dir.path(), Some("{\"type\": \"authorized_user\", SENTINEL"))?;

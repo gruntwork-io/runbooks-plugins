@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use crate::Secret;
+use crate::gcloud::{CONFIGURATION_VAR, ConfigurationName};
 
 /// Credential variables, in precedence order.
 const CREDENTIAL_VARS: [(&str, Shape); 4] = [
@@ -38,6 +39,8 @@ pub(crate) struct FoundVars {
     pub(crate) project: Option<String>,
     pub(crate) region: Option<String>,
     pub(crate) zone: Option<String>,
+    /// The gcloud configuration a run's gcloud uses.
+    pub(crate) configuration: Option<ConfigurationName>,
 }
 
 #[derive(Debug)]
@@ -73,28 +76,44 @@ impl Prefix {
 
 /// The first credential variable set in `vars`, read with `prefix`. A project
 /// with no credential beside it authenticates nothing, so it finds nothing.
-pub(crate) fn find(vars: &HashMap<String, String>, prefix: &Prefix) -> Option<FoundVars> {
+///
+/// # Errors
+///
+/// The configuration variable's name, prefix included, if gcloud wouldn't
+/// accept its value.
+pub(crate) fn find(
+    vars: &HashMap<String, String>,
+    prefix: &Prefix,
+) -> Result<Option<FoundVars>, String> {
     let get = |name: &str| {
         vars.get(&format!("{}{name}", prefix.0))
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
     };
     let first = |names: &[&str]| names.iter().find_map(|name| get(name)).map(str::to_owned);
-    let (name, value, shape) = CREDENTIAL_VARS
+    let Some((name, value, shape)) = CREDENTIAL_VARS
         .iter()
-        .find_map(|&(name, shape)| get(name).map(|value| (name, value, shape)))?;
+        .find_map(|&(name, shape)| get(name).map(|value| (name, value, shape)))
+    else {
+        return Ok(None);
+    };
+    let configuration = get(CONFIGURATION_VAR)
+        .map(|name| ConfigurationName::parse(name.to_owned()))
+        .transpose()
+        .map_err(|_name| format!("{}{CONFIGURATION_VAR}", prefix.0))?;
     let credential = match shape {
         Shape::Path => VarCredential::Path(value.to_owned()),
         Shape::Json => VarCredential::Json(Secret::new(value)),
         Shape::Token => VarCredential::Token(Secret::new(value)),
     };
-    Some(FoundVars {
+    Ok(Some(FoundVars {
         credential,
         var: format!("{}{name}", prefix.0),
         project: first(&PROJECT_VARS),
         region: first(&REGION_VARS),
         zone: first(&ZONE_VARS),
-    })
+        configuration,
+    }))
 }
 
 #[cfg(test)]
@@ -121,7 +140,7 @@ mod tests {
                 ("GOOGLE_CLOUD_PROJECT", "second"),
             ]),
             &Prefix::default(),
-        )
+        )?
         .ok_or("expected a credential")?;
         assert!(
             matches!(found.credential, VarCredential::Path(ref path) if path == "/keys/sa.json")
@@ -132,7 +151,10 @@ mod tests {
 
     #[test]
     fn a_project_alone_is_not_a_credential() {
-        assert!(find(&vars(&[("GOOGLE_CLOUD_PROJECT", "p")]), &Prefix::default()).is_none());
+        assert!(matches!(
+            find(&vars(&[("GOOGLE_CLOUD_PROJECT", "p")]), &Prefix::default()),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -142,12 +164,15 @@ mod tests {
             ("GOOGLE_OAUTH_ACCESS_TOKEN", "unprefixed"),
             ("CI_CLOUDSDK_AUTH_ACCESS_TOKEN", "prefixed"),
         ]);
-        let found = find(&env, &prefix).ok_or("expected a credential")?;
+        let found = find(&env, &prefix)?.ok_or("expected a credential")?;
         assert_eq!(found.var, "CI_CLOUDSDK_AUTH_ACCESS_TOKEN");
         assert!(
             matches!(found.credential, VarCredential::Token(ref token) if token.expose() == "prefixed")
         );
-        assert!(find(&vars(&[("GOOGLE_CREDENTIALS", "{}")]), &prefix).is_none());
+        assert!(matches!(
+            find(&vars(&[("GOOGLE_CREDENTIALS", "{}")]), &prefix),
+            Ok(None)
+        ));
         Ok(())
     }
 
