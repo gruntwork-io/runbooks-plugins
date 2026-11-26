@@ -931,11 +931,12 @@ mod tests {
     }
 
     #[test]
-    fn a_wrappers_error_is_named_by_letters_digits_underscores_or_hyphens() {
+    fn a_wrappers_error_is_a_plain_name_then_error_then_text() {
         let error = failure(
             "az account list",
             &stderr(&[
                 "WARNING: ERROR details are in the log file",
+                "mise ERRORS: 3 found",
                 "az_wrap-2 ERROR No az installed",
                 "Subscription not found.",
             ]),
