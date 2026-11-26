@@ -13,6 +13,8 @@ use crate::session::invalid_params;
 
 /// What gcloud runs to write Application Default Credentials.
 pub(crate) const ADC_LOGIN: &str = "gcloud auth application-default login";
+/// The variable that names the configuration gcloud uses.
+pub(crate) const CONFIGURATION_VAR: &str = "CLOUDSDK_ACTIVE_CONFIG_NAME";
 
 /// The largest configuration file read. gcloud's are a few hundred bytes.
 const MAX_CONFIGURATION_BYTES: usize = 64 * 1024;
@@ -64,11 +66,11 @@ impl Root {
         self.0.join("configurations")
     }
 
-    /// The configuration gcloud uses: `CLOUDSDK_ACTIVE_CONFIG_NAME`, then the
+    /// The configuration gcloud uses: [`CONFIGURATION_VAR`], then the
     /// `active_config` file, then `default`.
     pub(crate) async fn active_name(&self, env: &HashMap<String, String>) -> String {
         if let Some(name) = env
-            .get("CLOUDSDK_ACTIVE_CONFIG_NAME")
+            .get(CONFIGURATION_VAR)
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
         {
@@ -154,9 +156,9 @@ impl ConfigurationName {
 }
 
 /// The settings of a `config_<name>` file that the block uses.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Configuration {
-    pub(crate) name: String,
+    pub(crate) name: ConfigurationName,
     pub(crate) project: Option<String>,
     pub(crate) region: Option<String>,
     pub(crate) zone: Option<String>,
@@ -169,8 +171,10 @@ impl Configuration {
     fn parse(name: ConfigurationName, text: &str) -> Self {
         let mut section = "";
         let mut configuration = Self {
-            name: name.0,
-            ..Self::default()
+            name,
+            project: None,
+            region: None,
+            zone: None,
         };
         for line in text.lines().map(str::trim) {
             if line.starts_with(['#', ';']) {
@@ -246,11 +250,12 @@ mod tests {
     #[test]
     fn a_configuration_reads_its_project_region_and_zone() -> Result<(), String> {
         let text = "[core]\naccount = a@example.com\nproject = sandbox-1234\n\n# note\n[compute]\nregion=europe-west1\nzone =\nnot a setting\n";
-        let configuration = Configuration::parse(ConfigurationName::parse("dev".to_owned())?, text);
+        let name = ConfigurationName::parse("dev".to_owned())?;
+        let configuration = Configuration::parse(name.clone(), text);
         assert_eq!(
             configuration,
             Configuration {
-                name: "dev".to_owned(),
+                name,
                 project: Some("sandbox-1234".to_owned()),
                 region: Some("europe-west1".to_owned()),
                 zone: None,
