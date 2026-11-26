@@ -13,7 +13,7 @@ use std::time::Duration;
 use jsonschema::{Draft, Registry, Validator};
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_protocol::credential::{
-    ConfigureParams, ConfigureResult, DetectParams, DetectResult, EnvResult, Identity,
+    ConfigureParams, ConfigureResult, DetectParams, DetectResult, EnvResult, ErrorKind, Identity,
     IdentityKind, Requirement, SelectParams, SelectResult, SignInParams, SignInResult,
     SignOutResult, Target, TargetsParams, TargetsResult,
 };
@@ -197,6 +197,9 @@ const PADDED: &str = "padded";
 /// A sign-in method whose prompt is longer than a line may be.
 const OVERSIZED_PROMPT: &str = "oversized";
 
+/// A level whose targets fail with a message longer than a line may be.
+const OVERSIZED_ERROR: &str = "oversized";
+
 struct CountIfCancelled {
     cancelled: Arc<AtomicUsize>,
     finished: bool,
@@ -270,6 +273,12 @@ impl CredentialPlugin for Fake {
         params: TargetsParams,
     ) -> impl Future<Output = Result<TargetsResult, PluginError>> + Send {
         assert_ne!(params.level, "panic", "the test asked targets to panic");
+        if params.level == OVERSIZED_ERROR {
+            return future::ready(Err(PluginError::new(
+                ErrorKind::Network,
+                "x".repeat(MAX_LINE_BYTES),
+            )));
+        }
         let name = if params.level == PADDED {
             "x".repeat(self.padding.load(Ordering::SeqCst))
         } else {
@@ -512,6 +521,11 @@ async fn an_answer_up_to_the_line_limit_is_written_and_a_longer_one_is_internal(
     padding.store(room + 1, Ordering::SeqCst);
     let over = app.call(json!(12), "targets", padded).await?;
     assert_error(&over, &json!(12), -32000, "internal");
+
+    let failed = app
+        .call(json!(13), "targets", json!({"level": OVERSIZED_ERROR}))
+        .await?;
+    assert_error(&failed, &json!(13), -32000, "internal");
     Ok(())
 }
 

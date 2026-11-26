@@ -78,7 +78,8 @@ impl Prompts {
     ///
     /// # Errors
     ///
-    /// Kind `cancelled` if the plugin's output has closed.
+    /// Kind `cancelled` if the plugin's output has closed, or `internal` if
+    /// the prompt is longer than a line may be.
     pub async fn open_url(
         &self,
         url: impl Into<String>,
@@ -92,7 +93,8 @@ impl Prompts {
     ///
     /// # Errors
     ///
-    /// Kind `cancelled` if the plugin's output has closed.
+    /// Kind `cancelled` if the plugin's output has closed, or `internal` if
+    /// the prompt is longer than a line may be.
     pub async fn show_code(&self, code: impl Into<String>) -> Result<(), PluginError> {
         self.send(SignInPromptKind::ShowCode, None, Some(code.into()))
             .await
@@ -102,7 +104,8 @@ impl Prompts {
     ///
     /// # Errors
     ///
-    /// Kind `cancelled` if the plugin's output has closed.
+    /// Kind `cancelled` if the plugin's output has closed, or `internal` if
+    /// the prompt is longer than a line may be.
     pub async fn waiting(&self) -> Result<(), PluginError> {
         self.send(SignInPromptKind::Waiting, None, None).await
     }
