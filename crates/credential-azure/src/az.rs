@@ -681,8 +681,9 @@ fn failure(command: &str, stderr: &[String]) -> PluginError {
     )
 }
 
-/// The line that says what went wrong: `az`'s `ERROR:` line, or else its
-/// last line that is not a warning.
+/// The line that says what went wrong: `az`'s `ERROR:` line, else the first
+/// `<name> ERROR` line of a wrapper such as a mise shim, else the last line
+/// that is not a warning.
 fn error_line(stderr: &[String]) -> &str {
     let mut lines = stderr
         .iter()
@@ -690,6 +691,12 @@ fn error_line(stderr: &[String]) -> &str {
         .filter(|line| !line.is_empty());
     if let Some(error) = lines.clone().find_map(|line| line.strip_prefix("ERROR:")) {
         return error.trim();
+    }
+    if let Some(error) = lines
+        .clone()
+        .find(|line| line.split_whitespace().nth(1) == Some("ERROR"))
+    {
+        return error;
     }
     lines
         .rfind(|line| !line.starts_with("WARNING:") && !line.contains("Warning:"))
@@ -898,6 +905,23 @@ mod tests {
             ]),
         );
         assert_eq!(error.message(), "az login failed: The token is not valid.");
+    }
+
+    #[test]
+    fn a_wrappers_first_error_wins_over_its_closing_hint() {
+        let error = failure(
+            "az login",
+            &stderr(&[
+                "mise ERROR No version is set for shim: az",
+                "Set a global default version with one of the following:",
+                "mise use -g azure-cli@2.85.0",
+                "mise ERROR Run with --verbose or MISE_VERBOSE=1 for more information",
+            ]),
+        );
+        assert_eq!(
+            error.message(),
+            "az login failed: mise ERROR No version is set for shim: az."
+        );
     }
 
     #[test]
