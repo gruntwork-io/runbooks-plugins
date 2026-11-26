@@ -27,14 +27,14 @@ mise tasks
 ## Releases
 
 1. Create a draft release whose tag is `v<version>`, where `<version>` is the workspace version in `Cargo.toml`, and whose target is a full commit SHA: `gh release create v0.1.0 --draft --target <sha> --generate-notes`.
-2. Run [`release.yml`](.github/workflows/release.yml) with that tag: `gh workflow run release.yml -f version=v0.1.0`. It builds each binary at the draft's commit for macOS (arm64 and amd64), Linux (arm64 and amd64) and Windows (amd64), signs and notarizes the macOS ones, and attaches them to the draft with a `SHA256SUMS` file. The Windows ones are not signed.
+2. Run [`release.yml`](.github/workflows/release.yml) with that tag: `gh workflow run release.yml -f version=v0.1.0`. It builds each binary at the draft's commit for macOS (arm64 and amd64), Linux (arm64 and amd64) and Windows (amd64), signs and notarizes the macOS ones, and attaches them to the draft with the protocol's JSON Schemas and a `SHA256SUMS` file that lists both. The Windows ones are not signed.
 3. Publish the draft. GitHub then creates the tag at the draft's commit.
 
-Each asset is named `<binary>_<version>_<os>_<arch>`, plus `.exe` on Windows, such as `runbooks-credential-aws_0.1.0_darwin_arm64`. `<os>` is `darwin`, `linux` or `windows`, and `<arch>` is `arm64` or `amd64`.
+Each asset is named `<binary>_<version>_<os>_<arch>`, plus `.exe` on Windows, such as `runbooks-credential-aws_0.1.0_darwin_arm64`. `<os>` is `darwin`, `linux` or `windows`, and `<arch>` is `arm64` or `amd64`. The schemas keep their names: `base.schema.json` and `credential.schema.json`.
 
 Signing needs `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`, `MACOS_AC_LOGIN`, `MACOS_AC_PASSWORD` and `MACOS_AC_PROVIDER` as repository secrets. A run fails without them.
 
-`mise run dist <target>` and `mise run checksums` make the same files, unsigned, in `target/dist`.
+`mise run dist <target>`, `cp schema/*.schema.json target/dist/` and `mise run checksums` make the same files, unsigned, in `target/dist`.
 
 ## The protocol
 

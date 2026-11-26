@@ -209,7 +209,7 @@ jobs:
 
   checksums:
     name: Write SHA256SUMS
-    needs: [build, sign]
+    needs: [draft, build, sign]
     # A pull request skips the sign job, and its macOS binaries stay unsigned.
     if: ${{ !cancelled() && needs.build.result == 'success' && (needs.sign.result == 'success' || github.event_name == 'pull_request') }}
     runs-on: ubuntu-24.04
@@ -221,6 +221,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.draft.outputs.sha }}
           persist-credentials: false
       - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
@@ -232,6 +233,7 @@ jobs:
           pattern: assets-*
           path: target/dist
           merge-multiple: true
+      - run: cp schema/*.schema.json target/dist/
       - run: mise run checksums target/dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -268,6 +270,9 @@ jobs:
       - name: Check the draft's tag names the binaries' version
         run: |
           while read -r _ name; do
+            if [[ ${name} == *.schema.json ]]; then
+              continue
+            fi
             stem=${name%_*_*}
             version=${stem##*_}
             if [[ ${version} != "${TAG#v}" ]]; then
