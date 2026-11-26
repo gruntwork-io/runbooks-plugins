@@ -11,12 +11,13 @@ use runbooks_plugin_transport::PluginError;
 use std::path::PathBuf;
 
 use crate::describe::{
-    CERTIFICATE_FIELD, CLIENT_ID_FIELD, CLIENT_SECRET_FIELD, SUBSCRIPTION_LEVEL, TENANT_FIELD,
-    TENANT_LEVEL,
+    self, CERTIFICATE_FIELD, CLIENT_ID_FIELD, CLIENT_SECRET_FIELD, SUBSCRIPTION_LEVEL,
+    TENANT_FIELD, TENANT_LEVEL,
 };
 use crate::ids::{ClientId, SubscriptionId, TenantId, TenantRef};
 use crate::roles::RoleRequirement;
 use crate::service_principal::{Credential, Secret, ServicePrincipal, is_pkcs12, pkcs12_message};
+use crate::session::SignInMethod;
 
 /// What `detect` and `signIn` check a credential against, before a tenant
 /// domain is resolved.
@@ -140,6 +141,38 @@ pub(crate) fn login_tenant(
         (Some(pin), _) => Ok(Some(pin.clone())),
         (None, typed) => Ok(typed),
     }
+}
+
+/// # Errors
+///
+/// `invalidParams` naming each field that `method` does not have.
+pub(crate) fn known_fields(
+    method: SignInMethod,
+    fields: &HashMap<String, String>,
+) -> Result<(), PluginError> {
+    let known: Vec<String> = describe::method(method, None)
+        .fields
+        .into_iter()
+        .map(|field| field.name)
+        .collect();
+    let mut unknown: Vec<String> = fields
+        .keys()
+        .filter(|name| !known.contains(name))
+        .map(|name| format!("{name:?}"))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(PluginError::new(
+        ErrorKind::InvalidParams,
+        format!(
+            "signIn: the {} method has no field {}; its fields are {}",
+            method.name(),
+            unknown.join(", "),
+            known.join(", ")
+        ),
+    ))
 }
 
 /// A service principal from `signIn`'s fields. The tenant is the pinned

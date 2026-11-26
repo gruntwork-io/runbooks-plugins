@@ -59,7 +59,7 @@ fn field(name: &str, label: &str, required: bool, secret: bool) -> Field {
     }
 }
 
-fn method(method: SignInMethod, unavailable: Option<&MethodUnavailable>) -> Method {
+pub(crate) fn method(method: SignInMethod, unavailable: Option<&MethodUnavailable>) -> Method {
     let (label, fields, one_of) = match method {
         SignInMethod::Cli => (
             "Azure CLI",

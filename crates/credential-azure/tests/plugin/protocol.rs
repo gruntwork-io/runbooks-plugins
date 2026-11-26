@@ -771,6 +771,23 @@ async fn bad_params_are_refused_before_anything_runs() -> TestResult {
         ),
         (
             "signIn",
+            sign_in_params("device_code", &json!({"noSuchField": "x"}), &json!({})),
+            "invalidParams",
+            "noSuchField",
+        ),
+        (
+            "signIn",
+            sign_in_params(
+                "service_principal",
+                &json!({"clientId": "00000000-0000-0000-0000-000000000001",
+                    "tenantId": CONTOSO, "clientSecret": "s", "noSuchField": "x"}),
+                &json!({}),
+            ),
+            "invalidParams",
+            "noSuchField",
+        ),
+        (
+            "signIn",
             sign_in_params(
                 "cli",
                 &json!({"tenantId": FABRIKAM}),

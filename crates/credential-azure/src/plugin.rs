@@ -649,6 +649,7 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
                 ),
             )
         })?;
+        params::known_fields(method, &params.fields)?;
         let constraints = params::constraints("signIn", &params.pins, &params.requirements)?;
         let how = match method {
             SignInMethod::Cli => Interactive::Browser,
