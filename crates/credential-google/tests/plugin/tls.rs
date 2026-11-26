@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 
 use crate::support::{
     App, BARE_TOKEN, CLOUD_PLATFORM, NOW, TestResult, USER_EMAIL, WAIT, at, detect, host,
-    openssl_output,
+    openssl_output, runbooks_limits,
 };
 
 /// A self-signed CA. Made fresh each time, no platform trusts it.
@@ -212,6 +212,7 @@ async fn start(dir: &Path, network: &[(&str, &str)]) -> TestResult<App> {
     let mut params = Map::from_iter([
         ("protocolVersion".to_owned(), json!(PROTOCOL_VERSION)),
         ("caller".to_owned(), json!("runbooks/0.31.0")),
+        ("callTimeoutsMillis".to_owned(), runbooks_limits()),
         (
             "stateDir".to_owned(),
             json!(state_dir.to_str().ok_or("a temp dir is UTF-8")?),

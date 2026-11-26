@@ -9,6 +9,9 @@
 //!   error kind `notConfigured`. A `configure` for a protocol version other
 //!   than [`PROTOCOL_VERSION`](runbooks_plugin_protocol::PROTOCOL_VERSION)
 //!   gets `unsupportedProtocolVersion`.
+//! - A call still running a second before the app's limit on its method,
+//!   from `configure`'s `callTimeoutsMillis`, is cancelled and gets error
+//!   kind `timedOut`. A `configure` is held to the limit it brings.
 //! - Errors carry their kind in `data.kind`. A line that is not a request
 //!   gets its JSON-RPC error code with kind `invalidParams`, and the next line
 //!   is read. Unknown fields are ignored.

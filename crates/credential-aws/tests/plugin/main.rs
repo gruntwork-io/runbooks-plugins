@@ -83,6 +83,11 @@ fn at(value: &Value, pointer: &str) -> Value {
     value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
+/// What Runbooks sends in `callTimeoutsMillis`.
+fn runbooks_limits() -> Value {
+    json!({"configure": 30_000, "detect": 120_000, "targets": 120_000, "select": 120_000, "env": 120_000, "signOut": 60_000, "signIn": 900_000})
+}
+
 // The fake AWS.
 
 /// What the fake answers for each access key, and the calls it got.
@@ -513,7 +518,7 @@ impl App {
         let configured = app
             .call(
                 "configure",
-                json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/state/aws-auth"}),
+                json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/state/aws-auth", "callTimeoutsMillis": runbooks_limits()}),
             )
             .await?;
         assert_valid("configureResult", &at(&configured, "/result"))?;
@@ -613,7 +618,7 @@ impl App {
 
 /// `configure`'s params, with the block's `settings`.
 fn configure_params(settings: &Value) -> Value {
-    json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/state/aws-auth", "settings": settings})
+    json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/state/aws-auth", "callTimeoutsMillis": runbooks_limits(), "settings": settings})
 }
 
 fn keys_sign_in(access_key_id: &str, extra: &[(&str, &str)]) -> Result<Value, Box<dyn Error>> {
@@ -662,7 +667,7 @@ async fn configure_offers_static_keys_the_levels_and_every_name_a_run_gets() -> 
     let result = app
         .ok(
             "configure",
-            json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/s"}),
+            json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/s", "callTimeoutsMillis": runbooks_limits()}),
             "configureResult",
         )
         .await?;
@@ -1645,7 +1650,7 @@ async fn the_static_keys_method_is_labelled_for_the_form() -> TestResult {
     let result = app
         .ok(
             "configure",
-            json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/s"}),
+            json!({"protocolVersion": PROTOCOL_VERSION, "caller": "runbooks/0.31.0", "stateDir": "/s", "callTimeoutsMillis": runbooks_limits()}),
             "configureResult",
         )
         .await?;

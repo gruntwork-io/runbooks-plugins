@@ -24,7 +24,7 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, duplex};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -133,9 +133,12 @@ impl App {
     }
 
     async fn configure(&mut self) -> TestResult {
-        let response = self
-            .call(json!(0), "configure", configure_params(PROTOCOL_VERSION))
-            .await?;
+        self.configure_with(&runbooks_limits()).await
+    }
+
+    async fn configure_with(&mut self, limits: &Value) -> TestResult {
+        let params = configure_params(PROTOCOL_VERSION, CALLER, limits);
+        let response = self.call(json!(0), "configure", params).await?;
         assert_eq!(
             at(&response, "/result/protocolVersion"),
             PROTOCOL_VERSION,
@@ -154,8 +157,18 @@ impl App {
     }
 }
 
-fn configure_params(protocol_version: &str) -> Value {
-    json!({"protocolVersion": protocol_version, "caller": "runbooks/0.31.0", "stateDir": "/state/block-1"})
+const CALLER: &str = "runbooks/0.31.0";
+
+/// A caller whose `configure` the fake never finishes.
+const HANGING_CALLER: &str = "runbooks/hangs";
+
+fn configure_params(protocol_version: &str, caller: &str, limits: &Value) -> Value {
+    json!({"protocolVersion": protocol_version, "caller": caller, "stateDir": "/state/block-1", "callTimeoutsMillis": limits})
+}
+
+/// What Runbooks sends in `callTimeoutsMillis`.
+fn runbooks_limits() -> Value {
+    json!({"configure": 30_000, "detect": 120_000, "targets": 120_000, "select": 120_000, "env": 120_000, "signOut": 60_000, "signIn": 900_000})
 }
 
 fn detect_params() -> Value {
@@ -201,11 +214,11 @@ fn identity(method: &str) -> Identity {
 }
 
 impl CredentialPlugin for Fake {
-    fn configure(
-        &self,
-        _params: ConfigureParams,
-    ) -> impl Future<Output = Result<ConfigureResult, PluginError>> + Send {
-        future::ready(Ok(ConfigureResult {
+    async fn configure(&self, params: ConfigureParams) -> Result<ConfigureResult, PluginError> {
+        if params.caller == HANGING_CALLER {
+            self.release.notified().await;
+        }
+        Ok(ConfigureResult {
             cloud: None,
             driver_version: "0.0.0".to_owned(),
             levels: Vec::new(),
@@ -214,7 +227,7 @@ impl CredentialPlugin for Fake {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             requirements: Vec::new(),
             sources: Vec::new(),
-        }))
+        })
     }
 
     fn detect(
@@ -302,7 +315,11 @@ async fn calls_before_configure_get_not_configured() -> TestResult {
 async fn an_unsupported_protocol_version_is_refused_and_configures_nothing() -> TestResult {
     let mut app = App::start(Fake::default())?;
     let response = app
-        .call(json!(1), "configure", configure_params("2"))
+        .call(
+            json!(1),
+            "configure",
+            configure_params("2", CALLER, &runbooks_limits()),
+        )
         .await?;
     assert_error(&response, &json!(1), -32000, "unsupportedProtocolVersion");
 
@@ -426,6 +443,41 @@ async fn overlapping_calls_are_answered_by_id() -> TestResult {
     let signed_in = app.receive().await?;
     assert_eq!(at(&signed_in, "/id"), 1, "{signed_in}");
     assert_eq!(at(&signed_in, "/result/method"), "sso", "{signed_in}");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_still_running_a_second_before_its_limit_is_answered_timed_out() -> TestResult {
+    let fake = Fake::default();
+    let cancelled = Arc::clone(&fake.cancelled);
+    let mut app = App::start(fake)?;
+    app.configure_with(&json!({"signIn": 1_500})).await?;
+    let started = Instant::now();
+    app.request(json!(1), "signIn", sign_in_params()).await?;
+    app.receive().await?;
+
+    let response = app.receive().await?;
+    assert_error(&response, &json!(1), -32000, "timedOut");
+    assert_eq!(started.elapsed(), Duration::from_millis(500));
+    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn configure_keeps_its_own_limit_and_one_that_times_out_configures_nothing() -> TestResult {
+    let mut app = App::start(Fake::default())?;
+    let started = Instant::now();
+    let params = configure_params(
+        PROTOCOL_VERSION,
+        HANGING_CALLER,
+        &json!({"configure": 1_200}),
+    );
+    let response = app.call(json!(1), "configure", params).await?;
+    assert_error(&response, &json!(1), -32000, "timedOut");
+    assert_eq!(started.elapsed(), Duration::from_millis(200));
+
+    let response = app.call(json!(2), "detect", detect_params()).await?;
+    assert_error(&response, &json!(2), -32000, "notConfigured");
     Ok(())
 }
 

@@ -4,8 +4,8 @@ use runbooks_credential_google::{TOKEN_URL, TokenRequest};
 use serde_json::{Value, json};
 
 use crate::support::{
-    App, CLOUD_PLATFORM, NOW, SA_EMAIL, TestResult, at, ec_key, env_value, google, rsa_key, sa_key,
-    sign_in, verifies,
+    App, CLOUD_PLATFORM, NOW, SA_EMAIL, TestResult, at, ec_key, env_value, google, rsa_key,
+    runbooks_limits, sa_key, sign_in, verifies,
 };
 
 #[tokio::test]
@@ -44,8 +44,7 @@ async fn configure_offers_the_methods_project_level_scopes_and_every_name() -> T
 #[tokio::test]
 async fn configure_refuses_a_relative_state_dir() -> TestResult {
     let mut app = App::start(&[], &google())?;
-    let params =
-        json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "state/block"});
+    let params = json!({"protocolVersion": "1", "caller": "runbooks/0.31.0", "stateDir": "state/block", "callTimeoutsMillis": runbooks_limits()});
     let error = app.error("configure", params, "invalidParams").await?;
     assert!(
         at(&error, "/message")

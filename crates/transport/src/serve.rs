@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
-use std::sync::Arc;
+use std::num::NonZeroU64;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_protocol::base::Id;
@@ -11,6 +14,7 @@ use serde_json::{Map, Value};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinError, JoinSet};
+use tokio::time;
 
 use crate::line::{Line, LineReader};
 use crate::wire::{self, Rejection, Request, RpcMethod};
@@ -26,6 +30,10 @@ pub(crate) const MAX_CALLS: usize = 16;
 
 /// Lines waiting to be written to the output.
 const OUTPUT_QUEUE: usize = 64;
+
+/// How long before its method's limit a call still running is answered
+/// `timedOut`.
+const ANSWER_BEFORE_LIMIT: Duration = Duration::from_secs(1);
 
 /// Answers requests from `input` with `plugin` until `input` ends.
 ///
@@ -48,7 +56,7 @@ where
         lines,
         running: JoinSet::new(),
         open: HashMap::new(),
-        configured: false,
+        limits: Arc::default(),
     };
     let write = async { write_lines(queue, output).await.map_err(ServeError::Write) };
     tokio::try_join!(calls.run(BufReader::new(input)), write)?;
@@ -77,24 +85,22 @@ async fn write_lines<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// A call in flight: what its response needs.
-struct OpenCall {
-    id: Id,
-    method: RpcMethod,
-}
-
 type Outcome = Result<Map<String, Value>, PluginError>;
+
+/// The app's limit on each method's answer: `configure`'s `callTimeoutsMillis`.
+struct Limits(HashMap<String, NonZeroU64>);
 
 struct Calls<P> {
     plugin: Arc<P>,
     lines: mpsc::Sender<String>,
     running: JoinSet<Outcome>,
-    /// Every task in `running`, so a call whose task panicked is still answered.
-    open: HashMap<task::Id, OpenCall>,
-    /// Set when a `configure` succeeds, before its response is written, so
-    /// the app cannot send a call that sees it unset after reading that
-    /// response.
-    configured: bool,
+    /// The request id of every task in `running`, so a call whose task
+    /// panicked is still answered.
+    open: HashMap<task::Id, Id>,
+    /// Set by the first `configure` that succeeds, before its response is
+    /// written, so the app cannot send a call that finds them unset after
+    /// reading that response.
+    limits: Arc<OnceLock<Limits>>,
 }
 
 impl<P: CredentialPlugin> Calls<P> {
@@ -125,7 +131,7 @@ impl<P: CredentialPlugin> Calls<P> {
         match request {
             Err(rejection) => self.write(wire::rejection_line(rejection)?).await,
             Ok(Request { id, method, .. })
-                if !self.configured && method != RpcMethod::Configure =>
+                if self.limits.get().is_none() && method != RpcMethod::Configure =>
             {
                 let error = PluginError::new(
                     ErrorKind::NotConfigured,
@@ -135,10 +141,14 @@ impl<P: CredentialPlugin> Calls<P> {
             }
             Ok(Request { id, method, params }) => {
                 let prompts = Prompts::new(id.clone(), self.lines.clone());
-                let task =
-                    self.running
-                        .spawn(call(Arc::clone(&self.plugin), method, params, prompts));
-                self.open.insert(task.id(), OpenCall { id, method });
+                let task = self.running.spawn(call(
+                    Arc::clone(&self.plugin),
+                    Arc::clone(&self.limits),
+                    method,
+                    params,
+                    prompts,
+                ));
+                self.open.insert(task.id(), id);
                 Ok(())
             }
         }
@@ -161,12 +171,9 @@ impl<P: CredentialPlugin> Calls<P> {
             ),
         };
         // Every task in `running` was recorded when `answer` spawned it.
-        let Some(OpenCall { id, method }) = self.open.remove(&task) else {
+        let Some(id) = self.open.remove(&task) else {
             return Ok(());
         };
-        if method == RpcMethod::Configure && outcome.is_ok() {
-            self.configured = true;
-        }
         let line = match outcome {
             Ok(result) => wire::result_line(id, result)?,
             Err(error) => wire::plugin_error_line(id, &error)?,
@@ -184,14 +191,18 @@ impl<P: CredentialPlugin> Calls<P> {
     }
 }
 
-/// One call: its params parsed into the method's type, the plugin's answer,
-/// and that answer as the response's `result`.
+/// One call: its params parsed into the method's type, the plugin's answer
+/// within the app's limit, and that answer as the response's `result`. A
+/// `configure` answers within the limits it brings, and sets them for every
+/// later call once it succeeds.
 async fn call<P: CredentialPlugin>(
     plugin: Arc<P>,
+    limits: Arc<OnceLock<Limits>>,
     method: RpcMethod,
     params: Map<String, Value>,
     prompts: Prompts,
 ) -> Outcome {
+    let configured = limits.get();
     match method {
         RpcMethod::Configure => {
             let params: ConfigureParams = parse(method, params)?;
@@ -204,18 +215,52 @@ async fn call<P: CredentialPlugin>(
                     ),
                 ));
             }
-            result(method, plugin.configure(params).await?)
+            let asked = Limits(params.call_timeouts_millis.clone());
+            let answer = within(Some(&asked), method, plugin.configure(params)).await?;
+            let result = result(method, answer)?;
+            limits.get_or_init(|| asked);
+            Ok(result)
         }
-        RpcMethod::Detect => result(method, plugin.detect(parse(method, params)?).await?),
-        RpcMethod::SignIn => result(
-            method,
-            plugin.sign_in(parse(method, params)?, prompts).await?,
-        ),
-        RpcMethod::Targets => result(method, plugin.targets(parse(method, params)?).await?),
-        RpcMethod::Select => result(method, plugin.select(parse(method, params)?).await?),
-        RpcMethod::Env => result(method, plugin.env().await?),
-        RpcMethod::SignOut => result(method, plugin.sign_out().await?),
+        RpcMethod::Detect => {
+            let answer = plugin.detect(parse(method, params)?);
+            result(method, within(configured, method, answer).await?)
+        }
+        RpcMethod::SignIn => {
+            let answer = plugin.sign_in(parse(method, params)?, prompts);
+            result(method, within(configured, method, answer).await?)
+        }
+        RpcMethod::Targets => {
+            let answer = plugin.targets(parse(method, params)?);
+            result(method, within(configured, method, answer).await?)
+        }
+        RpcMethod::Select => {
+            let answer = plugin.select(parse(method, params)?);
+            result(method, within(configured, method, answer).await?)
+        }
+        RpcMethod::Env => result(method, within(configured, method, plugin.env()).await?),
+        RpcMethod::SignOut => result(method, within(configured, method, plugin.sign_out()).await?),
     }
+}
+
+/// `answer`, or `timedOut` once it has run until a second before the app's
+/// limit on `method`. A method with no limit waits for its answer.
+async fn within<T>(
+    limits: Option<&Limits>,
+    method: RpcMethod,
+    answer: impl Future<Output = Result<T, PluginError>>,
+) -> Result<T, PluginError> {
+    let Some(limit) = limits.and_then(|limits| limits.0.get(method.name())) else {
+        return answer.await;
+    };
+    let wait = Duration::from_millis(limit.get()).saturating_sub(ANSWER_BEFORE_LIMIT);
+    time::timeout(wait, answer)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(PluginError::new(
+                ErrorKind::TimedOut,
+                format!("{method} did not finish in time: the app waits {limit} ms for it"),
+            ))
+        })
 }
 
 fn parse<T: DeserializeOwned>(

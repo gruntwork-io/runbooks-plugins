@@ -299,8 +299,7 @@ fn constructed_detect_results_are_valid() -> TestResult {
 // Runbooks 1808ae07 (draft PR #547): a provider gets its block's settings.
 
 fn configure_params(settings: Option<Value>) -> Value {
-    let mut params =
-        json!({"protocolVersion":"1","caller":"runbooks/0.31.0","stateDir":"/tmp/state"});
+    let mut params = json!({"protocolVersion":"1","caller":"runbooks/0.31.0","stateDir":"/tmp/state","callTimeoutsMillis":{"configure":30_000}});
     if let (Some(settings), Some(object)) = (settings, params.as_object_mut()) {
         object.insert("settings".to_owned(), settings);
     }
