@@ -60,6 +60,9 @@ pub struct SdkAws {
     /// endpoint for their region. Only this module's tests set one: a
     /// loopback server.
     endpoint: Option<String>,
+    /// The most pages a listing may take: [`MAX_PAGES`], or fewer in this
+    /// module's tests.
+    max_pages: usize,
     /// What every client is built from: the HTTPS client, the timeouts and
     /// the SDK's behaviour version.
     shared: SdkConfig,
@@ -109,6 +112,7 @@ impl SdkAws {
         });
         Ok(Self {
             endpoint: None,
+            max_pages: MAX_PAGES,
             shared: SdkConfig::builder()
                 .behavior_version(BehaviorVersion::latest())
                 .timeout_config(timeouts())
@@ -345,7 +349,7 @@ impl Aws for SdkAws {
         let sso = self.sso_client(region);
         let mut accounts = Vec::new();
         let mut next_token = None;
-        for _page in 0..MAX_PAGES {
+        for _page in 0..self.max_pages {
             let page = sso
                 .list_accounts()
                 .access_token(token.access_token.expose())
@@ -366,7 +370,7 @@ impl Aws for SdkAws {
                 return Ok(accounts);
             }
         }
-        Err(too_many_pages("ListAccounts"))
+        Err(too_many_pages("ListAccounts", self.max_pages))
     }
 
     async fn sso_roles(
@@ -378,7 +382,7 @@ impl Aws for SdkAws {
         let sso = self.sso_client(region);
         let mut roles = Vec::new();
         let mut next_token = None;
-        for _page in 0..MAX_PAGES {
+        for _page in 0..self.max_pages {
             let page = sso
                 .list_account_roles()
                 .access_token(token.access_token.expose())
@@ -399,7 +403,7 @@ impl Aws for SdkAws {
                 return Ok(roles);
             }
         }
-        Err(too_many_pages("ListAccountRoles"))
+        Err(too_many_pages("ListAccountRoles", self.max_pages))
     }
 
     async fn role_credentials(
@@ -488,11 +492,11 @@ fn seconds(value: i32) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn too_many_pages(operation: &str) -> AwsError {
+fn too_many_pages(operation: &str, max_pages: usize) -> AwsError {
     AwsError::new(
         Service::Sso,
         AwsErrorKind::Unexpected,
-        format!("{operation} kept paging past {MAX_PAGES} pages"),
+        format!("{operation} kept paging past {max_pages} pages"),
     )
 }
 
@@ -1011,6 +1015,42 @@ mod tests {
                     && request.ends_with(&format!(" with {ACCESS_TOKEN}"))),
             "{requests:?}"
         );
+        Ok(())
+    }
+
+    /// Listings whose every page says there is another.
+    fn endless(target: &str, _body: &str) -> String {
+        let list = if target.starts_with("/assignment/roles") {
+            "roleList"
+        } else {
+            "accountList"
+        };
+        json(200, None, &format!(r#"{{"{list}":[],"nextToken":"more"}}"#))
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_never_ends_stops_at_the_page_cap_and_names_it() -> TestResult {
+        let mut sso = FakeSso::start(endless)?;
+        sso.aws.max_pages = 3;
+        let region = Region::parse("eu-west-1")?;
+        let accounts = sso.aws.sso_accounts(&token(), &region).await.err();
+        let roles = sso
+            .aws
+            .sso_roles(&token(), &production()?, &region)
+            .await
+            .err();
+        for (error, operation) in [(accounts, "ListAccounts"), (roles, "ListAccountRoles")] {
+            let error = error.ok_or(operation)?;
+            assert_eq!(
+                (error.service, error.kind, error.detail),
+                (
+                    Service::Sso,
+                    AwsErrorKind::Unexpected,
+                    format!("{operation} kept paging past 3 pages")
+                ),
+            );
+        }
+        assert_eq!(sso.requests().len(), 6);
         Ok(())
     }
 
