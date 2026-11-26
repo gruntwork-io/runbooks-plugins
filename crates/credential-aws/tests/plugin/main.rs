@@ -54,14 +54,37 @@ const TOKEN: &str = "test-session-token";
 const SCHEMAS: [&str; 2] = ["base.schema.json", "credential.schema.json"];
 const ROOT: &str = "json-schema:///";
 
+fn schema_file(file: &str) -> Result<Value, Box<dyn Error>> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../schema")
+        .join(file);
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+}
+
+/// How long before expiry `env` must refresh a credential: the N in
+/// envResult's "within N minutes".
+fn refresh_window() -> Result<time::Duration, Box<dyn Error>> {
+    let schema = schema_file("credential.schema.json")?;
+    let description = schema
+        .pointer("/$defs/envResult/description")
+        .and_then(Value::as_str)
+        .ok_or("credential.schema.json has no envResult description")?;
+    let unstated =
+        || format!("envResult's description says no \"within N minutes\": {description}");
+    let (minutes, _) = description
+        .split_once("within ")
+        .and_then(|(_, rest)| rest.split_once(" minutes"))
+        .ok_or_else(unstated)?;
+    let minutes = minutes
+        .parse()
+        .map_err(|error| format!("{}: {error}", unstated()))?;
+    Ok(time::Duration::minutes(minutes))
+}
+
 fn validator(schema: &Value) -> Result<Validator, Box<dyn Error>> {
     let mut registry = Registry::new();
     for file in SCHEMAS {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../schema")
-            .join(file);
-        let contents: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
-        registry = registry.add(format!("{ROOT}{file}"), contents)?;
+        registry = registry.add(format!("{ROOT}{file}"), schema_file(file)?)?;
     }
     let registry = registry.prepare()?;
     Ok(jsonschema::options()
