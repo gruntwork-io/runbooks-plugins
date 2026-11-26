@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 #MISE description="Build every binary for one target into target/dist, under its release asset name"
-#USAGE arg "<target>" help="aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc"
+#USAGE arg "<target>" help="aarch64-apple-darwin, x86_64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc"
 set -euo pipefail
 
 target=${usage_target:?}
 case "${target}" in
 aarch64-apple-darwin) platform=darwin_arm64 ;;
 x86_64-apple-darwin) platform=darwin_amd64 ;;
+aarch64-unknown-linux-gnu) platform=linux_arm64 ;;
 x86_64-unknown-linux-gnu) platform=linux_amd64 ;;
 x86_64-pc-windows-msvc) platform=windows_amd64 ;;
 *)
   echo "dist: no release asset name for target '${target}'. Expected aarch64-apple-darwin," \
-    "x86_64-apple-darwin, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc." >&2
+    "x86_64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc." >&2
   exit 2
   ;;
 esac

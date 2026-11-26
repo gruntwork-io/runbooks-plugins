@@ -60,13 +60,13 @@ jobs:
           version: 2026.11.8 # mise.toml's min_version.
       - run: mise run audit
 
-  # The binaries ship for macOS and Windows too, and their path and process code needs a native run.
+  # The binaries ship for macOS, Windows and arm64 Linux too, and each needs a native run.
   platforms:
     name: Test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:

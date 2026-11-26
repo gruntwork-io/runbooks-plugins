@@ -62,7 +62,9 @@ jobs:
             runner: macos-26
           - target: x86_64-apple-darwin
             runner: macos-26
-          # Links against glibc 2.35, the oldest a GitHub runner offers, so older distributions run it.
+          # The Linux ones link against glibc 2.35, the oldest a GitHub runner offers, so older distributions run them.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
           - target: x86_64-pc-windows-msvc
