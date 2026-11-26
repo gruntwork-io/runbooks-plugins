@@ -878,14 +878,10 @@ async fn configure_refuses_settings_since_azure_has_none() -> TestResult {
         Host::new([], cfg!(windows)),
         FakeAz::new(World::one_subscription()?),
     ))?;
-    let response = app
-        .call(
-            "configure",
-            json!({"protocolVersion": "1", "caller": "runbooks/0.31.0",
-                "stateDir": state.path().to_str().ok_or("not UTF-8")?,
-                "callTimeoutsMillis": {"configure": 30_000}, "settings": {"defaultRegion": "eastus"}}),
-        )
-        .await?;
+    let with_settings = json!({"protocolVersion": "1", "caller": "runbooks/0.31.0",
+        "stateDir": state.path().to_str().ok_or("not UTF-8")?,
+        "callTimeoutsMillis": {"configure": 30_000}, "settings": {"defaultRegion": "eastus"}});
+    let response = app.call("configure", with_settings.clone()).await?;
     assert_eq!(error_kind(&response), Some("invalidParams"), "{response}");
     assert!(
         error_message(&response).is_some_and(|message| message.contains("settings")),
@@ -893,5 +889,9 @@ async fn configure_refuses_settings_since_azure_has_none() -> TestResult {
     );
     let detect = app.call("detect", cli_detect()).await?;
     assert_eq!(error_kind(&detect), Some("notConfigured"), "{detect}");
+
+    app.configure(state.path()).await?;
+    let again = app.call("configure", with_settings).await?;
+    assert_eq!(error_kind(&again), Some("invalidParams"), "{again}");
     Ok(())
 }
