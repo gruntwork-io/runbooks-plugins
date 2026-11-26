@@ -24,5 +24,5 @@ pub use api::{
     ApiError, GoogleApi, HttpApi, MAX_RESPONSE_BYTES, Network, NetworkError, OAuthError, Project,
     ProjectPage, TIMEOUT, TOKEN_URL, Token, TokenInfo, TokenRequest,
 };
-pub use plugin::{Connect, GooglePlugin, Host, MAX_PROJECTS};
+pub use plugin::{Connect, GooglePlugin, Host, MAX_PAGES, MAX_PROJECTS};
 pub use secret::Secret;

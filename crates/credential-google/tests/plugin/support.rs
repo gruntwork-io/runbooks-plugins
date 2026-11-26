@@ -97,6 +97,8 @@ struct GoogleState {
     denied: Vec<String>,
     token_requests: Vec<TokenRequest>,
     page_sizes: Vec<u32>,
+    /// Every search page is empty and names another.
+    endless: bool,
 }
 
 /// Google, in memory.
@@ -130,6 +132,11 @@ impl Google {
                 state: state.map(str::to_owned),
             });
         });
+        self
+    }
+
+    pub(crate) fn endless(&self) -> &Self {
+        self.with(|state| state.endless = true);
         self
     }
 
@@ -171,6 +178,12 @@ impl Google {
         let size = usize::try_from(page_size).map_err(|_too_big| ApiError::Malformed)?;
         self.with(|state| {
             state.page_sizes.push(page_size);
+            if state.endless {
+                return Ok(ProjectPage {
+                    projects: Vec::new(),
+                    next_page_token: Some((start + 1).to_string()),
+                });
+            }
             let end = (start + size).min(state.projects.len());
             Ok(ProjectPage {
                 projects: state.projects.get(start..end).unwrap_or_default().to_vec(),

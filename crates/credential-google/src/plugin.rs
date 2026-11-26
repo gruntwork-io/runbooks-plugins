@@ -30,6 +30,9 @@ use crate::sources::{self, FoundVars, Prefix, VarCredential};
 pub const MAX_PROJECTS: usize = 500;
 /// The largest page asked for.
 const PAGE_SIZE: usize = 1000;
+/// The most pages `targets` reads: a guard against a listing that never
+/// ends, since a page can hold no live project and still name another.
+pub const MAX_PAGES: usize = 1000;
 const MAX_CA_BUNDLE_BYTES: usize = 1024 * 1024;
 
 const SERVICE_ACCOUNT: &str = "service_account";
@@ -542,6 +545,38 @@ fn live_target(project: Project) -> Option<Target> {
         })
 }
 
+/// Up to [`MAX_PROJECTS`] live projects the token can see, from at most
+/// [`MAX_PAGES`] pages.
+async fn live_projects<A: GoogleApi>(
+    api: &A,
+    token: &Secret,
+    origin: Origin,
+) -> Result<Vec<Target>, PluginError> {
+    let mut targets = Vec::new();
+    let mut page_token = None;
+    for _page in 0..MAX_PAGES {
+        let size = (MAX_PROJECTS - targets.len()).min(PAGE_SIZE);
+        let page = api
+            .search_projects(
+                token,
+                page_token.as_deref(),
+                u32::try_from(size).unwrap_or(1),
+            )
+            .await
+            .map_err(|error| api_error(&error, origin))?;
+        targets.extend(page.projects.into_iter().filter_map(live_target));
+        page_token = page.next_page_token;
+        if page_token.is_none() || targets.len() >= MAX_PROJECTS {
+            targets.truncate(MAX_PROJECTS);
+            return Ok(targets);
+        }
+    }
+    Err(PluginError::new(
+        ErrorKind::Internal,
+        format!("searchProjects kept paging past {MAX_PAGES} pages"),
+    ))
+}
+
 /// A detection source, checked before any is read.
 enum Lookup {
     Vars {
@@ -734,25 +769,7 @@ impl<A: GoogleApi> CredentialPlugin for GooglePlugin<A> {
         let session = self.session()?;
         let origin = Origin::of(&session.credential);
         let token = self.prover(&api).token(&session.credential).await?;
-        let mut targets = Vec::new();
-        let mut page_token = None;
-        loop {
-            let size = (MAX_PROJECTS - targets.len()).min(PAGE_SIZE);
-            let page = api
-                .search_projects(
-                    &token,
-                    page_token.as_deref(),
-                    u32::try_from(size).unwrap_or(1),
-                )
-                .await
-                .map_err(|error| api_error(&error, origin))?;
-            targets.extend(page.projects.into_iter().filter_map(live_target));
-            page_token = page.next_page_token;
-            if page_token.is_none() || targets.len() >= MAX_PROJECTS {
-                break;
-            }
-        }
-        targets.truncate(MAX_PROJECTS);
+        let targets = live_projects(&*api, &token, origin).await?;
         self.state().project_names = targets
             .iter()
             .map(|target| (target.id.clone(), target.name.clone()))
