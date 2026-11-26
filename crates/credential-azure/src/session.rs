@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 
-use runbooks_plugin_protocol::credential::{EnvValue, EnvValueToItem, Identity, IdentityKind};
+use runbooks_plugin_protocol::credential::{
+    EnvValue, EnvValueKind, EnvValueToItem, Identity, IdentityKind,
+};
 
 use crate::az::{AzDir, Subscription, Tenant};
 use crate::choose::{Pins, subscription_target, tenant_target};
@@ -112,7 +114,7 @@ impl Session {
     /// `azapi` use the sign-in in `AZURE_CONFIG_DIR` through `ARM_USE_CLI`.
     pub(crate) fn env(&self, chosen: &Chosen) -> Vec<EnvValue> {
         let mut values = Values::default();
-        values.both("AZURE_CONFIG_DIR", path(&self.dir.config));
+        values.file("AZURE_CONFIG_DIR", path(&self.dir.config));
         values.both(
             "AZURE_EXTENSION_DIR",
             path(
@@ -147,7 +149,7 @@ impl Session {
                 // certificates, so a PEM one goes through az too.
                 values.both("ARM_USE_CLI", "true".to_owned());
                 if let Some(Credential::Certificate(copy)) = certificate {
-                    values.both("AZURE_CLIENT_CERTIFICATE_PATH", path(copy));
+                    values.file("AZURE_CLIENT_CERTIFICATE_PATH", path(copy));
                 }
             }
         }
@@ -182,31 +184,36 @@ impl Values {
         &mut self,
         name: &str,
         value: Option<String>,
-        sensitive: bool,
+        kind: EnvValueKind,
         to: Vec<EnvValueToItem>,
     ) {
         if let Some(value) = value {
-            self.0.push(EnvValue {
-                name: name.to_owned(),
-                sensitive,
-                to,
-                value,
-            });
+            self.0.push(EnvValue::new(name, value, kind, to));
         }
     }
 
     fn both(&mut self, name: &str, value: impl Into<Option<String>>) {
         let to = vec![EnvValueToItem::Env, EnvValueToItem::Output];
-        self.push(name, value.into(), false, to);
+        self.push(name, value.into(), EnvValueKind::Plain, to);
+    }
+
+    fn file(&mut self, name: &str, path: Option<String>) {
+        let to = vec![EnvValueToItem::Env, EnvValueToItem::Output];
+        self.push(name, path, EnvValueKind::File, to);
     }
 
     /// A sensitive output: a template that shows it shows `<redacted>`.
     fn secret(&mut self, name: &str, value: &str) {
         let to = vec![EnvValueToItem::Env, EnvValueToItem::Output];
-        self.push(name, Some(value.to_owned()), true, to);
+        self.push(name, Some(value.to_owned()), EnvValueKind::Sensitive, to);
     }
 
     fn output(&mut self, name: &str, value: String) {
-        self.push(name, Some(value), false, vec![EnvValueToItem::Output]);
+        self.push(
+            name,
+            Some(value),
+            EnvValueKind::Plain,
+            vec![EnvValueToItem::Output],
+        );
     }
 }

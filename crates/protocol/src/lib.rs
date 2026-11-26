@@ -74,4 +74,34 @@ pub mod credential {
             }
         }
     }
+
+    /// What an [`EnvValue`] holds.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum EnvValueKind {
+        /// Neither a secret nor a file.
+        Plain,
+        /// A secret.
+        Sensitive,
+        /// The absolute path of a file or folder under `stateDir` that only
+        /// its owner can read.
+        File,
+    }
+
+    impl EnvValue {
+        /// The value `name` takes in what `to` names.
+        pub fn new(
+            name: impl Into<String>,
+            value: impl Into<String>,
+            kind: EnvValueKind,
+            to: Vec<EnvValueToItem>,
+        ) -> Self {
+            Self {
+                file: kind == EnvValueKind::File,
+                name: name.into(),
+                sensitive: kind == EnvValueKind::Sensitive,
+                to,
+                value: value.into(),
+            }
+        }
+    }
 }

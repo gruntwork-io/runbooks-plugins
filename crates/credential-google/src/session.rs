@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use runbooks_plugin_protocol::Timestamp;
+use runbooks_plugin_protocol::credential::EnvValueKind::{self, File, Plain, Sensitive};
 use runbooks_plugin_protocol::credential::{
     EnvValue, EnvValueToItem, ErrorKind, Identity, IdentityKind, Pins, Requirement, Target,
 };
@@ -313,42 +314,37 @@ impl Session {
         const BOTH: &[EnvValueToItem] = &[EnvValueToItem::Env, EnvValueToItem::Output];
         const ENV: &[EnvValueToItem] = &[EnvValueToItem::Env];
         let mut values = Vec::new();
-        let mut set = |names: &[&str], value: &str, sensitive: bool, to: &[EnvValueToItem]| {
+        let mut set = |names: &[&str], value: &str, kind: EnvValueKind, to: &[EnvValueToItem]| {
             for name in names {
-                values.push(EnvValue {
-                    name: (*name).to_owned(),
-                    sensitive,
-                    to: to.to_vec(),
-                    value: value.to_owned(),
-                });
+                values.push(EnvValue::new(*name, value, kind, to.to_vec()));
             }
         };
         match (&self.credential, credentials_file) {
             (Credential::AccessToken(token), _) => {
-                set(&ACCESS_TOKEN_VARS, token.expose(), true, ENV);
+                set(&ACCESS_TOKEN_VARS, token.expose(), Sensitive, ENV);
             }
-            (Credential::Document(_), Some(path)) => set(&CREDENTIAL_FILE_VARS, path, false, BOTH),
+            (Credential::Document(_), Some(path)) => set(&CREDENTIAL_FILE_VARS, path, File, BOTH),
             (Credential::Document(_), None) => {}
         }
         if let Some(project) = &self.project {
-            set(&PROJECT_VARS, &project.id, false, BOTH);
+            set(&PROJECT_VARS, &project.id, Plain, BOTH);
         }
         if !self.principal.is_empty() {
-            set(&[ACCOUNT_VAR], &self.principal, false, BOTH);
+            set(&[ACCOUNT_VAR], &self.principal, Plain, BOTH);
         }
         if let Some(region) = &self.region {
-            set(&REGION_VARS, region, false, BOTH);
+            set(&REGION_VARS, region, Plain, BOTH);
         }
         if let Some(zone) = &self.zone {
-            set(&ZONE_VARS, zone, false, BOTH);
+            set(&ZONE_VARS, zone, Plain, BOTH);
         }
         if let Some(configuration) = &self.configuration {
-            set(&[CONFIGURATION_VAR], configuration.as_str(), false, ENV);
+            set(&[CONFIGURATION_VAR], configuration.as_str(), Plain, ENV);
         }
         set(
             &[AUTH_TYPE_OUTPUT],
             self.credential.credential_type().name(),
-            false,
+            Plain,
             &[EnvValueToItem::Output],
         );
         values
