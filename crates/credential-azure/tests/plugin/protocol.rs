@@ -870,3 +870,28 @@ async fn configure_again_with_another_state_dir_is_refused() -> TestResult {
     assert_eq!(error_kind(&relative), Some("invalidParams"), "{relative}");
     Ok(())
 }
+
+#[tokio::test]
+async fn configure_refuses_settings_since_azure_has_none() -> TestResult {
+    let state = tempfile::tempdir()?;
+    let mut app = App::start(AzurePlugin::new(
+        Host::new([], cfg!(windows)),
+        FakeAz::new(World::one_subscription()?),
+    ))?;
+    let response = app
+        .call(
+            "configure",
+            json!({"protocolVersion": "1", "caller": "runbooks/0.31.0",
+                "stateDir": state.path().to_str().ok_or("not UTF-8")?,
+                "callTimeoutsMillis": {"configure": 30_000}, "settings": {"defaultRegion": "eastus"}}),
+        )
+        .await?;
+    assert_eq!(error_kind(&response), Some("invalidParams"), "{response}");
+    assert!(
+        error_message(&response).is_some_and(|message| message.contains("settings")),
+        "{response}"
+    );
+    let detect = app.call("detect", cli_detect()).await?;
+    assert_eq!(error_kind(&detect), Some("notConfigured"), "{detect}");
+    Ok(())
+}
