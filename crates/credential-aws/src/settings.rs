@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use runbooks_plugin_transport::shown_name;
+
 use crate::methods::DEFAULT_REGION;
 use crate::region::{InvalidRegion, Region};
 
@@ -10,7 +12,7 @@ use crate::region::{InvalidRegion, Region};
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{}", self.describe())]
 pub(crate) struct InvalidSettings {
-    /// Settings AWS does not have, each cut to 64 characters.
+    /// Settings AWS does not have, each as `shown_name` shows it.
     pub unknown: BTreeSet<String>,
     pub region: Option<InvalidRegion>,
 }
@@ -45,7 +47,7 @@ pub(crate) fn default_region(
     let unknown: BTreeSet<String> = settings
         .keys()
         .filter(|name| name.as_str() != DEFAULT_REGION)
-        .map(|name| name.chars().take(64).collect())
+        .map(|name| shown_name(name).to_owned())
         .collect();
     let region = settings
         .get(DEFAULT_REGION)

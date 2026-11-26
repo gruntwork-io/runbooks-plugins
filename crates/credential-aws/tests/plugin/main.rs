@@ -783,7 +783,8 @@ async fn the_blocks_default_region_is_the_runs_when_nothing_else_names_one() -> 
 #[tokio::test]
 async fn settings_aws_does_not_have_or_a_bad_region_are_refused_by_name() -> TestResult {
     let mut app = App::start(FakeAws::default(), Environment::default()).await?;
-    let cut = format!("no setting {}: its", "a".repeat(64));
+    let hidden =
+        "AWS has no setting (a name that is not an identifier): its only setting is defaultRegion";
     for (settings, says, never) in [
         (
             json!({"defaultZone": "us-east-1a", "projectId": "p", "defaultRegion": "Ohio"}),
@@ -803,8 +804,12 @@ async fn settings_aws_does_not_have_or_a_bad_region_are_refused_by_name() -> Tes
             vec!["AWS has no setting region: its only setting is defaultRegion"],
             Some("invalid"),
         ),
-        // A name is cut to 64 characters.
-        (json!({"a".repeat(100): "x"}), vec![cut.as_str()], None),
+        (json!({"a".repeat(65): "x"}), vec![hidden], Some("aaaa")),
+        (
+            json!({"SENTINEL VALUE": "x"}),
+            vec![hidden],
+            Some("SENTINEL"),
+        ),
     ] {
         let error = app
             .fails("configure", configure_params(&settings), "invalidParams")
