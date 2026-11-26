@@ -136,6 +136,22 @@ async fn env_points_a_run_at_a_private_copy_of_the_key_and_sign_out_deletes_it()
     let bridge =
         env_value(&env, "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE").ok_or("no gcloud bridge")?;
     assert_eq!(bridge.0, path);
+    let mut files: Vec<&str> = env
+        .get("values")
+        .and_then(Value::as_array)
+        .ok_or("no values")?
+        .iter()
+        .filter(|value| value["file"] == true)
+        .filter_map(|value| value["name"].as_str())
+        .collect();
+    files.sort_unstable();
+    assert_eq!(
+        files,
+        [
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+            "GOOGLE_APPLICATION_CREDENTIALS"
+        ]
+    );
     for name in [
         "GOOGLE_CLOUD_PROJECT",
         "CLOUDSDK_CORE_PROJECT",

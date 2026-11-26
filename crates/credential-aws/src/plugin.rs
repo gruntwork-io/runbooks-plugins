@@ -4,6 +4,7 @@ use std::future::{self, Future};
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use runbooks_plugin_protocol::credential::EnvValueKind::{Plain, Sensitive};
 use runbooks_plugin_protocol::credential::{
     ConfigureParams, ConfigureResult, DetectParams, DetectResult, EnvResult, EnvValue,
     EnvValueToItem, ErrorKind, Identity, IdentityWarningsItem, Requirement, SelectParams,
@@ -808,26 +809,27 @@ impl<A: Aws, C: Clock> CredentialPlugin for AwsPlugin<A, C> {
 /// session does, keeps their expiry.
 fn env_values(ready: &Ready) -> Result<Vec<EnvValue>, PluginError> {
     let both = || vec![EnvValueToItem::Env, EnvValueToItem::Output];
-    let value = |name: &str, value: &str, sensitive, to| EnvValue {
-        name: name.to_owned(),
-        sensitive,
-        to,
-        value: value.to_owned(),
-    };
     let credentials = &ready.credentials;
     let mut values = vec![
-        value(AWS_ACCESS_KEY_ID, &credentials.access_key_id, false, both()),
-        value(
+        EnvValue::new(AWS_ACCESS_KEY_ID, &credentials.access_key_id, Plain, both()),
+        EnvValue::new(
             AWS_SECRET_ACCESS_KEY,
             credentials.secret_access_key.expose(),
-            true,
+            Sensitive,
             both(),
         ),
         credentials.session_token.as_ref().map_or_else(
-            || value(AWS_SESSION_TOKEN, "", true, vec![EnvValueToItem::Output]),
-            |token| value(AWS_SESSION_TOKEN, token.expose(), true, both()),
+            || {
+                EnvValue::new(
+                    AWS_SESSION_TOKEN,
+                    "",
+                    Sensitive,
+                    vec![EnvValueToItem::Output],
+                )
+            },
+            |token| EnvValue::new(AWS_SESSION_TOKEN, token.expose(), Sensitive, both()),
         ),
-        value(AWS_REGION, ready.region.as_str(), false, both()),
+        EnvValue::new(AWS_REGION, ready.region.as_str(), Plain, both()),
     ];
     if let Some(expires_at) = credentials.expires_at {
         let at = expires_at.format(&Rfc3339).map_err(|error| {
@@ -836,7 +838,7 @@ fn env_values(ready: &Ready) -> Result<Vec<EnvValue>, PluginError> {
                 format!("the AWS credentials' expiry {expires_at} cannot be written in RFC 3339: {error}"),
             )
         })?;
-        values.push(value(AWS_CREDENTIAL_EXPIRATION, &at, false, both()));
+        values.push(EnvValue::new(AWS_CREDENTIAL_EXPIRATION, at, Plain, both()));
     }
     Ok(values)
 }

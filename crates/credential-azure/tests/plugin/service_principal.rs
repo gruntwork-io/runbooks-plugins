@@ -235,6 +235,16 @@ async fn a_certificate_is_used_through_the_blocks_own_copy() -> TestResult {
         env_value(&env, "AZURE_CLIENT_CERTIFICATE_PATH").map(Path::new),
         Some(copy.as_path())
     );
+    let mut files: Vec<&str> = env
+        .get("values")
+        .and_then(Value::as_array)
+        .ok_or("no values")?
+        .iter()
+        .filter(|value| value["file"] == true)
+        .filter_map(|value| value["name"].as_str())
+        .collect();
+    files.sort_unstable();
+    assert_eq!(files, ["AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CONFIG_DIR"]);
     assert_eq!(env_value(&env, "AZURE_SUBSCRIPTION_ID"), Some(DEV));
     assert_eq!(env_value(&env, "ARM_USE_CLI"), Some("true"));
     for name in ["ARM_TENANT_ID", "ARM_CLIENT_SECRET", "AZURE_CLIENT_SECRET"] {

@@ -535,3 +535,23 @@ fn a_values_source_names_its_block() -> TestResult {
         &json!({"sources":[{"kind":"values","values":{}}],"pins":{},"requirements":[]}),
     )
 }
+
+#[test]
+fn an_env_values_kind_sets_sensitive_and_file() -> TestResult {
+    use credential::{EnvValue, EnvValueKind, EnvValueToItem};
+    for (kind, sensitive, file) in [
+        (EnvValueKind::Plain, false, false),
+        (EnvValueKind::Sensitive, true, false),
+        (EnvValueKind::File, false, true),
+    ] {
+        let value = EnvValue::new("NAME", "/abs/path", kind, vec![EnvValueToItem::Env]);
+        let value = serde_json::to_value(value)?;
+        assert_valid("credential.schema.json#/$defs/envValue", &value)?;
+        assert_eq!(
+            (value.get("sensitive"), value.get("file")),
+            (Some(&json!(sensitive)), Some(&json!(file))),
+            "{kind:?}"
+        );
+    }
+    Ok(())
+}
