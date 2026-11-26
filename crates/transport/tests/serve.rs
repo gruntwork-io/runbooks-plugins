@@ -187,7 +187,15 @@ struct Fake {
     release: Arc<Notify>,
     /// Sign-ins whose future was dropped before it finished.
     cancelled: Arc<AtomicUsize>,
+    /// How long the name of level [`PADDED`]'s target is.
+    padding: Arc<AtomicUsize>,
 }
+
+/// A level whose one target's name is as long as [`Fake::padding`] says.
+const PADDED: &str = "padded";
+
+/// A sign-in method whose prompt is longer than a line may be.
+const OVERSIZED_PROMPT: &str = "oversized";
 
 struct CountIfCancelled {
     cancelled: Arc<AtomicUsize>,
@@ -246,12 +254,12 @@ impl CredentialPlugin for Fake {
             cancelled: Arc::clone(&self.cancelled),
             finished: false,
         };
-        prompts
-            .open_url(
-                "https://device.sso.us-east-1.amazonaws.com/",
-                Some("ABCD-EFGH".to_owned()),
-            )
-            .await?;
+        let url = if params.method == OVERSIZED_PROMPT {
+            "x".repeat(MAX_LINE_BYTES)
+        } else {
+            "https://device.sso.us-east-1.amazonaws.com/".to_owned()
+        };
+        prompts.open_url(url, Some("ABCD-EFGH".to_owned())).await?;
         self.release.notified().await;
         guard.finished = true;
         Ok(SignInResult(identity(&params.method)))
@@ -262,10 +270,15 @@ impl CredentialPlugin for Fake {
         params: TargetsParams,
     ) -> impl Future<Output = Result<TargetsResult, PluginError>> + Send {
         assert_ne!(params.level, "panic", "the test asked targets to panic");
+        let name = if params.level == PADDED {
+            "x".repeat(self.padding.load(Ordering::SeqCst))
+        } else {
+            params.level.clone()
+        };
         future::ready(Ok(TargetsResult {
             targets: vec![Target {
-                id: params.level.clone(),
-                name: params.level,
+                id: params.level,
+                name,
             }],
         }))
     }
@@ -478,6 +491,37 @@ async fn configure_keeps_its_own_limit_and_one_that_times_out_configures_nothing
 
     let response = app.call(json!(2), "detect", detect_params()).await?;
     assert_error(&response, &json!(2), -32000, "notConfigured");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_answer_up_to_the_line_limit_is_written_and_a_longer_one_is_internal() -> TestResult {
+    let fake = Fake::default();
+    let padding = Arc::clone(&fake.padding);
+    let mut app = App::start(fake)?;
+    app.configure().await?;
+    let padded = json!({"level": PADDED});
+    let short = app.call(json!(10), "targets", padded.clone()).await?;
+    let room = MAX_LINE_BYTES - serde_json::to_string(&short)?.len();
+
+    padding.store(room, Ordering::SeqCst);
+    let full = app.call(json!(11), "targets", padded.clone()).await?;
+    assert_eq!(serde_json::to_string(&full)?.len(), MAX_LINE_BYTES);
+    assert_eq!(at(&full, "/id"), 11);
+
+    padding.store(room + 1, Ordering::SeqCst);
+    let over = app.call(json!(12), "targets", padded).await?;
+    assert_error(&over, &json!(12), -32000, "internal");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_prompt_longer_than_a_line_is_not_written_and_fails_the_sign_in() -> TestResult {
+    let mut app = App::start(Fake::default())?;
+    app.configure().await?;
+    let params = json!({"method": OVERSIZED_PROMPT, "fields": {}, "pins": {}, "requirements": []});
+    let response = app.call(json!(1), "signIn", params).await?;
+    assert_error(&response, &json!(1), -32000, "internal");
     Ok(())
 }
 

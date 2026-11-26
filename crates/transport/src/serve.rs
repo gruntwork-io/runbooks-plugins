@@ -20,9 +20,31 @@ use crate::line::{Line, LineReader};
 use crate::wire::{self, Rejection, Request, RpcMethod};
 use crate::{CredentialPlugin, PluginError, Prompts, ServeError};
 
-/// The longest line the plugin reads. A longer one is answered as an invalid
-/// request and skipped. The app caps the plugin's own lines at the same size.
+/// The longest line the plugin reads or writes, without its newline.
+///
+/// A longer request is answered as an invalid request and skipped. The app
+/// reads no longer line either, so a longer answer is replaced by error kind
+/// `internal`.
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// `line`, if the app can read it.
+///
+/// # Errors
+///
+/// Kind `internal`, naming `what`, if `line` is longer than [`MAX_LINE_BYTES`].
+pub(crate) fn fit(line: String, what: &str) -> Result<String, PluginError> {
+    if line.len() <= MAX_LINE_BYTES {
+        Ok(line)
+    } else {
+        Err(PluginError::new(
+            ErrorKind::Internal,
+            format!(
+                "{what} is {} bytes, over the {MAX_LINE_BYTES} a line may hold",
+                line.len()
+            ),
+        ))
+    }
+}
 
 /// Calls answered at once. With this many in flight, the plugin reads no
 /// further line until one finishes.
@@ -175,7 +197,11 @@ impl<P: CredentialPlugin> Calls<P> {
             return Ok(());
         };
         let line = match outcome {
-            Ok(result) => wire::result_line(id, result)?,
+            Ok(result) => wire::result_line(id.clone(), result)?,
+            Err(error) => wire::plugin_error_line(id.clone(), &error)?,
+        };
+        let line = match fit(line, "the answer") {
+            Ok(line) => line,
             Err(error) => wire::plugin_error_line(id, &error)?,
         };
         self.write(line).await

@@ -9,7 +9,7 @@ use runbooks_plugin_protocol::credential::{
 use tokio::sync::mpsc;
 
 use crate::PluginError;
-use crate::wire;
+use crate::{serve, wire};
 
 /// A credential plugin: one method per protocol method, each given its
 /// parsed params. [`serve`](crate::serve) runs calls concurrently, so each
@@ -125,6 +125,7 @@ impl Prompts {
                 format!("encoding a signIn.prompt: {error}"),
             )
         })?;
+        let line = serve::fit(line, "a signIn.prompt")?;
         self.lines
             .send(line)
             .await
