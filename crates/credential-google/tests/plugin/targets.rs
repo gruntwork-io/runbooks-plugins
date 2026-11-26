@@ -1,3 +1,4 @@
+use runbooks_credential_google::MAX_PAGES;
 use serde_json::{Value, json};
 
 use crate::support::{App, Google, TestResult, USER_ADC, at, google, rsa_key, sa_key, sign_in};
@@ -43,10 +44,35 @@ async fn targets_lists_live_projects_across_pages_up_to_the_cap() -> TestResult 
         "a project pending deletion was listed"
     );
     assert_eq!(
-        google.page_sizes().first(),
-        Some(&500),
+        google.page_sizes(),
+        [500, 1],
         "asks for no more than the cap"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn targets_stops_at_the_page_cap_when_pages_never_end() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let google = google();
+    google.endless();
+    let mut app = App::start(&[("GOOGLE_CREDENTIALS", USER_ADC)], &google)?;
+    app.configure(dir.path()).await?;
+    app.ok(
+        "detect",
+        "detectResult",
+        json!({"sources": [{"kind": "env"}], "pins": {}, "requirements": []}),
+    )
+    .await?;
+
+    let error = app
+        .error("targets", json!({"level": "project"}), "internal")
+        .await?;
+    assert_eq!(
+        at(&error, "/message"),
+        format!("searchProjects kept paging past {MAX_PAGES} pages")
+    );
+    assert_eq!(google.page_sizes().len(), MAX_PAGES);
     Ok(())
 }
 
