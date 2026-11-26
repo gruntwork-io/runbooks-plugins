@@ -7,6 +7,10 @@ on:
 
 permissions: {}
 
+env:
+  # No job runs az, and uv only installs it.
+  MISE_DISABLE_TOOLS: azure-cli,uv
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
