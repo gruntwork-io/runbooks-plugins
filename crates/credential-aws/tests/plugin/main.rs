@@ -1702,6 +1702,17 @@ async fn an_unknown_field_alone_refuses_a_sign_in() -> TestResult {
         at(&error, "/message"),
         "the credentials method has no field nope: its fields are accessKeyId, secretAccessKey, sessionToken, defaultRegion"
     );
+    let error = app
+        .fails(
+            "signIn",
+            keys_sign_in("AKIA", &[("SENTINEL VALUE", "x")])?,
+            "invalidParams",
+        )
+        .await?;
+    assert_eq!(
+        at(&error, "/message"),
+        "the credentials method has no field (a name that is not an identifier): its fields are accessKeyId, secretAccessKey, sessionToken, defaultRegion"
+    );
     let missing = json!({"method": "credentials", "fields": {"accessKeyId": "AKIA"}, "pins": {}, "requirements": []});
     let error = app.fails("signIn", missing, "invalidParams").await?;
     assert_eq!(

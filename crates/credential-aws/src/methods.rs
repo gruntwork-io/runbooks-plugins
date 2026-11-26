@@ -7,6 +7,7 @@ use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_protocol::credential::{
     ConfigureResult, ConfigureResultCloud, Field, FieldChoicesItem, Level, LevelChosen, Method,
 };
+use runbooks_plugin_transport::shown_name;
 
 use crate::detect::{
     AWS_ACCESS_KEY_ID, AWS_CREDENTIAL_EXPIRATION, AWS_REGION, AWS_SECRET_ACCESS_KEY,
@@ -245,7 +246,7 @@ impl<'a> Fields<'a> {
         let mut unknown: Vec<String> = values
             .keys()
             .filter(|name| !specs.iter().any(|spec| spec.name == name.as_str()))
-            .map(|name| name.chars().take(64).collect())
+            .map(|name| shown_name(name).to_owned())
             .collect();
         unknown.sort();
         let fields = Self { values };
