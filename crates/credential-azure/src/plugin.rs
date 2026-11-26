@@ -720,9 +720,9 @@ impl<C: Connect> CredentialPlugin for AzurePlugin<C> {
 
     async fn select(&self, params: SelectParams) -> Result<SelectResult, PluginError> {
         let configured = self.configured()?;
-        let (tenant, subscription) = params::choice(&params.targets)?;
         let mut held = self.session.lock().await;
         let session = held.as_mut().ok_or_else(not_signed_in)?;
+        let (tenant, subscription) = params::choice(&params.targets)?;
         choose::check_choice(
             &session.tenants,
             &session.subscriptions,

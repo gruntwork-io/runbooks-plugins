@@ -701,11 +701,21 @@ async fn a_tenant_with_no_subscription_signs_in_with_none() -> TestResult {
 #[tokio::test]
 async fn select_and_targets_refuse_what_the_sign_in_cannot_see() -> TestResult {
     let mut fixture = Fixture::new(World::two_tenants()?).await?;
-    let before = fixture
-        .app
-        .call("targets", json!({"level": "tenant"}))
-        .await?;
-    assert_eq!(error_kind(&before), Some("notSignedIn"));
+    for (method, params) in [
+        ("targets", json!({"level": "tenant"})),
+        ("select", json!({"targets": {"tenant": "none-chosen"}})),
+        (
+            "select",
+            json!({"targets": {"subscription": "none-chosen"}}),
+        ),
+    ] {
+        let before = fixture.app.call(method, params.clone()).await?;
+        assert_eq!(
+            error_kind(&before),
+            Some("notSignedIn"),
+            "{method} {params}: {before}"
+        );
+    }
     sign_in(&mut fixture, &json!({})).await?;
     for (method, params) in [
         (
