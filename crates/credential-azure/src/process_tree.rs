@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
 
@@ -25,10 +25,11 @@ pub const STOP_GRACE: Duration = Duration::from_secs(5);
 /// killed.
 const REAP_WAIT: Duration = Duration::from_secs(5);
 
-/// How often a `kill` or `taskkill` run is checked for its exit, and how
-/// many times: 5 seconds in all.
+/// The longest a `kill` or `taskkill` run is waited for.
+const KILLER_WAIT: Duration = Duration::from_secs(3);
+
+/// How often a `kill` or `taskkill` run is checked for its exit.
 const KILLER_POLL: Duration = Duration::from_millis(5);
-const KILLER_POLLS: u32 = 1000;
 
 const KILL: &str = "/bin/kill";
 
@@ -116,7 +117,7 @@ impl ProcessTree {
         match &self.killer {
             Killer::ProcessGroup => signal_group(pid, Signal::Kill),
             Killer::Taskkill(program) => {
-                if let Err(failed) = run_killer(program, &taskkill_args(pid)) {
+                if let Err(failed) = run_killer(program, &taskkill_args(pid), KILLER_WAIT) {
                     crate::log(format_args!("ending what az started: taskkill {failed}"));
                 }
             }
@@ -138,7 +139,7 @@ impl Drop for ProcessTree {
 }
 
 fn signal_group(pid: u32, signal: Signal) {
-    if let Err(failed) = run_killer(Path::new(KILL), &kill_args(pid, signal)) {
+    if let Err(failed) = run_killer(Path::new(KILL), &kill_args(pid, signal), KILLER_WAIT) {
         crate::log(format_args!("ending what az started: kill {failed}"));
     }
 }
@@ -167,7 +168,7 @@ fn taskkill_args(pid: u32) -> [String; 4] {
 enum KillerFailed {
     Start(io::ErrorKind),
     Wait(io::ErrorKind),
-    TimedOut,
+    TimedOut(Duration),
 }
 
 impl fmt::Display for KillerFailed {
@@ -175,19 +176,15 @@ impl fmt::Display for KillerFailed {
         match self {
             Self::Start(kind) => write!(f, "could not start: {kind}"),
             Self::Wait(kind) => write!(f, "could not be waited for: {kind}"),
-            Self::TimedOut => write!(
-                f,
-                "did not finish within {} seconds",
-                (KILLER_POLL * KILLER_POLLS).as_secs()
-            ),
+            Self::TimedOut(wait) => write!(f, "did not finish within {wait:?}"),
         }
     }
 }
 
-/// Runs `program` and waits for it, up to 5 seconds. Its exit status and
+/// Runs `program` and waits for it, up to `wait`. Its exit status and
 /// output are dropped: `kill` fails for a group that has already ended,
 /// which is how a stop usually ends.
-fn run_killer(program: &Path, args: &[String]) -> Result<(), KillerFailed> {
+fn run_killer(program: &Path, args: &[String], wait: Duration) -> Result<(), KillerFailed> {
     let mut killer = std::process::Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -195,7 +192,8 @@ fn run_killer(program: &Path, args: &[String]) -> Result<(), KillerFailed> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| KillerFailed::Start(error.kind()))?;
-    for _ in 0..KILLER_POLLS {
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
         match killer.try_wait() {
             Ok(Some(_status)) => return Ok(()),
             Ok(None) => thread::sleep(KILLER_POLL),
@@ -204,15 +202,16 @@ fn run_killer(program: &Path, args: &[String]) -> Result<(), KillerFailed> {
     }
     // Left unreaped if it does not end at once: the system is stuck.
     match killer.kill().and_then(|()| killer.try_wait()) {
-        Ok(_) | Err(_) => Err(KillerFailed::TimedOut),
+        Ok(_) | Err(_) => Err(KillerFailed::TimedOut(wait)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::time::{Duration, Instant};
 
-    use super::{KillerFailed, Signal, kill_args, run_killer, taskkill_args};
+    use super::{KILLER_WAIT, KillerFailed, Signal, kill_args, run_killer, taskkill_args};
 
     #[test]
     fn kill_signals_the_group_and_taskkill_ends_the_tree() {
@@ -225,7 +224,7 @@ mod tests {
     fn a_killer_that_cannot_start_says_why_without_its_path() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let missing = temp.path().join("SECRET-NOT-THERE").join("kill");
-        let failed = run_killer(&missing, &[])
+        let failed = run_killer(&missing, &[], KILLER_WAIT)
             .err()
             .ok_or("a killer that is not there ran")?;
         assert_eq!(failed, KillerFailed::Start(io::ErrorKind::NotFound));
@@ -242,8 +241,8 @@ mod tests {
             "could not be waited for: operation interrupted"
         );
         assert_eq!(
-            KillerFailed::TimedOut.to_string(),
-            "did not finish within 5 seconds"
+            KillerFailed::TimedOut(Duration::from_secs(3)).to_string(),
+            "did not finish within 3s"
         );
     }
 
@@ -253,8 +252,22 @@ mod tests {
         let program = std::path::Path::new(super::KILL);
         let this_process = std::process::id().to_string();
         assert_eq!(
-            run_killer(program, &["-0".to_owned(), this_process]),
+            run_killer(program, &["-0".to_owned(), this_process], KILLER_WAIT),
             Ok(())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_killer_that_hangs_is_given_up_on_after_its_wait() {
+        let wait = Duration::from_millis(50);
+        let started = Instant::now();
+        let failed = run_killer(std::path::Path::new("/bin/sleep"), &["30".to_owned()], wait);
+        assert_eq!(failed, Err(KillerFailed::TimedOut(wait)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
         );
     }
 }
