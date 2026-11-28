@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn only_a_busy_or_failing_google_is_worth_trying_again() {
         let kind = |code| api_error(&status(code, None, &[]), Origin::ServiceAccountKey).kind();
-        for code in [408, 429, 500, 503] {
+        for code in [408, 429, 500, 502, 503, 504, 599] {
             assert_eq!(kind(code), ErrorKind::Network, "{code}");
         }
         for code in [400, 404, 411] {
