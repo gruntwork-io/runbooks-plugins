@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 use runbooks_credential_azure::AzurePlugin;
 use runbooks_credential_azure::az::Interactive;
-use runbooks_credential_azure::host::Host;
 use runbooks_plugin_protocol::credential::{ConfigureResult, ErrorKind};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -15,7 +14,7 @@ use crate::fake_az::{
     CONTOSO, Call, DEV, DEVICE_CODE, DEVICE_URL, FABRIKAM, FakeAz, PROD, SHARED, World,
 };
 use crate::support::{
-    App, TestResult, assert_valid, at, detect_params, env_value, error_kind, error_message,
+    App, TestResult, assert_valid, at, detect_params, env_value, error_kind, error_message, host,
     runbooks_limits, sign_in_dirs, sign_in_params,
 };
 
@@ -45,7 +44,7 @@ impl Fixture {
                 .map(|(name, value)| ((*name).into(), (*value).into())),
         );
         let az = FakeAz::new(world);
-        let host = Host::new(env, cfg!(windows));
+        let host = host(env);
         let mut app = App::start(AzurePlugin::new(host, az.clone()))?;
         app.configure(state.path()).await?;
         Ok(Self {
@@ -104,7 +103,7 @@ fn is_under(path: Option<&str>, dir: &Path) -> bool {
 async fn configure_offers_the_methods_levels_and_every_name() -> TestResult {
     let state = tempfile::tempdir()?;
     let mut app = App::start(AzurePlugin::new(
-        Host::new([], cfg!(windows)),
+        host([]),
         FakeAz::new(World::one_subscription()?),
     ))?;
     let result = app.configure(state.path()).await?;
@@ -164,7 +163,7 @@ async fn configure_offers_the_methods_levels_and_every_name() -> TestResult {
 async fn a_service_principal_takes_one_of_a_secret_and_a_certificate() -> TestResult {
     let state = tempfile::tempdir()?;
     let mut app = App::start(AzurePlugin::new(
-        Host::new([], cfg!(windows)),
+        host([]),
         FakeAz::new(World::one_subscription()?),
     ))?;
     let result: ConfigureResult = serde_json::from_value(app.configure(state.path()).await?)?;
@@ -869,10 +868,7 @@ fn debug_shows_no_proxy_password_and_only_whether_configured() -> TestResult {
         format!("{network:?}"),
         r#"Network { ca_bundle_file: Some("/etc/ca.pem"), proxy: Some("<set>") }"#
     );
-    let plugin = AzurePlugin::new(
-        Host::new([], cfg!(windows)),
-        FakeAz::new(World::one_subscription()?),
-    );
+    let plugin = AzurePlugin::new(host([]), FakeAz::new(World::one_subscription()?));
     assert_eq!(
         format!("{plugin:?}"),
         "AzurePlugin { configured: false, .. }"
@@ -909,7 +905,7 @@ async fn configure_again_with_another_state_dir_is_refused() -> TestResult {
 async fn configure_refuses_settings_since_azure_has_none() -> TestResult {
     let state = tempfile::tempdir()?;
     let mut app = App::start(AzurePlugin::new(
-        Host::new([], cfg!(windows)),
+        host([]),
         FakeAz::new(World::one_subscription()?),
     ))?;
     let with_settings = json!({"protocolVersion": "1", "caller": "runbooks/0.31.0",

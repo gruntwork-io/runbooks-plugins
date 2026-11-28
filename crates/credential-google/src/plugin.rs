@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsStr;
 use std::fmt;
 use std::future::{self, Future};
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use runbooks_plugin_protocol::credential::{
     ErrorKind, Field, Level, LevelChosen, Method, RequirementKind, SelectParams, SelectResult,
     SignInParams, SignInResult, SignOutResult, Source, Target, TargetsParams, TargetsResult,
 };
-use runbooks_plugin_transport::{CredentialPlugin, PluginError, Prompts, shown_name};
+use runbooks_plugin_transport::{CredentialPlugin, OwnerOnly, PluginError, Prompts, shown_name};
 use serde_json::Map;
 use time::OffsetDateTime;
 
@@ -51,6 +52,21 @@ pub struct Host {
     pub env: HashMap<String, String>,
     /// The clock.
     pub now: fn() -> OffsetDateTime,
+    /// How the credentials file is kept to the user.
+    pub owner_only: OwnerOnly,
+}
+
+impl Host {
+    /// Windows' way to keep the credentials file to the user: icacls from
+    /// `SystemRoot`, a name `env` may spell in any case.
+    #[must_use]
+    pub fn windows_owner_only(env: &HashMap<String, String>) -> OwnerOnly {
+        let system_root = env
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("SystemRoot"))
+            .map(|(_, value)| OsStr::new(value));
+        OwnerOnly::icacls(system_root)
+    }
 }
 
 /// The variables' names only: their values may hold the person's secrets.
@@ -59,6 +75,7 @@ impl fmt::Debug for Host {
         f.debug_struct("Host")
             .field("env", &self.env.keys().collect::<BTreeSet<_>>())
             .field("now", &self.now)
+            .field("owner_only", &self.owner_only)
             .finish()
     }
 }
@@ -792,6 +809,7 @@ impl<A: GoogleApi> CredentialPlugin for GooglePlugin<A> {
                     &state_dir,
                     CREDENTIALS_FILE,
                     document.text.expose().as_bytes(),
+                    &self.host.owner_only,
                 )
                 .await
                 .map_err(|error| {

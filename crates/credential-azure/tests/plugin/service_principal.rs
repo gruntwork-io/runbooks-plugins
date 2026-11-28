@@ -6,7 +6,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use runbooks_credential_azure::AzurePlugin;
-use runbooks_credential_azure::host::Host;
 use runbooks_credential_azure::service_principal::{Credential, Secret};
 use runbooks_plugin_protocol::credential::ErrorKind;
 use runbooks_plugin_transport::PluginError;
@@ -15,7 +14,7 @@ use tempfile::TempDir;
 
 use crate::fake_az::{CLIENT, CONTOSO, Call, DEV, FABRIKAM, FakeAz, PROD, World};
 use crate::support::{
-    App, TestResult, assert_valid, at, detect_params, env_value, error_kind, sign_in_dirs,
+    App, TestResult, assert_valid, at, detect_params, env_value, error_kind, host, sign_in_dirs,
     sign_in_params,
 };
 
@@ -34,7 +33,7 @@ impl Fixture {
         let env = vars
             .iter()
             .map(|(name, value)| ((*name).into(), (*value).into()));
-        let host = Host::new(env, cfg!(windows));
+        let host = host(env);
         let mut app = App::start(AzurePlugin::new(host, az.clone()))?;
         app.configure(state.path()).await?;
         Ok(Self { app, az, state })

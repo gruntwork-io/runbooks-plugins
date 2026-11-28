@@ -19,7 +19,7 @@ use runbooks_credential_google::{
     TokenInfo, TokenRequest,
 };
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
-use runbooks_plugin_transport::{ServeError, serve};
+use runbooks_plugin_transport::{OwnerOnly, ServeError, serve};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::io::{
@@ -384,6 +384,7 @@ pub(crate) fn host(env: &[(&str, &str)]) -> Host {
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
             .collect(),
         now,
+        owner_only: OwnerOnly::Mode,
     }
 }
 

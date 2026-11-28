@@ -22,10 +22,12 @@
 
 mod error;
 mod line;
+mod owner_only;
 mod plugin;
 mod serve;
 mod wire;
 
 pub use error::{PluginError, ServeError, shown_name};
+pub use owner_only::{OwnerOnly, OwnerOnlyError, PathKind};
 pub use plugin::{CredentialPlugin, Prompts};
 pub use serve::{MAX_LINE_BYTES, serve, serve_stdio};

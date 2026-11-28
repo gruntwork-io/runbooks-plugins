@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use runbooks_credential_google::{GooglePlugin, Host, OAuthError, TokenRequest};
+use runbooks_plugin_transport::OwnerOnly;
 use serde_json::json;
 
 use crate::support::{
@@ -154,10 +156,22 @@ fn the_hosts_debug_names_its_variables_but_shows_no_value() {
             BARE_TOKEN.to_owned(),
         )]),
         now,
+        owner_only: OwnerOnly::Mode,
     };
     let shown = format!("{host:?}");
     assert!(shown.contains("GOOGLE_OAUTH_ACCESS_TOKEN"), "{shown}");
     assert!(!shown.contains(BARE_TOKEN), "Host's Debug shows the token");
+}
+
+/// On Windows the plugin finds icacls from `SystemRoot`, whatever case the
+/// environment spells it in.
+#[test]
+fn windows_finds_icacls_from_system_root_in_any_case() {
+    let env = HashMap::from([("SYSTEMROOT".to_owned(), "C:\\Windows".to_owned())]);
+    assert!(matches!(
+        Host::windows_owner_only(&env),
+        OwnerOnly::Icacls { system_root: Some(root), .. } if root == Path::new("C:\\Windows")
+    ));
 }
 
 /// The plugin holds the host's environment and, once signed in, the
@@ -170,6 +184,7 @@ fn the_plugins_debug_names_it_and_shows_nothing_it_holds() {
             BARE_TOKEN.to_owned(),
         )]),
         now,
+        owner_only: OwnerOnly::Mode,
     };
     let google = google();
     let plugin = GooglePlugin::new(host, Box::new(move |_network| Ok(google.clone())));
