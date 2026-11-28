@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use runbooks_plugin_transport::{OwnerOnly, PathKind};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -76,9 +77,14 @@ pub(crate) async fn create_private_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Replaces `dir/name` with `contents`: written beside it, readable by its
-/// owner only on Unix from the moment it exists, then renamed over it, so a
-/// run never reads half a file.
-pub(crate) async fn write_private(dir: &Path, name: &str, contents: &[u8]) -> io::Result<PathBuf> {
+/// owner only before anything is written, then renamed over it, so a run
+/// never reads half a file.
+pub(crate) async fn write_private(
+    dir: &Path,
+    name: &str,
+    contents: &[u8],
+    owner_only: &OwnerOnly,
+) -> io::Result<PathBuf> {
     static WRITES: AtomicU64 = AtomicU64::new(0);
     let target = dir.join(name);
     let temporary = dir.join(format!(
@@ -87,11 +93,12 @@ pub(crate) async fn write_private(dir: &Path, name: &str, contents: &[u8]) -> io
         WRITES.fetch_add(1, Ordering::Relaxed)
     ));
     let written = async {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&temporary).await?;
+        let mut file = temporary_options().open(&temporary).await?;
+        let (owner_only, path) = (owner_only.clone(), temporary.clone());
+        tokio::task::spawn_blocking(move || owner_only.restrict(&path, PathKind::File))
+            .await
+            .map_err(io::Error::other)?
+            .map_err(io::Error::other)?;
         file.write_all(contents).await?;
         file.sync_all().await?;
         drop(file);
@@ -107,6 +114,19 @@ pub(crate) async fn write_private(dir: &Path, name: &str, contents: &[u8]) -> io
     }
 }
 
+/// Options that create a new file only its owner can use: mode 0600 on Unix.
+/// On Windows no one else can open it while it is held, so no one can in
+/// the moment before it is restricted.
+fn temporary_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    #[cfg(windows)]
+    options.share_mode(0);
+    options
+}
+
 /// Removes `dir/name`. A file that is already gone is not an error.
 pub(crate) async fn remove(dir: &Path, name: &str) -> io::Result<()> {
     match fs::remove_file(dir.join(name)).await {
@@ -119,13 +139,20 @@ pub(crate) async fn remove(dir: &Path, name: &str) -> io::Result<()> {
 mod tests {
     use std::error::Error;
 
+    use runbooks_plugin_transport::OwnerOnly;
+
     use super::{ReadError, read_text, remove, write_private};
 
     #[tokio::test]
     async fn a_write_replaces_the_file_and_leaves_no_temporary() -> Result<(), Box<dyn Error>> {
         let dir = tempfile::tempdir()?;
-        write_private(dir.path(), "c.json", b"first").await?;
-        let path = write_private(dir.path(), "c.json", b"second").await?;
+        let owner_only = if cfg!(windows) {
+            OwnerOnly::icacls(std::env::var_os("SystemRoot").as_deref())
+        } else {
+            OwnerOnly::Mode
+        };
+        write_private(dir.path(), "c.json", b"first", &owner_only).await?;
+        let path = write_private(dir.path(), "c.json", b"second", &owner_only).await?;
         assert_eq!(std::fs::read_to_string(&path)?, "second");
         let names: Vec<_> = std::fs::read_dir(dir.path())?
             .map(|entry| entry.map(|entry| entry.file_name()))
@@ -142,6 +169,75 @@ mod tests {
         remove(dir.path(), "c.json").await?;
         remove(dir.path(), "c.json").await?;
         assert!(!path.exists());
+        Ok(())
+    }
+
+    /// On Windows the empty file is left to its owner before the secret is
+    /// written into it. Scripts stand in for `whoami.exe` and `icacls.exe`;
+    /// icacls records, for each call, the file's size then and its arguments.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn icacls_restricts_the_file_before_anything_is_written_to_it()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+
+        let root = tempfile::tempdir()?;
+        let system32 = root.path().join("System32");
+        std::fs::create_dir_all(&system32)?;
+        for (name, body) in [
+            ("whoami.exe", "echo 'host\\user S-1-5-21-1-2-3-1001'"),
+            (
+                "icacls.exe",
+                r#"printf '%s %s\n' "$(wc -c < "$1" | tr -d ' ')" "$*" >> "$0.seen""#,
+            ),
+        ] {
+            let path = system32.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let dir = tempfile::tempdir()?;
+        let owner_only = OwnerOnly::icacls(Some(root.path().as_os_str()));
+
+        let path = write_private(dir.path(), "c.json", b"secret", &owner_only).await?;
+        assert_eq!(std::fs::read_to_string(&path)?, "secret");
+        let seen = std::fs::read_to_string(system32.join("icacls.exe.seen"))?;
+        let restricted = seen.split(' ').nth(1).ok_or("icacls never ran")?;
+        let name = Path::new(restricted)
+            .file_name()
+            .and_then(|name| name.to_str());
+        assert_eq!(Path::new(restricted).parent(), Some(dir.path()));
+        assert!(
+            name.is_some_and(|name| name.starts_with(".c.json.")),
+            "{seen}"
+        );
+        assert_eq!(
+            seen,
+            format!("0 {restricted} /inheritance:r /grant:r *S-1-5-21-1-2-3-1001:F\n")
+        );
+        Ok(())
+    }
+
+    /// On Windows no one else can open a temporary file while it is held,
+    /// as they can a file opened with the default options.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn no_one_else_can_open_a_temporary_file_while_it_is_held() -> Result<(), Box<dyn Error>>
+    {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let dir = tempfile::tempdir()?;
+        let (plain, temporary) = (dir.path().join("plain"), dir.path().join("temporary"));
+        let _plain = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&plain)
+            .await?;
+        std::fs::File::open(&plain)?;
+        let _held = super::temporary_options().open(&temporary).await?;
+        let error = std::fs::File::open(&temporary)
+            .err()
+            .ok_or("opened a temporary file someone holds")?;
+        assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION));
         Ok(())
     }
 

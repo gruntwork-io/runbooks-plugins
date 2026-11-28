@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use runbooks_credential_google::{GooglePlugin, Host, HttpApi};
-use runbooks_plugin_transport::serve_stdio;
+use runbooks_plugin_transport::{OwnerOnly, serve_stdio};
 use time::OffsetDateTime;
 
 /// An `Err` is a failure standard error could not take.
@@ -16,9 +16,15 @@ fn main() -> io::Result<ExitCode> {
     let env: HashMap<String, String> = std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect();
+    let owner_only = if cfg!(windows) {
+        Host::windows_owner_only(&env)
+    } else {
+        OwnerOnly::Mode
+    };
     let host = Host {
         env,
         now: OffsetDateTime::now_utc,
+        owner_only,
     };
     let plugin = GooglePlugin::new(host, Box::new(HttpApi::new));
 
