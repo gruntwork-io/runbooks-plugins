@@ -124,8 +124,26 @@ pub(crate) enum DocumentError {
         "has type {0}, which this plugin can't use: expected service_account or authorized_user"
     )]
     UnsupportedType(String),
+    #[error("has type {0}: expected a service account key, of type service_account")]
+    NotServiceAccountKey(String),
     #[error("is missing {0}")]
     Missing(&'static str),
+}
+
+/// Parses a service account key: a credentials document of type `service_account`.
+pub(crate) fn parse_service_account_key(text: String) -> Result<Document, DocumentError> {
+    match parse_document(text) {
+        Ok(Document {
+            kind: DocumentKind::AuthorizedUser { .. },
+            ..
+        }) => Err(DocumentError::NotServiceAccountKey(type_name(
+            CredentialType::AuthorizedUser.name(),
+        ))),
+        Err(DocumentError::UnsupportedType(other)) => {
+            Err(DocumentError::NotServiceAccountKey(other))
+        }
+        parsed => parsed,
+    }
 }
 
 /// Parses a credentials document. The text is held as a secret from here on.

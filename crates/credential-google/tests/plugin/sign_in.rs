@@ -4,8 +4,8 @@ use runbooks_credential_google::{TOKEN_URL, TokenRequest};
 use serde_json::{Value, json};
 
 use crate::support::{
-    App, CLOUD_PLATFORM, NOW, SA_EMAIL, TestResult, at, ec_key, env_value, google, rsa_key,
-    runbooks_limits, sa_key, sign_in, verifies,
+    App, CLOUD_PLATFORM, NOW, SA_EMAIL, TestResult, USER_ADC, at, ec_key, env_value, google,
+    rsa_key, runbooks_limits, sa_key, sign_in, verifies,
 };
 
 #[tokio::test]
@@ -232,6 +232,8 @@ async fn service_account_fields_are_checked_before_anything_is_read() -> TestRes
     let mut app = App::start(&[], &google())?;
     app.configure(dir.path()).await?;
     let key = sa_key(&rsa_key()?);
+    let user_file = dir.path().join("user.json");
+    std::fs::write(&user_file, USER_ADC)?;
     for (fields, expect) in [
         (json!({}), "keyFile"),
         (json!({"key": key, "keyFile": "/k.json"}), "not both"),
@@ -239,7 +241,15 @@ async fn service_account_fields_are_checked_before_anything_is_read() -> TestRes
         (json!({"key": key, "region": "us-east1"}), "no field region"),
         (
             json!({"key": "{\"type\":\"external_account\"}"}),
-            "external_account",
+            "has type \"external_account\": expected a service account key",
+        ),
+        (
+            json!({"key": USER_ADC}),
+            "has type \"authorized_user\": expected a service account key",
+        ),
+        (
+            json!({"keyFile": user_file.to_str().ok_or("utf-8")?}),
+            "has type \"authorized_user\": expected a service account key",
         ),
         (
             json!({"key": "{\"type\":\"service_account\",\"client_email\":\"a@b\",\"private_key\":\"not-a-key\"}"}),
