@@ -124,31 +124,55 @@ pub(crate) enum DocumentError {
         "has type {0}, which this plugin can't use: expected service_account or authorized_user"
     )]
     UnsupportedType(String),
+    #[error("has type {0}: expected a service account key, of type service_account")]
+    NotServiceAccountKey(String),
     #[error("is missing {0}")]
     Missing(&'static str),
 }
 
+/// The document types a parse takes.
+#[derive(Clone, Copy)]
+enum Accepted {
+    ServiceAccountKey,
+    AnyDocument,
+}
+
+/// Parses a service account key: a credentials document of type `service_account`.
+pub(crate) fn parse_service_account_key(text: String) -> Result<Document, DocumentError> {
+    parse(text, Accepted::ServiceAccountKey)
+}
+
 /// Parses a credentials document. The text is held as a secret from here on.
 pub(crate) fn parse_document(text: String) -> Result<Document, DocumentError> {
+    parse(text, Accepted::AnyDocument)
+}
+
+/// The type is checked before any field, so a refused type is what the error names.
+fn parse(text: String, accepted: Accepted) -> Result<Document, DocumentError> {
     // serde's message can quote the text, so only the kind of failure is kept.
     let value: Value = serde_json::from_str(&text).map_err(|_syntax| DocumentError::NotJson)?;
     let Value::Object(fields) = value else {
         return Err(DocumentError::NotObject);
     };
-    let kind = match string(&fields, "type").as_deref() {
-        None => return Err(DocumentError::NoType),
-        Some("service_account") => DocumentKind::ServiceAccount {
+    let kind = match (string(&fields, "type").as_deref(), accepted) {
+        (None, _) => return Err(DocumentError::NoType),
+        (Some("service_account"), _) => DocumentKind::ServiceAccount {
             client_email: required(&fields, "client_email")?,
             private_key: Secret::new(required(&fields, "private_key")?),
             project_id: string(&fields, "project_id"),
         },
-        Some("authorized_user") => DocumentKind::AuthorizedUser {
+        (Some("authorized_user"), Accepted::AnyDocument) => DocumentKind::AuthorizedUser {
             client_id: required(&fields, "client_id")?,
             client_secret: Secret::new(required(&fields, "client_secret")?),
             refresh_token: Secret::new(required(&fields, "refresh_token")?),
             quota_project_id: string(&fields, "quota_project_id"),
         },
-        Some(other) => return Err(DocumentError::UnsupportedType(type_name(other))),
+        (Some(other), Accepted::ServiceAccountKey) => {
+            return Err(DocumentError::NotServiceAccountKey(type_name(other)));
+        }
+        (Some(other), Accepted::AnyDocument) => {
+            return Err(DocumentError::UnsupportedType(type_name(other)));
+        }
     };
     Ok(Document {
         text: Secret::new(text),

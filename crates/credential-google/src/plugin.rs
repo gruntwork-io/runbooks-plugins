@@ -16,7 +16,10 @@ use time::OffsetDateTime;
 
 use crate::Secret;
 use crate::api::{GoogleApi, Network, NetworkError, Project};
-use crate::credential::{Credential, MAX_DOCUMENT_BYTES, Origin, api_error, parse_document};
+use crate::credential::{
+    Credential, Document, DocumentError, MAX_DOCUMENT_BYTES, Origin, api_error, parse_document,
+    parse_service_account_key,
+};
 use crate::files::{self, CREDENTIALS_FILE, ReadError};
 use crate::gcloud::{ADC_LOGIN, Configuration, ConfigurationName, Root};
 use crate::oauth::{self, ClientFields, DEFAULT_SCOPES};
@@ -204,7 +207,7 @@ impl<A: GoogleApi> GooglePlugin<A> {
         let key_file = fields.take("keyFile");
         let project = fields.take("project");
         let document = match (key, key_file) {
-            (Some(key), None) => parse_document(key.expose().to_owned())
+            (Some(key), None) => parse_service_account_key(key.expose().to_owned())
                 .map_err(|error| invalid_params(format!("The key field {error}")))?,
             (None, Some(path)) => {
                 let path = PathBuf::from(path);
@@ -214,7 +217,7 @@ impl<A: GoogleApi> GooglePlugin<A> {
                         path.display()
                     )));
                 }
-                read_document(&path, "keyFile").await?
+                read_document(&path, "keyFile", parse_service_account_key).await?
             }
             (Some(_), Some(_)) => {
                 return Err(invalid_params("Give key or keyFile, not both."));
@@ -399,10 +402,7 @@ async fn read_configuration(
     })
 }
 
-fn gcloud_candidate(
-    document: crate::credential::Document,
-    configuration: Configuration,
-) -> Candidate {
+fn gcloud_candidate(document: Document, configuration: Configuration) -> Candidate {
     Candidate {
         credential: Credential::Document(document),
         method: GCLOUD.to_owned(),
@@ -422,7 +422,7 @@ async fn candidate_from_vars(found: FoundVars, source: &str) -> Result<Candidate
                 .map_err(|error| invalid_params(format!("{} {error}", found.var)))?,
         ),
         VarCredential::Path(path) => {
-            Credential::Document(read_document(Path::new(&path), &found.var).await?)
+            Credential::Document(read_document(Path::new(&path), &found.var, parse_document).await?)
         }
     };
     Ok(Candidate {
@@ -469,11 +469,12 @@ impl MethodFields {
     }
 }
 
-/// Reads and parses the credentials document at `path`, which `what` names.
+/// Reads the credentials document at `path`, which `what` names, and parses it with `parse`.
 async fn read_document(
     path: &Path,
     what: &str,
-) -> Result<crate::credential::Document, PluginError> {
+    parse: fn(String) -> Result<Document, DocumentError>,
+) -> Result<Document, PluginError> {
     let text = files::read_text(path, MAX_DOCUMENT_BYTES)
         .await
         .map_err(|error| {
@@ -485,8 +486,7 @@ async fn read_document(
             };
             PluginError::new(kind, format!("{what} {}: the file {error}", path.display()))
         })?;
-    parse_document(text)
-        .map_err(|error| invalid_params(format!("{what} {} {error}", path.display())))
+    parse(text).map_err(|error| invalid_params(format!("{what} {} {error}", path.display())))
 }
 
 fn methods() -> Vec<Method> {
