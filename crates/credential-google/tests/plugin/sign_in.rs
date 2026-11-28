@@ -252,6 +252,10 @@ async fn service_account_fields_are_checked_before_anything_is_read() -> TestRes
             "has type \"authorized_user\": expected a service account key",
         ),
         (
+            json!({"key": "{\"type\":\"authorized_user\",\"client_id\":\"c\"}"}),
+            "has type \"authorized_user\": expected a service account key",
+        ),
+        (
             json!({"key": "{\"type\":\"service_account\",\"client_email\":\"a@b\",\"private_key\":\"not-a-key\"}"}),
             "PKCS #8",
         ),
