@@ -306,12 +306,14 @@ impl GoogleApi for HttpApi {
 
     async fn token_info(&self, access_token: &Secret) -> Result<TokenInfo, ApiError> {
         // A POST with the token as a bearer, as Google's own library does, so
-        // the token is never in a URL.
+        // the token is never in a URL. Google refuses a POST without
+        // Content-Length, and an empty body sends none.
         let response = self
             .client
             .post(TOKEN_INFO_URL)
             .bearer_auth(access_token.expose())
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::CONTENT_LENGTH, "0")
             .send()
             .await
             .map_err(|error| classify(&error))?;

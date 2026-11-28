@@ -157,46 +157,78 @@ fn tunnel(
     seen: &Mutex<Vec<String>>,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(WAIT))?;
-    let connect = request_line((&stream).take(MAX_HEAD))?;
+    let connect = request_head((&stream).take(MAX_HEAD))?;
     seen.lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .push(connect);
+        .push(connect.line);
     (&stream).write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
 
     let connection = ServerConnection::new(Arc::clone(config)).map_err(io::Error::other)?;
     let mut tls = StreamOwned::new(connection, stream);
-    let request = request_line((&mut tls).take(MAX_HEAD))?;
+    let request = request_head((&mut tls).take(MAX_HEAD))?;
+    let lacks_length = request.lacks_length();
     seen.lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .push(request);
-    let body = json!({
-        "email": USER_EMAIL,
-        "sub": "1234567890",
-        "scope": CLOUD_PLATFORM,
-        "exp": (NOW + 1800).to_string(),
-    })
-    .to_string();
+        .push(request.line);
+    let (status, body) = if lacks_length {
+        (
+            "411 Length Required",
+            "POST requests require a Content-length header.".to_owned(),
+        )
+    } else {
+        let info = json!({
+            "email": USER_EMAIL,
+            "sub": "1234567890",
+            "scope": CLOUD_PLATFORM,
+            "exp": (NOW + 1800).to_string(),
+        });
+        ("200 OK", info.to_string())
+    };
     write!(
         tls,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )?;
     tls.conn.send_close_notify();
     tls.flush()
 }
 
-/// The request line of the head `stream` starts with. The client sends
-/// nothing past a tunnel's head until it is answered, and the tokeninfo
-/// request has no body, so nothing past the head is lost.
-fn request_line(stream: impl Read) -> io::Result<String> {
+/// A request's head: its request line and its header lines.
+struct Head {
+    line: String,
+    headers: Vec<String>,
+}
+
+impl Head {
+    /// Google answers 411 to a POST that gives its body no length.
+    fn lacks_length(&self) -> bool {
+        self.line.starts_with("POST ")
+            && !self.headers.iter().any(|header| {
+                header.split_once(':').is_some_and(|(name, _)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        || name.eq_ignore_ascii_case("transfer-encoding")
+                })
+            })
+    }
+}
+
+/// The head `stream` starts with. The client sends nothing past a tunnel's
+/// head until it is answered, and the tokeninfo request has no body, so
+/// nothing past the head is lost.
+fn request_head(stream: impl Read) -> io::Result<Head> {
     let mut reader = BufReader::new(stream);
-    let mut first = String::new();
-    reader.read_line(&mut first)?;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let mut headers = Vec::new();
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 || line.trim_end().is_empty() {
-            return Ok(first.trim_end().to_owned());
+        let mut header = String::new();
+        if reader.read_line(&mut header)? == 0 || header.trim_end().is_empty() {
+            return Ok(Head {
+                line: line.trim_end().to_owned(),
+                headers,
+            });
         }
+        headers.push(header.trim_end().to_owned());
     }
 }
 
