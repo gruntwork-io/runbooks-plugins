@@ -331,9 +331,21 @@ pub(crate) fn api_error(error: &ApiError, origin: Origin) -> PluginError {
             ErrorKind::AccessDenied,
             "Google refused this request for the signed-in identity.".to_owned(),
         ),
-        (ApiError::Status { status, .. }, _) => (
+        (
+            ApiError::Status {
+                status: status @ (408 | 429 | 500..=599),
+                ..
+            },
+            _,
+        ) => (
             ErrorKind::Network,
             format!("Google answered HTTP {status}. Try again."),
+        ),
+        (ApiError::Status { status, .. }, _) => (
+            ErrorKind::Internal,
+            format!(
+                "Google refused the plugin's request with HTTP {status}. Report this as a bug in the Google plugin."
+            ),
         ),
         (ApiError::Connect | ApiError::TooLarge | ApiError::Malformed, _) => (
             ErrorKind::Network,
@@ -388,7 +400,9 @@ pub(crate) fn denies_project(error: &ApiError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DocumentError, DocumentKind, denies_project, parse_document};
+    use runbooks_plugin_protocol::credential::ErrorKind;
+
+    use super::{DocumentError, DocumentKind, Origin, api_error, denies_project, parse_document};
     use crate::api::ApiError;
 
     #[test]
@@ -441,5 +455,16 @@ mod tests {
         assert!(!denies_project(&status(403, Some("UNAUTHENTICATED"), &[])));
         assert!(!denies_project(&status(503, Some("UNAVAILABLE"), &[])));
         assert!(!denies_project(&ApiError::Connect));
+    }
+
+    #[test]
+    fn only_a_busy_or_failing_google_is_worth_trying_again() {
+        let kind = |code| api_error(&status(code, None, &[]), Origin::ServiceAccountKey).kind();
+        for code in [408, 429, 500, 502, 503, 504, 599] {
+            assert_eq!(kind(code), ErrorKind::Network, "{code}");
+        }
+        for code in [400, 404, 411] {
+            assert_eq!(kind(code), ErrorKind::Internal, "{code}");
+        }
     }
 }
