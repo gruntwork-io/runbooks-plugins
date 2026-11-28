@@ -155,7 +155,7 @@ impl<C: Connect> AzurePlugin<C> {
         // are dropped and it answers as the first did.
         let _first = self.configured.set(Configured {
             az,
-            state: StateDir::new(state_dir),
+            state: StateDir::new(state_dir, self.host.owner_only()),
             network,
         });
         Ok(described)

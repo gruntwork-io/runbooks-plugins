@@ -6,19 +6,18 @@ use std::error::Error;
 use std::path::Path;
 
 use runbooks_credential_azure::AzurePlugin;
-use runbooks_credential_azure::host::Host;
 use runbooks_credential_azure::service_principal::{Credential, Secret};
 use runbooks_plugin_protocol::credential::ErrorKind;
 use runbooks_plugin_transport::PluginError;
 use serde_json::{Map, Value, json};
 
 use crate::fake_az::{CLIENT, CONTOSO, Call, FakeAz, PROD, World};
-use crate::support::{App, TestResult, at, detect_params, error_kind, sign_in_params};
+use crate::support::{App, TestResult, at, detect_params, error_kind, host, sign_in_params};
 
 const BLOCK: &str = "azure-auth";
 
 async fn start(az: &FakeAz, state: &Path) -> Result<App, Box<dyn Error>> {
-    let mut app = App::start(AzurePlugin::new(Host::new([], cfg!(windows)), az.clone()))?;
+    let mut app = App::start(AzurePlugin::new(host([]), az.clone()))?;
     app.configure(state).await?;
     Ok(app)
 }

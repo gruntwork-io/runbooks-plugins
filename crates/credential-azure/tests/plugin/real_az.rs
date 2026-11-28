@@ -10,7 +10,6 @@ use std::iter;
 use std::path::Path;
 use std::process::Stdio;
 
-use runbooks_credential_azure::host::Host;
 use runbooks_credential_azure::process_tree::Killer;
 use runbooks_credential_azure::{AzurePlugin, InstalledAz};
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
@@ -24,7 +23,7 @@ use crate::hanging_az::{self, HangingAz};
 use crate::scripted_az::{self, DEVICE_LINE, ScriptedAz, token};
 use crate::support::{
     App, TestResult, WAIT, assert_valid, at, detect_params, env_value, error_kind, error_message,
-    runbooks_limits, sign_in_dirs, sign_in_params,
+    host, runbooks_limits, sign_in_dirs, sign_in_params,
 };
 
 fn installed(scripted: &ScriptedAz) -> InstalledAz {
@@ -36,7 +35,7 @@ fn installed(scripted: &ScriptedAz) -> InstalledAz {
 }
 
 async fn start(az: InstalledAz, state: &Path) -> Result<App, Box<dyn Error>> {
-    let mut app = App::start(AzurePlugin::new(Host::new([], cfg!(windows)), az))?;
+    let mut app = App::start(AzurePlugin::new(host([]), az))?;
     app.configure(state).await?;
     Ok(app)
 }
@@ -227,7 +226,7 @@ async fn with_no_az_on_path_a_sign_in_is_tool_missing() -> TestResult {
 
 /// Each method's `unavailable` in `configure`'s answer, or null.
 async fn unavailable(az: InstalledAz, state: &Path) -> Result<Vec<Value>, Box<dyn Error>> {
-    let mut app = App::start(AzurePlugin::new(Host::new([], cfg!(windows)), az))?;
+    let mut app = App::start(AzurePlugin::new(host([]), az))?;
     let configured = app.configure(state).await?;
     Ok(configured
         .pointer("/methods")
@@ -363,13 +362,10 @@ async fn detect_fetches_the_subscriptions_of_the_persons_login_again() -> TestRe
         "account-list.out",
         &json!([{"id": PROD, "name": "Prod", "tenantId": CONTOSO, "state": "Enabled"}]).to_string(),
     )?;
-    let host = Host::new(
-        [(
-            "AZURE_CONFIG_DIR".into(),
-            local.path().as_os_str().to_owned(),
-        )],
-        cfg!(windows),
-    );
+    let host = host([(
+        "AZURE_CONFIG_DIR".into(),
+        local.path().as_os_str().to_owned(),
+    )]);
     let mut app = App::start(AzurePlugin::new(host, installed(&scripted)))?;
     app.configure(state.path()).await?;
     let cli = detect_params(
@@ -403,13 +399,10 @@ async fn a_local_login_az_cannot_use_is_not_found() -> TestResult {
     );
     fs::write(local.path().join("azureProfile.json"), "{}")?;
     scripted.respond("account-get-access-token.fail", "")?;
-    let host = Host::new(
-        [(
-            "AZURE_CONFIG_DIR".into(),
-            local.path().as_os_str().to_owned(),
-        )],
-        cfg!(windows),
-    );
+    let host = host([(
+        "AZURE_CONFIG_DIR".into(),
+        local.path().as_os_str().to_owned(),
+    )]);
     let mut app = App::start(AzurePlugin::new(host, installed(&scripted)))?;
     app.configure(state.path()).await?;
     let cli = detect_params(

@@ -5,6 +5,8 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use runbooks_plugin_transport::OwnerOnly;
+
 use crate::process_tree::Killer;
 
 /// Variables that point `az` at a config directory. The plugin sets its own
@@ -124,6 +126,17 @@ impl Host {
         }
     }
 
+    /// How a sign-in directory is kept to its owner. On Windows that is
+    /// icacls in `%SystemRoot%\System32`.
+    #[must_use]
+    pub fn owner_only(&self) -> OwnerOnly {
+        if self.windows {
+            OwnerOnly::icacls(self.var("SystemRoot"))
+        } else {
+            OwnerOnly::Mode
+        }
+    }
+
     /// Where the environment says the person's own `az` login is.
     pub fn local_login(&self) -> LocalLogin {
         let home = if self.windows { "USERPROFILE" } else { "HOME" };
@@ -162,6 +175,8 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    use runbooks_plugin_transport::OwnerOnly;
 
     use super::Host;
     use crate::process_tree::Killer;
@@ -307,6 +322,19 @@ mod tests {
             host(&[("SystemRoot", &root)], false).tree_killer(),
             Killer::ProcessGroup
         );
+    }
+
+    #[test]
+    fn windows_restricts_with_icacls_from_system_root_and_unix_with_the_mode() {
+        let root = OsString::from("C:\\Windows");
+        assert!(matches!(
+            host(&[("SYSTEMROOT", &root)], true).owner_only(),
+            OwnerOnly::Icacls { system_root: Some(found), .. } if found == Path::new("C:\\Windows")
+        ));
+        assert!(matches!(
+            host(&[("SystemRoot", &root)], false).owner_only(),
+            OwnerOnly::Mode
+        ));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use runbooks_plugin_protocol::credential::ErrorKind;
-use runbooks_plugin_transport::PluginError;
+use runbooks_plugin_transport::{OwnerOnly, PathKind, PluginError};
 
 /// Every sign-in directory's name starts with this, so `signOut` can find
 /// them all, including any an earlier process left behind.
@@ -46,19 +46,23 @@ const MAX_LOGIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The block's state directory, which holds its sign-in directories.
 #[derive(Clone, Debug)]
-pub(crate) struct StateDir(PathBuf);
+pub(crate) struct StateDir {
+    path: PathBuf,
+    owner_only: OwnerOnly,
+}
 
 impl StateDir {
-    /// The state directory at `path`.
+    /// The state directory at `path`, whose sign-in directories are kept to
+    /// their owner by `owner_only`.
     #[must_use]
-    pub(crate) const fn new(path: PathBuf) -> Self {
-        Self(path)
+    pub(crate) const fn new(path: PathBuf, owner_only: OwnerOnly) -> Self {
+        Self { path, owner_only }
     }
 
     /// Where the state directory is.
     #[must_use]
     pub(crate) fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 
     /// A new, empty sign-in directory.
@@ -68,7 +72,7 @@ impl StateDir {
     /// `internal` when it cannot be created, or the state directory already
     /// holds too many sign-in directories.
     pub(crate) async fn create(&self) -> Result<PathBuf, PluginError> {
-        let state = self.0.clone();
+        let state = self.clone();
         blocking(move || create_private_dir(&state)).await
     }
 
@@ -80,7 +84,7 @@ impl StateDir {
     /// `internal` when the sign-in directory cannot be created or the login
     /// cannot be copied.
     pub(crate) async fn copy_login(&self, from: &Path) -> Result<Option<PathBuf>, PluginError> {
-        let (state, from) = (self.0.clone(), from.to_owned());
+        let (state, from) = (self.clone(), from.to_owned());
         blocking(move || {
             if !from.join(PROFILE).is_file() {
                 return Ok(None);
@@ -150,7 +154,7 @@ impl StateDir {
     /// `internal` when the state directory cannot be read or a sign-in
     /// directory cannot be deleted.
     pub(crate) async fn remove_all(&self) -> Result<(), PluginError> {
-        let state = self.0.clone();
+        let state = self.path.clone();
         blocking(move || remove_sign_in_dirs(&state)).await
     }
 }
@@ -196,7 +200,6 @@ fn remove_dir(dir: &Path) -> Result<(), PluginError> {
 }
 
 /// A builder for directories only their owner can use: mode 0700 on Unix.
-/// On Windows a directory inherits its parent's access list.
 fn private_dir_builder() -> fs::DirBuilder {
     #[cfg(unix)]
     {
@@ -210,14 +213,14 @@ fn private_dir_builder() -> fs::DirBuilder {
     }
 }
 
-/// `az-1`, or the first `az-<n>` not already there. Created with mode 0700
-/// on Unix; on Windows it inherits the state directory's access list.
-fn create_private_dir(state: &Path) -> Result<PathBuf, PluginError> {
+/// `az-1`, or the first `az-<n>` not already there, left to its owner.
+fn create_private_dir(state_dir: &StateDir) -> Result<PathBuf, PluginError> {
+    let state = state_dir.path();
     let builder = private_dir_builder();
     for n in 1..=MAX_ATTEMPTS {
         let dir = state.join(format!("{PREFIX}{n}"));
         match builder.create(&dir) {
-            Ok(()) => return Ok(dir),
+            Ok(()) => return restrict_or_remove(&dir, &state_dir.owner_only).map(|()| dir),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(state_error(state, &error)),
         }
@@ -229,6 +232,25 @@ fn create_private_dir(state: &Path) -> Result<PathBuf, PluginError> {
             state.display()
         ),
     ))
+}
+
+/// Leaves the new, empty `dir` to its owner, or removes it.
+fn restrict_or_remove(dir: &Path, owner_only: &OwnerOnly) -> Result<(), PluginError> {
+    let problem = match owner_only.restrict(dir, PathKind::Folder) {
+        Err(error) => format!("could not be kept to its owner: {error}"),
+        // A file made before the restriction may belong to someone else.
+        Ok(()) => match fs::read_dir(dir).map(|mut entries| entries.next().is_none()) {
+            Ok(true) => return Ok(()),
+            Ok(false) => "was not empty once kept to its owner".to_owned(),
+            Err(error) => format!("could not be read: {error}"),
+        },
+    };
+    let message = format!("the sign-in directory {} {problem}", dir.display());
+    let message = match fs::remove_dir_all(dir) {
+        Ok(()) => message,
+        Err(removal) => format!("{message}; removing it failed too: {removal}"),
+    };
+    Err(PluginError::new(ErrorKind::Internal, message))
 }
 
 fn copy_files(from: &Path, to: &Path) -> io::Result<()> {
@@ -264,9 +286,21 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
+    use runbooks_plugin_protocol::credential::ErrorKind;
+    use runbooks_plugin_transport::OwnerOnly;
+
     use super::StateDir;
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    /// The real way on each platform.
+    fn owner_only() -> OwnerOnly {
+        if cfg!(windows) {
+            OwnerOnly::icacls(std::env::var_os("SystemRoot").as_deref())
+        } else {
+            OwnerOnly::Mode
+        }
+    }
 
     #[tokio::test]
     async fn copies_only_the_login_files_and_leaves_the_source_alone() -> TestResult {
@@ -274,7 +308,7 @@ mod tests {
         fs::write(home.path().join("azureProfile.json"), "{}")?;
         fs::write(home.path().join("msal_token_cache.json"), "tokens")?;
         fs::write(home.path().join("commands.log"), "log")?;
-        let state = StateDir::new(state.path().to_owned());
+        let state = StateDir::new(state.path().to_owned(), owner_only());
 
         let dir = state
             .copy_login(home.path())
@@ -300,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn a_directory_without_a_profile_holds_no_login() -> TestResult {
         let (home, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
-        let state = StateDir::new(state.path().to_owned());
+        let state = StateDir::new(state.path().to_owned(), owner_only());
         assert_eq!(state.copy_login(home.path()).await?, None);
         assert_eq!(fs::read_dir(state.path())?.count(), 0);
         Ok(())
@@ -311,7 +345,7 @@ mod tests {
         let (source, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
         let pem = source.path().join("sp.pem");
         fs::write(&pem, "-----BEGIN PRIVATE KEY-----")?;
-        let state = StateDir::new(state.path().to_owned());
+        let state = StateDir::new(state.path().to_owned(), owner_only());
         let dir = state.create().await?;
 
         let copy = state.copy_certificate(&pem, &dir).await?;
@@ -327,10 +361,7 @@ mod tests {
             .await
             .err()
             .ok_or("a missing certificate was copied")?;
-        assert_eq!(
-            missing.kind(),
-            runbooks_plugin_protocol::credential::ErrorKind::InvalidParams
-        );
+        assert_eq!(missing.kind(), ErrorKind::InvalidParams);
         assert!(missing.message().contains("gone.pem"), "{missing}");
         Ok(())
     }
@@ -342,7 +373,7 @@ mod tests {
         let pem = source.path().join("sp.pem");
         let file = fs::File::create(&pem)?;
         file.set_len(1024 * 1024)?;
-        let state = StateDir::new(state.path().to_owned());
+        let state = StateDir::new(state.path().to_owned(), owner_only());
         let dir = state.create().await?;
         let copy = state.copy_certificate(&pem, &dir).await?;
         assert_eq!(fs::metadata(&copy)?.len(), 1024 * 1024);
@@ -365,7 +396,7 @@ mod tests {
     async fn each_sign_in_gets_its_own_directory_and_remove_all_clears_them() -> TestResult {
         let temp = tempfile::tempdir()?;
         fs::write(temp.path().join("engine-file"), "kept")?;
-        let state = StateDir::new(temp.path().to_owned());
+        let state = StateDir::new(temp.path().to_owned(), owner_only());
         let (first, second) = (state.create().await?, state.create().await?);
         assert_ne!(first, second);
 
@@ -384,7 +415,7 @@ mod tests {
         fs::write(home.path().join("azureProfile.json"), "{}")?;
         let cache = fs::File::create(home.path().join("msal_token_cache.bin"))?;
         cache.set_len(64 * 1024 * 1024)?;
-        let state = StateDir::new(state.path().to_owned());
+        let state = StateDir::new(state.path().to_owned(), owner_only());
         let dir = state
             .copy_login(home.path())
             .await?
@@ -420,7 +451,7 @@ mod tests {
         fs::write(home.path().join("azureProfile.json"), "{}")?;
         let looped = home.path().join("msal_token_cache.json");
         std::os::unix::fs::symlink(&looped, &looped)?;
-        let state = StateDir::new(state.path().to_owned());
+        let state = StateDir::new(state.path().to_owned(), owner_only());
         let error = state
             .copy_login(home.path())
             .await
@@ -440,13 +471,13 @@ mod tests {
     #[tokio::test]
     async fn remove_deletes_one_sign_in_directory_and_a_missing_one_is_no_error() -> TestResult {
         let temp = tempfile::tempdir()?;
-        let state = StateDir::new(temp.path().to_owned());
+        let state = StateDir::new(temp.path().to_owned(), owner_only());
         let (first, second) = (state.create().await?, state.create().await?);
         state.remove(&first).await?;
         assert!(!first.exists() && second.exists());
         state.remove(&first).await?;
 
-        let gone = StateDir::new(temp.path().join("not-there"));
+        let gone = StateDir::new(temp.path().join("not-there"), owner_only());
         gone.remove_all().await?;
         Ok(())
     }
@@ -459,10 +490,15 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let file = temp.path().join("az-1");
         fs::write(&file, "not a directory")?;
-        let state = StateDir::new(temp.path().to_owned());
+        let state = StateDir::new(temp.path().to_owned(), owner_only());
         assert!(state.remove(&file).await.is_err());
         assert!(state.remove_all().await.is_err());
-        assert!(StateDir::new(file).remove_all().await.is_err());
+        assert!(
+            StateDir::new(file, owner_only())
+                .remove_all()
+                .await
+                .is_err()
+        );
         Ok(())
     }
 
@@ -471,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn a_state_directory_that_is_not_there_is_an_error_at_once() -> TestResult {
         let temp = tempfile::tempdir()?;
-        let state = StateDir::new(temp.path().join("not-there"));
+        let state = StateDir::new(temp.path().join("not-there"), owner_only());
         let error = state.create().await.err().ok_or("created")?;
         assert!(
             error.message().starts_with("the state directory")
@@ -479,6 +515,62 @@ mod tests {
             "{}",
             error.message()
         );
+        Ok(())
+    }
+
+    /// On Windows each sign-in directory is left to its owner, and one that
+    /// can't be, or that someone put a file in first, is removed. Scripts
+    /// stand in for `whoami.exe` and `icacls.exe`; icacls records each
+    /// call's arguments, puts a file in its target once `icacls.exe.plant`
+    /// exists, and fails once `icacls.exe.fail` exists.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_sign_in_directory_is_left_to_its_owner_or_removed() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir()?;
+        let system32 = root.path().join("System32");
+        fs::create_dir_all(&system32)?;
+        for (name, body) in [
+            ("whoami.exe", "echo 'host\\user S-1-5-21-1-2-3-1001'"),
+            (
+                "icacls.exe",
+                r#"printf '%s\n' "$*" >> "$0.args"; [ ! -e "$0.plant" ] || : > "$1/msal_token_cache.json"; [ ! -e "$0.fail" ]"#,
+            ),
+        ] {
+            let path = system32.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        }
+        let temp = tempfile::tempdir()?;
+        let state = StateDir::new(
+            temp.path().to_owned(),
+            OwnerOnly::icacls(Some(root.path().as_os_str())),
+        );
+
+        let dir = state.create().await?;
+        assert_eq!(
+            fs::read_to_string(system32.join("icacls.exe.args"))?,
+            format!(
+                "{} /inheritance:r /grant:r *S-1-5-21-1-2-3-1001:(OI)(CI)F\n",
+                dir.display()
+            )
+        );
+
+        fs::write(system32.join("icacls.exe.plant"), "")?;
+        let error = state
+            .create()
+            .await
+            .err()
+            .ok_or("created with a file in it")?;
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert!(!temp.path().join("az-2").exists());
+        fs::remove_file(system32.join("icacls.exe.plant"))?;
+
+        fs::write(system32.join("icacls.exe.fail"), "")?;
+        let error = state.create().await.err().ok_or("created")?;
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert!(!temp.path().join("az-2").exists());
         Ok(())
     }
 }

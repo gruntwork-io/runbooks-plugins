@@ -3,11 +3,13 @@
 //! against the schema.
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
 use jsonschema::{Draft, Registry, Validator};
+use runbooks_credential_azure::host::Host;
 use runbooks_plugin_protocol::PROTOCOL_VERSION;
 use runbooks_plugin_transport::{CredentialPlugin, ServeError, serve};
 use serde_json::{Value, json};
@@ -16,6 +18,13 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 pub(crate) type TestResult = Result<(), Box<dyn Error>>;
+
+/// A host with `vars` on this platform. On Windows it adds the real
+/// `SystemRoot`, where the plugin finds icacls.
+pub(crate) fn host(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Host {
+    let system_root = std::env::var_os("SystemRoot").map(|root| ("SystemRoot".into(), root));
+    Host::new(vars.into_iter().chain(system_root), cfg!(windows))
+}
 
 /// Longer than any answer takes on a loaded runner; a hang fails the test.
 /// Under cargo-mutants' 20-second test timeout, so a mutant that leaves a
